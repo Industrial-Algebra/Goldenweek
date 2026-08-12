@@ -1,6 +1,29 @@
 [package]
-name = "Goldenweek"
+name = "goldenweek"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Thin GPU graphics abstraction — Metal and Vulkan render backends for Industrial Algebra"
+license = "Apache-2.0"
+repository = "https://github.com/industrial-algebra/Goldenweek"
+keywords = ["gpu", "graphics", "rendering", "metal", "vulkan"]
+categories = ["hardware-support", "rendering", "rendering::graphics-api"]
+
+[features]
+default = []
+# Render backends land in v0.2. v0.1 ships the trait + opaque-handle surface
+# plus a NoBackend stub, mirroring Borsalino's pre-backend state.
+metal = []
+vulkan = []
 
 [dependencies]
+thiserror = "2"
+bytemuck = { version = "1", features = ["derive"] }
+# WGSL → MSL/SPIR-V translation. Load-bearing for the WGSL-first thesis;
+# consumed by the render backends the moment they land.
+naga = { version = "27", features = ["wgsl-in", "spv-out", "msl-out"] }
+
+# Backend dependencies are reintroduced alongside src/metal.rs / src/vulkan.rs:
+#   metal  (macOS)         -> objc = "0.2"            (raw objc_msgSend FFI)
+#   vulkan (Linux/Windows) -> ash  = "0.38"           (raw Vulkan FFI)
+# Held out of v0.1 to keep the stub-only build free of unused dependencies.
