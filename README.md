@@ -7,6 +7,11 @@ Thin GPU **graphics** abstraction for the Industrial Algebra ecosystem.
 > Render pipelines, frames, and presentation. Compute stays in
 > [`borsalino`](https://crates.io/crates/borsalino).
 
+## Documentation
+
+- **[docs/architecture.md](docs/architecture.md)** — purpose, the graphics surface, and relationship to Zunesha.
+- **[docs/adr/0001 — Graphics surface and scope](docs/adr/0001-graphics-surface-and-scope.md)** — the v0.1 refusal list and rationale.
+
 Goldenweek is the graphics sibling of
 [Borsalino](https://github.com/Industrial-Algebra/Borsalino). Where Borsalino
 is a minimal, synchronous **compute** abstraction over Metal and Vulkan,
