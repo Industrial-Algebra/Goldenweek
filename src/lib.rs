@@ -50,6 +50,9 @@
 
 mod error;
 
+#[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+pub mod vulkan;
+
 pub use error::{GraphicsError, Result};
 
 use std::ffi::c_void;
@@ -66,8 +69,9 @@ use std::ffi::c_void;
 /// Backends interpret the handle natively:
 ///
 /// - **Metal:** a `CAMetalLayer` pointer.
-/// - **Vulkan:** a `VkSurfaceKHR` plus the `VkInstance` that created it
-///   (Goldenweek needs the instance to bind the surface to its device).
+/// - **Vulkan:** a `VkSurfaceKHR` plus the `VkInstance` that created it. The
+///   instance must be the one that owns the Zunesha device the backend is
+///   constructed over (the surface and device must share an instance).
 ///
 /// # Safety
 ///
@@ -294,8 +298,10 @@ impl Drop for Frame {
 /// Backend-agnostic GPU graphics interface.
 ///
 /// Each backend (Metal on macOS, Vulkan elsewhere) implements this trait.
-/// Callers obtain a backend via [`init_for_surface`] against an
-/// externally-provided [`SurfaceHandle`].
+/// Construction is backend-specific — a concrete backend is built against a
+/// borrowed Zunesha device and an externally-provided [`SurfaceHandle`] (e.g.
+/// `vulkan::VulkanBackend::new`); this trait covers only the runtime
+/// operations.
 ///
 /// # Frame lifecycle
 ///
@@ -309,13 +315,6 @@ impl Drop for Frame {
 /// draw call into the frame; `present` queues the frame for display and
 /// blocks until it is safe to begin the next frame.
 pub trait GraphicsBackend: Sized {
-    /// Initialise the backend against an externally-provided surface.
-    ///
-    /// Creates (or binds to) a graphics-capable device and a swapchain
-    /// targeting the surface. The caller guarantees the surface outlives
-    /// the backend.
-    fn init_for_surface(surface: SurfaceHandle) -> Result<Self>;
-
     /// Compile a WGSL vertex + fragment pair into a render pipeline.
     ///
     /// `vertex_entry` / `fragment_entry` name the `@vertex` / `@fragment`
@@ -375,9 +374,6 @@ pub trait GraphicsBackend: Sized {
 pub struct NoBackendStub;
 
 impl GraphicsBackend for NoBackendStub {
-    fn init_for_surface(_surface: SurfaceHandle) -> Result<Self> {
-        Err(GraphicsError::NoBackend)
-    }
     fn compile_render_pipeline(
         &self,
         _vertex_entry: &str,
@@ -410,16 +406,18 @@ impl GraphicsBackend for NoBackendStub {
 
 // ── Top-level initialiser ─────────────────────────────────────────
 
-/// Initialise the best available render backend against `surface`.
+/// Construct the Vulkan render backend over a borrowed Zunesha device and an
+/// external surface.
 ///
-/// v0.1: returns [`GraphicsError::NoBackend`] unconditionally — the render
-/// backends land in v0.2. Once present, this is cfg-gated per platform
-/// exactly like `borsalino::init`:
-///
-/// - macOS: `metal::MetalBackend` (requires `metal` feature)
-/// - Linux / Windows: `vulkan::VulkanBackend` (requires `vulkan` feature`)
-pub fn init_for_surface(_surface: SurfaceHandle) -> Result<NoBackendStub> {
-    Err(GraphicsError::NoBackend)
+/// A thin, cfg-gated convenience over `vulkan::VulkanBackend::new`, mirroring
+/// `zunesha::init`. The device is borrowed (shared with Borsalino); the caller
+/// must keep it alive for the backend's lifetime.
+#[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+pub fn init(
+    device: &zunesha::vulkan::VulkanDevice,
+    surface: SurfaceHandle,
+) -> Result<vulkan::VulkanBackend> {
+    vulkan::VulkanBackend::new(device, surface)
 }
 
 /// Reusable WGSL shaders for Goldenweek examples and first backend slices.
@@ -498,29 +496,5 @@ mod tests {
 
         let buffer = stub.create_buffer(&[0.0f32; 3]);
         assert!(matches!(buffer, Err(GraphicsError::NoBackend)));
-    }
-
-    #[test]
-    fn init_for_surface_refuses_unconditionally_in_v0_1() {
-        // v0.1's init refuses regardless of the surface handle. Construct a
-        // null surface of the current platform's variant and assert refusal;
-        // this exercises the real free-function entry point.
-        #[cfg(target_os = "macos")]
-        let surface = SurfaceHandle::MetalLayer(std::ptr::null_mut());
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
-        let surface = SurfaceHandle::VulkanSurface {
-            instance: std::ptr::null_mut(),
-            surface: std::ptr::null_mut(),
-        };
-        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-        {
-            // No SurfaceHandle variant exists for this target; nothing to test.
-            return;
-        }
-
-        assert!(matches!(
-            init_for_surface(surface),
-            Err(GraphicsError::NoBackend)
-        ));
     }
 }

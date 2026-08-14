@@ -14,7 +14,7 @@ default = []
 # Render backends land in v0.2. v0.1 ships the trait + opaque-handle surface
 # plus a NoBackend stub, mirroring Borsalino's pre-backend state.
 metal = []
-vulkan = []
+vulkan = ["dep:ash", "dep:zunesha", "zunesha/vulkan"]
 
 [dependencies]
 thiserror = "2"
@@ -23,7 +23,16 @@ bytemuck = { version = "1", features = ["derive"] }
 # consumed by the render backends the moment they land.
 naga = { version = "27", features = ["wgsl-in", "spv-out", "msl-out"] }
 
-# Backend dependencies are reintroduced alongside src/metal.rs / src/vulkan.rs:
-#   metal  (macOS)         -> objc = "0.2"            (raw objc_msgSend FFI)
-#   vulkan (Linux/Windows) -> ash  = "0.38"           (raw Vulkan FFI)
-# Held out of v0.1 to keep the stub-only build free of unused dependencies.
+# Vulkan backend (Linux / Windows): raw FFI via ash, device via the shared
+# Zunesha substrate. The backend borrows the Zunesha device (cloned handles) —
+# it does not own it, since the device is shared with Borsalino (ADR 0001).
+# Metal (macOS) lands later via objc.
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+ash = { version = "0.38", optional = true }
+zunesha = { path = "../Zunesha", optional = true }
+
+[dev-dependencies]
+# GPU tests touch the Vulkan loader, which is not safe under concurrent
+# instance/device creation (see Zunesha's serial-test note). `#[serial]`
+# keeps Goldenweek's vulkan tests from racing the loader.
+serial_test = "3"
