@@ -49,11 +49,13 @@
 #![warn(clippy::all)]
 
 mod error;
+mod frame;
 
 #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
 pub mod vulkan;
 
 pub use error::{GraphicsError, Result};
+pub use frame::Frame;
 
 use std::ffi::c_void;
 
@@ -253,45 +255,7 @@ impl Drop for GpuBuffer {
     }
 }
 
-/// Handle to an acquired presentation frame.
-///
-/// Created by [`GraphicsBackend::acquire_frame`]. Record draw calls into it
-/// via [`GraphicsBackend::draw`], then display it via
-/// [`GraphicsBackend::present`], which consumes the frame.
-///
-/// A frame holds exclusive access to one swapchain image for the duration of
-/// its lifetime. Dropping a frame without presenting it returns the image to
-/// the swapchain (it is simply not displayed).
-///
-/// # Drop behaviour
-///
-/// [`GraphicsBackend::present`] consumes the frame by value; the backend
-/// implementation nulls out the raw handle so the subsequent `Drop` is a
-/// no-op. For an unpresented frame, `Drop` releases the image back to the
-/// swapchain.
-pub struct Frame {
-    pub(crate) raw: *mut c_void,
-    pub(crate) drop_fn: fn(*mut c_void),
-}
-
-impl std::fmt::Debug for Frame {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Frame").field("raw", &self.raw).finish()
-    }
-}
-
-// Safety: a frame owns exclusive access to a swapchain image. While it is
-// alive no other frame references the same image, and draw/present operate
-// through the backend's command stream. Send is sound because the backend
-// serialises command recording; Sync is intentionally NOT implemented — two
-// threads must not record into the same frame concurrently.
-unsafe impl Send for Frame {}
-
-impl Drop for Frame {
-    fn drop(&mut self) {
-        (self.drop_fn)(self.raw);
-    }
-}
+// (`Frame` lives in `src/frame.rs` — see `pub use frame::Frame`.)
 
 // ── Trait ─────────────────────────────────────────────────────────
 

@@ -101,15 +101,38 @@ The [`GraphicsBackend`](../src/lib.rs) trait is the contract:
 Opaque handles (`RenderPipeline`, `GpuBuffer`, `Frame`) keep backend details out
 of the public API.
 
+## Hardware compatibility notes (headless testing)
+
+Empirically established on the development laptop (RTX 5080 + Intel ARL +
+llvmpipe), 2026-08-12:
+
+| Driver | Headless surface caps | Swapchain | Verdict |
+|---|---|---|---|
+| NVIDIA proprietary (RTX 5080) | `ERROR_EXTENSION_NOT_PRESENT` | fails likewise | **unsupported** — the driver merely stubs `VK_EXT_headless_surface` |
+| Intel / Mesa (ARL) | OK (extent `0xFFFFFFFF` = undefined) | **full acquire→present loop works** | the headless test device |
+| llvmpipe (CPU) | OK | crashes the process mid-probe | unusable for this path |
+
+Consequences:
+- Headless tests pin to a working driver via
+  `InitRequest::device_hint` (env `GOLDENWEEK_TEST_DEVICE`, default `"Intel"`).
+- Real (windowed) presentation on NVIDIA is unaffected — this is a headless-surface gap, not a general graphics one.
+- NVIDIA-only machines cannot run Goldenweek's headless tests against real
+  hardware; compute-only GB10 is refused by design (no graphics queue).
+
 ## Current state & next steps
 
 - ✅ Scaffold — `GraphicsBackend` trait, opaque handles, `PipelineConfig`,
   `SurfaceHandle`, `NoBackendStub`, full `#![warn(missing_docs)]`.
-- ⏳ **Vulkan rendering backend** (next) — swapchain, render pass, graphics
-  pipeline (vertex + fragment WGSL via `naga`), frame loop, all constructed over
-  a `zunesha::Device`. Testable **headless** via `VK_EXT_headless_surface`
-  (available on this machine), which matches the external-`SurfaceHandle`
-  decision exactly.
-- ⏳ **Step C** — wire Goldenweek to depend on Zunesha (`GpuBuffer` wraps
-  `zunesha::Buffer`; backend constructed over a `zunesha::Device`).
+- ✅ **Step C** — wired to Zunesha: `VulkanBackend::new(&device, surface)`
+    over a *borrowed* `zunesha::vulkan::VulkanDevice` (shared with Borsalino,
+    ADR 0001); `HeadlessSurface` RAII helper; construction verified on real
+    hardware.
+- ✅ **Increment 3** — swapchain + frame lifecycle: surface-support check,
+    format/extent selection (undefined-extent fallback for headless), FIFO
+    present mode, `acquire_frame()` / `present()` with null-on-present frame
+    drop semantics. Verified headless on Intel ARL (4-image swapchain,
+    repeated acquire→present).
+- ⏳ **Increment 4** — render pass + graphics pipeline (WGSL→SPIR-V via
+    `naga`), bake `PipelineConfig`.
+- ⏳ **Increment 5** — draw: flat triangle + readback/screenshot verification.
 - ⏳ Metal backend (raw `objc`) — mirroring Borsalino/Zunesha's backend split.
