@@ -16,12 +16,97 @@
 //! ([`VulkanBackend::acquire_frame`] / [`VulkanBackend::present`]). Pipeline
 //! compilation, buffers, and draw calls land in increments 4-5.
 
+use std::ffi::{CString, c_void};
+
 use ash::vk::Handle;
 use ash::{Entry, ext, khr, vk};
 
 use crate::frame::{Frame, FrameInner};
-use crate::{GraphicsError, Result, SurfaceHandle};
+use crate::{
+    CullMode, GraphicsError, PipelineConfig, RenderPipeline, Result, SurfaceHandle, Topology,
+    VertexFormat,
+};
 use zunesha::Device;
+
+// ── Shader compilation (WGSL → SPIR-V via naga) ───────────────────
+
+/// Human stage name for error reporting.
+fn stage_name(stage: naga::ShaderStage) -> &'static str {
+    match stage {
+        naga::ShaderStage::Vertex => "vertex",
+        naga::ShaderStage::Fragment => "fragment",
+        _ => "compute",
+    }
+}
+
+/// Compile one WGSL shader stage to SPIR-V words.
+///
+/// Parses, validates, and lowers via naga. The entry point is selected in the
+/// backend pass ([`naga::back::spv::PipelineOptions`]), so a missing entry
+/// name is reported here rather than by the driver.
+fn compile_stage(entry: &str, source: &str, stage: naga::ShaderStage) -> Result<Vec<u32>> {
+    let mut frontend = naga::front::wgsl::Frontend::new();
+    let module = frontend
+        .parse(source)
+        .map_err(|e| GraphicsError::CompileFailed {
+            stage: stage_name(stage),
+            entry: entry.into(),
+            message: e.emit_to_string(source),
+        })?;
+    let info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .map_err(|e| GraphicsError::CompileFailed {
+        stage: stage_name(stage),
+        entry: entry.into(),
+        message: e.emit_to_string(source),
+    })?;
+    let options = naga::back::spv::Options::default();
+    let pipeline_options = naga::back::spv::PipelineOptions {
+        shader_stage: stage,
+        entry_point: entry.to_string(),
+    };
+    naga::back::spv::write_vec(&module, &info, &options, Some(&pipeline_options)).map_err(|e| {
+        GraphicsError::CompileFailed {
+            stage: stage_name(stage),
+            entry: entry.into(),
+            message: format!("SPIR-V lowering: {e:?}"),
+        }
+    })
+}
+
+// ── Pipeline-config translation ──────────────────────────────────
+
+/// Map [`Topology`] to Vulkan primitive topology.
+fn to_vk_topology(t: Topology) -> vk::PrimitiveTopology {
+    match t {
+        Topology::TriangleList => vk::PrimitiveTopology::TRIANGLE_LIST,
+        Topology::TriangleStrip => vk::PrimitiveTopology::TRIANGLE_STRIP,
+        Topology::LineList => vk::PrimitiveTopology::LINE_LIST,
+        Topology::LineStrip => vk::PrimitiveTopology::LINE_STRIP,
+        Topology::PointList => vk::PrimitiveTopology::POINT_LIST,
+    }
+}
+
+/// Map [`CullMode`] to Vulkan cull-mode flags.
+fn to_vk_cull(c: CullMode) -> vk::CullModeFlags {
+    match c {
+        CullMode::None => vk::CullModeFlags::NONE,
+        CullMode::Front => vk::CullModeFlags::FRONT,
+        CullMode::Back => vk::CullModeFlags::BACK,
+    }
+}
+
+/// Map [`VertexFormat`] to Vulkan formats.
+fn to_vk_format(f: VertexFormat) -> vk::Format {
+    match f {
+        VertexFormat::Float32x2 => vk::Format::R32G32_SFLOAT,
+        VertexFormat::Float32x3 => vk::Format::R32G32B32_SFLOAT,
+        VertexFormat::Float32x4 => vk::Format::R32G32B32A32_SFLOAT,
+    }
+}
 
 // ── Headless surface (tests / headless rendering) ──────────────────
 
@@ -144,6 +229,16 @@ pub struct VulkanBackend {
     image_count: u32,
     /// Chosen swap extent (needed by the render pass in increment 4).
     extent: vk::Extent2D,
+    /// Chosen swapchain image format (render-pass attachment format).
+    /// Read by readback verification in increment 5.
+    #[allow(dead_code)]
+    format: vk::Format,
+    /// One image view per swapchain image.
+    image_views: Vec<vk::ImageView>,
+    /// Render pass: single color attachment, clear→store, UNDEFINED→PRESENT.
+    render_pass: vk::RenderPass,
+    /// One framebuffer per swapchain image, sized to `extent`.
+    framebuffers: Vec<vk::Framebuffer>,
     /// Graphics queue handle, reconstructed from the Zunesha queue view.
     graphics_queue: vk::Queue,
     /// Graphics queue family index (needed for command pools in increment 5).
@@ -160,8 +255,43 @@ impl Drop for VulkanBackend {
         // destroyed here.
         unsafe {
             let _ = self.device.device_wait_idle();
+            for &fb in &self.framebuffers {
+                self.device.destroy_framebuffer(fb, None);
+            }
+            for &view in &self.image_views {
+                self.device.destroy_image_view(view, None);
+            }
+            self.device.destroy_render_pass(self.render_pass, None);
             self.device.destroy_semaphore(self.image_available, None);
             self.swapchain_fn.destroy_swapchain(self.swapchain, None);
+        }
+    }
+}
+
+// ── Pipeline inner + drop ───────────────────────────────────────
+
+/// Internal state for a compiled Vulkan pipeline, stored behind the opaque
+/// [`RenderPipeline`] handle. Self-contained (clones the device) so it can
+/// destroy itself on drop.
+struct VulkanPipelineInner {
+    pipeline: vk::Pipeline,
+    layout: vk::PipelineLayout,
+    vs_module: vk::ShaderModule,
+    fs_module: vk::ShaderModule,
+    device: ash::Device,
+}
+
+/// Drop function stored in [`RenderPipeline`] — drops the boxed inner.
+pub(super) fn drop_vulkan_pipeline(raw: *mut c_void) {
+    if !raw.is_null() {
+        // Safety: `raw` was produced by `Box::into_raw` in
+        // `compile_render_pipeline`.
+        unsafe {
+            let inner = Box::from_raw(raw as *mut VulkanPipelineInner);
+            inner.device.destroy_pipeline(inner.pipeline, None);
+            inner.device.destroy_pipeline_layout(inner.layout, None);
+            inner.device.destroy_shader_module(inner.vs_module, None);
+            inner.device.destroy_shader_module(inner.fs_module, None);
         }
     }
 }
@@ -269,9 +399,63 @@ impl VulkanBackend {
             .old_swapchain(vk::SwapchainKHR::null());
         let swapchain = unsafe { swapchain_fn.create_swapchain(&create_info, None) }
             .map_err(|e| GraphicsError::InitFailed(format!("vkCreateSwapchainKHR: {e}")))?;
-        let actual_count = unsafe { swapchain_fn.get_swapchain_images(swapchain) }
-            .map_err(|e| GraphicsError::InitFailed(format!("swapchain images: {e}")))?
-            .len() as u32;
+        // Image views + render pass + framebuffers — the swapchain's rendering
+        // surface. One framebuffer per swapchain image, all sized to `extent`.
+        let images = unsafe { swapchain_fn.get_swapchain_images(swapchain) }
+            .map_err(|e| GraphicsError::InitFailed(format!("swapchain images: {e}")))?;
+        let actual_count = images.len() as u32;
+        let subresource = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
+        let image_views: Vec<vk::ImageView> = images
+            .iter()
+            .map(|&image| {
+                let ci = vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format.format)
+                    .subresource_range(subresource);
+                unsafe { logical.create_image_view(&ci, None) }
+                    .map_err(|e| GraphicsError::InitFailed(format!("vkCreateImageView: {e}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let attachment = vk::AttachmentDescription::default()
+            .format(format.format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+        let color_ref = [vk::AttachmentReference {
+            attachment: 0,
+            layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        }];
+        let subpass = vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(&color_ref);
+        let rp_ci = vk::RenderPassCreateInfo::default()
+            .attachments(std::slice::from_ref(&attachment))
+            .subpasses(std::slice::from_ref(&subpass));
+        let render_pass = unsafe { logical.create_render_pass(&rp_ci, None) }
+            .map_err(|e| GraphicsError::InitFailed(format!("vkCreateRenderPass: {e}")))?;
+
+        let framebuffers: Vec<vk::Framebuffer> = image_views
+            .iter()
+            .map(|&view| {
+                let ci = vk::FramebufferCreateInfo::default()
+                    .render_pass(render_pass)
+                    .attachments(std::slice::from_ref(&view))
+                    .width(extent.width)
+                    .height(extent.height)
+                    .layers(1);
+                unsafe { logical.create_framebuffer(&ci, None) }
+                    .map_err(|e| GraphicsError::InitFailed(format!("vkCreateFramebuffer: {e}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let semaphore_ci = vk::SemaphoreCreateInfo::default();
         let image_available = unsafe { logical.create_semaphore(&semaphore_ci, None) }
@@ -287,9 +471,173 @@ impl VulkanBackend {
             swapchain,
             image_count: actual_count,
             extent,
+            format: format.format,
+            image_views,
+            render_pass,
+            framebuffers,
             graphics_queue,
             graphics_queue_family: graphics.family_index,
             image_available,
+        })
+    }
+
+    /// Compile a WGSL vertex + fragment pair into a render pipeline.
+    ///
+    /// Mirrors [`crate::GraphicsBackend::compile_render_pipeline`]: shaders are
+    /// translated WGSL → SPIR-V via naga, and `config` (topology, culling,
+    /// vertex layout) is baked into the pipeline object. Viewport and scissor
+    /// are dynamic states — they are supplied at draw time, so the pipeline
+    /// does not depend on the swap extent.
+    ///
+    /// The returned [`RenderPipeline`] owns its Vulkan objects and destroys
+    /// them on drop; it must not outlive the backend (documented invariant —
+    /// same posture as Zunesha buffers).
+    pub fn compile_render_pipeline(
+        &self,
+        vertex_entry: &str,
+        vertex_source: &str,
+        fragment_entry: &str,
+        fragment_source: &str,
+        config: &PipelineConfig,
+    ) -> Result<RenderPipeline> {
+        let vs_spv = compile_stage(vertex_entry, vertex_source, naga::ShaderStage::Vertex)?;
+        let fs_spv = compile_stage(fragment_entry, fragment_source, naga::ShaderStage::Fragment)?;
+
+        let vs_ci = vk::ShaderModuleCreateInfo::default().code(&vs_spv);
+        let vs_module = unsafe { self.device.create_shader_module(&vs_ci, None) }.map_err(|e| {
+            GraphicsError::CompileFailed {
+                stage: "vertex",
+                entry: vertex_entry.into(),
+                message: format!("vkCreateShaderModule: {e}"),
+            }
+        })?;
+        let fs_ci = vk::ShaderModuleCreateInfo::default().code(&fs_spv);
+        let fs_module = unsafe { self.device.create_shader_module(&fs_ci, None) }.map_err(|e| {
+            GraphicsError::CompileFailed {
+                stage: "fragment",
+                entry: fragment_entry.into(),
+                message: format!("vkCreateShaderModule: {e}"),
+            }
+        })?;
+
+        let vs_name = CString::new(vertex_entry).map_err(|_| GraphicsError::CompileFailed {
+            stage: "vertex",
+            entry: vertex_entry.into(),
+            message: "entry name contains a NUL byte".into(),
+        })?;
+        let fs_name = CString::new(fragment_entry).map_err(|_| GraphicsError::CompileFailed {
+            stage: "fragment",
+            entry: fragment_entry.into(),
+            message: "entry name contains a NUL byte".into(),
+        })?;
+
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vs_module)
+                .name(&vs_name),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(fs_module)
+                .name(&fs_name),
+        ];
+
+        // Vertex input from the caller's layout (binding 0, interleaved).
+        let binding = vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(config.vertex_layout.stride)
+            .input_rate(vk::VertexInputRate::VERTEX);
+        let attributes: Vec<vk::VertexInputAttributeDescription> = config
+            .vertex_layout
+            .attributes
+            .iter()
+            .map(|a| {
+                vk::VertexInputAttributeDescription::default()
+                    .binding(0)
+                    .location(a.location)
+                    .format(to_vk_format(a.format))
+                    .offset(a.offset)
+            })
+            .collect();
+        let bindings: Vec<vk::VertexInputBindingDescription> = if config.vertex_layout.stride == 0 {
+            Vec::new()
+        } else {
+            vec![binding]
+        };
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&bindings)
+            .vertex_attribute_descriptions(&attributes);
+
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(to_vk_topology(config.topology))
+            .primitive_restart_enable(false);
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(to_vk_cull(config.cull_mode))
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA);
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+            .logic_op_enable(false)
+            .attachments(std::slice::from_ref(&blend_attachment));
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+
+        // Empty layout: v0.1 pipelines take no descriptors and no push
+        // constants.
+        let layout_ci = vk::PipelineLayoutCreateInfo::default();
+        let layout =
+            unsafe { self.device.create_pipeline_layout(&layout_ci, None) }.map_err(|e| {
+                GraphicsError::PipelineFailed {
+                    message: format!("vkCreatePipelineLayout: {e}"),
+                }
+            })?;
+
+        let ci = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterization)
+            .multisample_state(&multisample)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic_state)
+            .layout(layout)
+            .render_pass(self.render_pass)
+            .subpass(0);
+        let pipelines = unsafe {
+            self.device.create_graphics_pipelines(
+                vk::PipelineCache::null(),
+                std::slice::from_ref(&ci),
+                None,
+            )
+        }
+        .map_err(|(_, e)| GraphicsError::PipelineFailed {
+            message: format!("vkCreateGraphicsPipelines: {e}"),
+        })?;
+        let Some(&pipeline) = pipelines.first() else {
+            return Err(GraphicsError::PipelineFailed {
+                message: "vkCreateGraphicsPipelines returned no pipeline".into(),
+            });
+        };
+
+        let inner = Box::new(VulkanPipelineInner {
+            pipeline,
+            layout,
+            vs_module,
+            fs_module,
+            device: self.device.clone(),
+        });
+        Ok(RenderPipeline {
+            raw: Box::into_raw(inner) as *mut c_void,
+            drop_fn: drop_vulkan_pipeline,
         })
     }
 
@@ -457,5 +805,80 @@ mod tests {
         drop(frame); // not presented
         let frame = rig.backend.acquire_frame().expect("acquire after drop");
         rig.backend.present(frame).expect("present after drop");
+    }
+
+    /// A simple flat-triangle pipeline compiles from WGSL via naga.
+    #[test]
+    #[serial]
+    fn pipeline_compiles_from_flat_triangle_shaders() {
+        let Some(rig) = rig() else { return };
+        let config = PipelineConfig {
+            topology: Topology::TriangleList,
+            cull_mode: CullMode::None,
+            vertex_layout: crate::VertexLayout {
+                stride: 8,
+                attributes: vec![crate::VertexAttribute {
+                    location: 0,
+                    offset: 0,
+                    format: VertexFormat::Float32x2,
+                }],
+            },
+        };
+        let pipeline = rig
+            .backend
+            .compile_render_pipeline(
+                "vs_main",
+                crate::kernels::FLAT_TRIANGLE_VERT,
+                "fs_main",
+                crate::kernels::FLAT_TRIANGLE_FRAG,
+                &config,
+            )
+            .expect("compile_render_pipeline");
+        drop(pipeline); // exercises the pipeline drop path
+        println!("flat-triangle pipeline compiled + dropped cleanly");
+    }
+
+    /// Malformed WGSL is rejected as a vertex CompileFailed with source
+    /// location context.
+    #[test]
+    #[serial]
+    fn bad_wgsl_is_rejected_with_stage_context() {
+        let Some(rig) = rig() else { return };
+        let err = rig
+            .backend
+            .compile_render_pipeline(
+                "vs_main",
+                "this is not wgsl at all",
+                "fs_main",
+                crate::kernels::FLAT_TRIANGLE_FRAG,
+                &PipelineConfig::default(),
+            )
+            .expect_err("bad source must fail");
+        match err {
+            GraphicsError::CompileFailed { stage, entry, .. } => {
+                assert_eq!(stage, "vertex");
+                assert_eq!(entry, "vs_main");
+            }
+            other => panic!("expected CompileFailed, got {other:?}"),
+        }
+    }
+
+    /// A missing entry point is caught by naga (PipelineOptions), not the
+    /// driver.
+    #[test]
+    #[serial]
+    fn missing_entry_point_is_rejected() {
+        let Some(rig) = rig() else { return };
+        let err = rig
+            .backend
+            .compile_render_pipeline(
+                "no_such_entry",
+                crate::kernels::FLAT_TRIANGLE_VERT,
+                "fs_main",
+                crate::kernels::FLAT_TRIANGLE_FRAG,
+                &PipelineConfig::default(),
+            )
+            .expect_err("missing entry must fail");
+        assert!(matches!(err, GraphicsError::CompileFailed { .. }));
     }
 }
