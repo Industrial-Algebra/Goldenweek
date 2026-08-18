@@ -6,25 +6,31 @@
 //! Constructed over a **borrowed** [`zunesha::vulkan::VulkanDevice`] (the shared
 //! device substrate) and an externally-provided [`SurfaceHandle`]. Per Zunesha
 //! ADR 0001 the device is shared between Borsalino (compute) and Goldenweek
-//! (graphics), so this backend does **not** own the device — it holds cloned
-//! Vulkan handles (a non-owning view) and the caller must keep the
-//! `VulkanDevice` alive for the backend's lifetime. This is a documented
-//! invariant, not a borrow-checked one, matching Zunesha's own buffer-lifetime
-//! posture (ADR 0003).
+//! (graphics), so this backend does **not** own the device — it borrows it
+//! (`VulkanBackend<'a>`), and the borrow checker enforces what was previously a
+//! documented invariant: the device outlives the backend.
 //!
-//! This increment delivers the swapchain and the frame lifecycle
-//! ([`VulkanBackend::acquire_frame`] / [`VulkanBackend::present`]). Pipeline
-//! compilation, buffers, and draw calls land in increments 4-5.
+//! The full frame lifecycle is implemented: `acquire_frame` begins a command
+//! buffer and the render pass (clearing to the backend's clear color),
+//! [`VulkanBackend::draw`] records pipeline + vertex-buffer binds, and
+//! `present` ends the pass, submits (waiting the acquire semaphore, signalling
+//! the present semaphore + a fence), presents, and blocks on the fence so the
+//! next acquire is safe — the synchronous frame loop the trait documents.
+//!
+//! Buffers created here are `zunesha::Buffer`s (zero-copy compute→render
+//! interop, ADR 0001); `zunesha::vulkan::VulkanDevice::raw_buffer` recovers
+//! the `VkBuffer` for binding.
 
 use std::ffi::{CString, c_void};
+use std::sync::Mutex;
 
 use ash::vk::Handle;
 use ash::{Entry, ext, khr, vk};
 
 use crate::frame::{Frame, FrameInner};
 use crate::{
-    CullMode, GraphicsError, PipelineConfig, RenderPipeline, Result, SurfaceHandle, Topology,
-    VertexFormat,
+    CullMode, GpuBuffer, GraphicsError, PipelineConfig, RenderPipeline, Result, SurfaceHandle,
+    Topology, VertexFormat,
 };
 use zunesha::Device;
 
@@ -77,7 +83,7 @@ fn compile_stage(entry: &str, source: &str, stage: naga::ShaderStage) -> Result<
     })
 }
 
-// ── Pipeline-config translation ──────────────────────────────────
+// ── Pipeline-config translation ───────────────────────────────────
 
 /// Map [`Topology`] to Vulkan primitive topology.
 fn to_vk_topology(t: Topology) -> vk::PrimitiveTopology {
@@ -121,7 +127,7 @@ fn to_vk_format(f: VertexFormat) -> vk::Format {
 /// # Safety contract (enforced by drop order)
 ///
 /// The instance must outlive this surface. In tests, declare the owning
-/// `VulkanDevice` *before* the `HeadlessSurface` so the instance is dropped
+/// `VulkanDevice` *after* the `HeadlessSurface` so the instance is dropped
 /// last.
 pub struct HeadlessSurface {
     surface: vk::SurfaceKHR,
@@ -198,77 +204,17 @@ fn choose_extent(caps: &vk::SurfaceCapabilitiesKHR) -> vk::Extent2D {
     }
 }
 
-// ── Render backend ────────────────────────────────────────────────
-
-/// Vulkan render backend — a non-owning view over a borrowed
-/// [`zunesha::vulkan::VulkanDevice`] plus a caller-owned presentation surface.
-///
-/// Holds cloned Vulkan handles (`instance`, `device`, `physical_device`), the
-/// graphics queue, and a swapchain built against the surface at construction.
-/// The caller must keep the `VulkanDevice` — and the surface — alive for the
-/// backend's lifetime. On drop the backend destroys its own swapchain and
-/// synchronization objects only; the device and surface are torn down by their
-/// owners.
-pub struct VulkanBackend {
-    // Read during construction; consumed again by the render-pass and
-    // pipeline operations (increments 4-5) and by out-of-date-surface handling.
-    #[allow(dead_code)]
-    instance: ash::Instance,
-    device: ash::Device,
-    #[allow(dead_code)]
-    physical_device: vk::PhysicalDevice,
-    /// `VK_KHR_surface` instance functions (queries, surface destruction is
-    /// the caller's).
-    #[allow(dead_code)]
-    surface_fn: khr::surface::Instance,
-    /// `VK_KHR_swapchain` device functions.
-    swapchain_fn: khr::swapchain::Device,
-    surface: vk::SurfaceKHR,
-    swapchain: vk::SwapchainKHR,
-    /// Number of images in the swapchain.
-    image_count: u32,
-    /// Chosen swap extent (needed by the render pass in increment 4).
-    extent: vk::Extent2D,
-    /// Chosen swapchain image format (render-pass attachment format).
-    /// Read by readback verification in increment 5.
-    #[allow(dead_code)]
-    format: vk::Format,
-    /// One image view per swapchain image.
-    image_views: Vec<vk::ImageView>,
-    /// Render pass: single color attachment, clear→store, UNDEFINED→PRESENT.
-    render_pass: vk::RenderPass,
-    /// One framebuffer per swapchain image, sized to `extent`.
-    framebuffers: Vec<vk::Framebuffer>,
-    /// Graphics queue handle, reconstructed from the Zunesha queue view.
-    graphics_queue: vk::Queue,
-    /// Graphics queue family index (needed for command pools in increment 5).
-    graphics_queue_family: u32,
-    /// Signaled when a swapchain image is acquired.
-    image_available: vk::Semaphore,
+/// Per-frame command-recording state (interior mutability: every trait
+/// operation takes `&self`, but the frame loop is synchronous by design — the
+/// mutex is uncontended).
+struct RenderState {
+    /// The frame command buffer (reset + rerecorded each acquire).
+    cmd: vk::CommandBuffer,
+    /// Signalled when the frame's command buffer finishes.
+    fence: vk::Fence,
+    /// The image index whose render pass is currently open, if recording.
+    recording: Option<u32>,
 }
-
-impl Drop for VulkanBackend {
-    fn drop(&mut self) {
-        // Safety: the backend owns exclusively the swapchain and semaphore.
-        // Wait for outstanding work first (present may still be in flight).
-        // The device/instance/surface belong to their owners and are NOT
-        // destroyed here.
-        unsafe {
-            let _ = self.device.device_wait_idle();
-            for &fb in &self.framebuffers {
-                self.device.destroy_framebuffer(fb, None);
-            }
-            for &view in &self.image_views {
-                self.device.destroy_image_view(view, None);
-            }
-            self.device.destroy_render_pass(self.render_pass, None);
-            self.device.destroy_semaphore(self.image_available, None);
-            self.swapchain_fn.destroy_swapchain(self.swapchain, None);
-        }
-    }
-}
-
-// ── Pipeline inner + drop ───────────────────────────────────────
 
 /// Internal state for a compiled Vulkan pipeline, stored behind the opaque
 /// [`RenderPipeline`] handle. Self-contained (clones the device) so it can
@@ -281,7 +227,8 @@ struct VulkanPipelineInner {
     device: ash::Device,
 }
 
-/// Drop function stored in [`RenderPipeline`] — drops the boxed inner.
+/// Drop function stored in [`RenderPipeline`] — drops the boxed inner and its
+/// Vulkan objects.
 pub(super) fn drop_vulkan_pipeline(raw: *mut c_void) {
     if !raw.is_null() {
         // Safety: `raw` was produced by `Box::into_raw` in
@@ -296,18 +243,115 @@ pub(super) fn drop_vulkan_pipeline(raw: *mut c_void) {
     }
 }
 
-impl VulkanBackend {
+/// Drop function stored in [`GpuBuffer`] — drops the boxed `zunesha::Buffer`,
+/// whose own drop destroys the Vulkan buffer + memory.
+pub(super) fn drop_zunesha_buffer_box(raw: *mut c_void) {
+    if !raw.is_null() {
+        // Safety: `raw` was produced by `Box::into_raw` in `create_buffer`.
+        unsafe {
+            drop(Box::from_raw(raw as *mut zunesha::Buffer));
+        }
+    }
+}
+
+// ── Render backend ────────────────────────────────────────────────
+
+/// Vulkan render backend — a borrowed view over a
+/// [`zunesha::vulkan::VulkanDevice`] plus a caller-owned presentation surface.
+///
+/// The backend borrows the Zunesha device (`'a` lifetime, borrow-checked: the
+/// device outlives the backend) and holds cloned Vulkan handles, the graphics
+/// queue, a swapchain with its render pass / framebuffers, and the per-frame
+/// command-recording state. The caller must keep the surface alive for the
+/// backend's lifetime. On drop the backend destroys only what it created
+/// (swapchain, views, render pass, framebuffers, pool, semaphores, fence); the
+/// device and surface are torn down by their owners.
+///
+/// Buffers created via [`VulkanBackend::create_buffer`] are `zunesha::Buffer`s
+/// — a buffer Borsalino filled by compute can be bound as a vertex buffer with
+/// zero copies (ADR 0001). Pipelines own themselves; both handles must be
+/// dropped before the backend (enforced for the device by the borrow, and for
+/// pipelines by the documented invariant).
+pub struct VulkanBackend<'a> {
+    zunesha_device: &'a zunesha::vulkan::VulkanDevice,
+    device: ash::Device,
+    #[allow(dead_code)]
+    physical_device: vk::PhysicalDevice,
+    /// `VK_KHR_swapchain` device functions.
+    swapchain_fn: khr::swapchain::Device,
+    surface: vk::SurfaceKHR,
+    swapchain: vk::SwapchainKHR,
+    /// The swapchain images (indexed by acquire index).
+    images: Vec<vk::Image>,
+    /// Chosen swap extent.
+    extent: vk::Extent2D,
+    /// Chosen swapchain image format (render-pass attachment format).
+    format: vk::Format,
+    /// One image view per swapchain image.
+    image_views: Vec<vk::ImageView>,
+    /// Render pass: single color attachment, clear→store, UNDEFINED→PRESENT.
+    render_pass: vk::RenderPass,
+    /// One framebuffer per swapchain image, sized to `extent`.
+    framebuffers: Vec<vk::Framebuffer>,
+    /// Graphics command pool (on the graphics family).
+    command_pool: vk::CommandPool,
+    /// Per-frame recording state (command buffer, fence, open-pass index).
+    render: Mutex<RenderState>,
+    /// Graphics queue handle, reconstructed from the Zunesha queue view.
+    graphics_queue: vk::Queue,
+    /// Graphics queue family index.
+    graphics_queue_family: u32,
+    /// Signalled when a swapchain image is acquired.
+    image_available: vk::Semaphore,
+    /// Signalled when the frame's rendering is complete (present waits on it).
+    render_finished: vk::Semaphore,
+}
+
+impl Drop for VulkanBackend<'_> {
+    fn drop(&mut self) {
+        // Safety: the backend owns exclusively everything destroyed here.
+        // Wait for outstanding work first (present may still be in flight).
+        // Pipelines/buffers self-destruct and must already have been dropped
+        // by the caller (documented invariant). The device/instance/surface
+        // belong to their owners and are NOT destroyed here.
+        unsafe {
+            let _ = self.device.device_wait_idle();
+            let render = self.render.lock().expect("render state lock");
+            self.device.destroy_fence(render.fence, None);
+            self.device
+                .free_command_buffers(self.command_pool, &[render.cmd]);
+            drop(render);
+            for &fb in &self.framebuffers {
+                self.device.destroy_framebuffer(fb, None);
+            }
+            for &view in &self.image_views {
+                self.device.destroy_image_view(view, None);
+            }
+            self.device.destroy_render_pass(self.render_pass, None);
+            self.device.destroy_semaphore(self.image_available, None);
+            self.device.destroy_semaphore(self.render_finished, None);
+            self.device.destroy_command_pool(self.command_pool, None);
+            self.swapchain_fn.destroy_swapchain(self.swapchain, None);
+        }
+    }
+}
+
+impl<'a> VulkanBackend<'a> {
     /// Construct the backend over a borrowed Zunesha device and an external
-    /// surface, building a swapchain against the surface.
+    /// surface, building the swapchain, render pass, and framebuffers against
+    /// the surface.
     ///
-    /// `device` is borrowed (cloned handles are stored); it is not consumed, so
-    /// the shared device remains available to Borsalino. The surface must have
-    /// been created against the same instance that owns `device` — the caller's
-    /// responsibility per the [`SurfaceHandle`] safety contract.
+    /// The device is borrowed, not consumed — the shared device remains
+    /// available to Borsalino. The surface must have been created against the
+    /// same instance that owns the device (the caller's responsibility per the
+    /// [`SurfaceHandle`] safety contract).
     ///
     /// Refuses on compute-only hardware (no graphics queue) and when the
     /// graphics queue family cannot present to the surface.
-    pub fn new(device: &zunesha::vulkan::VulkanDevice, surface: SurfaceHandle) -> Result<Self> {
+    pub fn new(
+        device: &'a zunesha::vulkan::VulkanDevice,
+        surface: SurfaceHandle,
+    ) -> Result<VulkanBackend<'a>> {
         // On Vulkan targets the only [`SurfaceHandle`] variant is
         // `VulkanSurface`, so this binding is irrefutable.
         let SurfaceHandle::VulkanSurface {
@@ -399,11 +443,11 @@ impl VulkanBackend {
             .old_swapchain(vk::SwapchainKHR::null());
         let swapchain = unsafe { swapchain_fn.create_swapchain(&create_info, None) }
             .map_err(|e| GraphicsError::InitFailed(format!("vkCreateSwapchainKHR: {e}")))?;
+
         // Image views + render pass + framebuffers — the swapchain's rendering
         // surface. One framebuffer per swapchain image, all sized to `extent`.
         let images = unsafe { swapchain_fn.get_swapchain_images(swapchain) }
             .map_err(|e| GraphicsError::InitFailed(format!("swapchain images: {e}")))?;
-        let actual_count = images.len() as u32;
         let subresource = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .level_count(1)
@@ -457,28 +501,87 @@ impl VulkanBackend {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        // Graphics command pool + frame command buffer + fence (created
+        // signalled so the first acquire's wait passes immediately).
+        let pool_ci = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+            .queue_family_index(graphics.family_index);
+        let command_pool = unsafe { logical.create_command_pool(&pool_ci, None) }
+            .map_err(|e| GraphicsError::InitFailed(format!("vkCreateCommandPool: {e}")))?;
+        let cb_ci = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cmd = unsafe { logical.allocate_command_buffers(&cb_ci) }
+            .map_err(|e| GraphicsError::InitFailed(format!("vkAllocateCommandBuffers: {e}")))?
+            .first()
+            .copied()
+            .ok_or_else(|| GraphicsError::InitFailed("no command buffer allocated".into()))?;
+        let fence_ci = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+        let fence = unsafe { logical.create_fence(&fence_ci, None) }
+            .map_err(|e| GraphicsError::InitFailed(format!("vkCreateFence: {e}")))?;
+
         let semaphore_ci = vk::SemaphoreCreateInfo::default();
         let image_available = unsafe { logical.create_semaphore(&semaphore_ci, None) }
             .map_err(|e| GraphicsError::InitFailed(format!("vkCreateSemaphore: {e}")))?;
+        let render_finished = unsafe { logical.create_semaphore(&semaphore_ci, None) }
+            .map_err(|e| GraphicsError::InitFailed(format!("vkCreateSemaphore: {e}")))?;
 
         Ok(Self {
-            instance,
+            zunesha_device: device,
             device: logical,
             physical_device,
-            surface_fn,
             swapchain_fn,
             surface,
             swapchain,
-            image_count: actual_count,
+            images,
             extent,
             format: format.format,
             image_views,
             render_pass,
             framebuffers,
+            command_pool,
+            render: Mutex::new(RenderState {
+                cmd,
+                fence,
+                recording: None,
+            }),
             graphics_queue,
             graphics_queue_family: graphics.family_index,
             image_available,
+            render_finished,
         })
+    }
+
+    /// The graphics queue family index (always present — [`VulkanBackend::new`]
+    /// refuses construction without one).
+    #[must_use]
+    pub fn graphics_family(&self) -> u32 {
+        self.graphics_queue_family
+    }
+
+    /// The borrowed presentation surface handle.
+    #[must_use]
+    pub fn surface(&self) -> vk::SurfaceKHR {
+        self.surface
+    }
+
+    /// The swap extent chosen at construction.
+    pub fn extent(&self) -> vk::Extent2D {
+        self.extent
+    }
+
+    /// Number of swapchain images.
+    #[must_use]
+    pub fn image_count(&self) -> u32 {
+        self.images.len() as u32
+    }
+
+    /// The swapchain image format — needed to decode [`VulkanBackend::read_pixels`]
+    /// bytes (channel order follows this format).
+    #[must_use]
+    pub fn format(&self) -> vk::Format {
+        self.format
     }
 
     /// Compile a WGSL vertex + fragment pair into a render pipeline.
@@ -641,37 +744,54 @@ impl VulkanBackend {
         })
     }
 
-    /// The graphics queue family index (always present — [`VulkanBackend::new`]
-    /// refuses construction without one).
-    #[must_use]
-    pub fn graphics_family(&self) -> u32 {
-        self.graphics_queue_family
-    }
-
-    /// The borrowed presentation surface handle.
-    #[must_use]
-    pub fn surface(&self) -> vk::SurfaceKHR {
-        self.surface
-    }
-
-    /// The swap extent chosen at construction.
-    pub fn extent(&self) -> vk::Extent2D {
-        self.extent
-    }
-
-    /// Number of swapchain images.
-    #[must_use]
-    pub fn image_count(&self) -> u32 {
-        self.image_count
+    /// Allocate a GPU buffer and upload `data` — a `zunesha::Buffer`.
+    ///
+    /// Buffers live in Zunesha's memory domain (ADR 0001): a buffer Borsalino
+    /// filled via compute can be bound here as a vertex buffer with **zero
+    /// copies**. The buffer self-destructs on drop; it must not outlive the
+    /// backend, and in-flight frames reading it must complete first (the
+    /// synchronous `present` guarantees this).
+    pub fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<GpuBuffer> {
+        let buffer = self.zunesha_device.create_buffer(data).map_err(|e| {
+            GraphicsError::BufferCreationFailed {
+                message: format!("{e}"),
+            }
+        })?;
+        let len = std::mem::size_of_val(data);
+        Ok(GpuBuffer {
+            raw: Box::into_raw(Box::new(buffer)) as *mut c_void,
+            len,
+            drop_fn: drop_zunesha_buffer_box,
+        })
     }
 
     /// Acquire the next frame for rendering.
     ///
-    /// Blocks until a swapchain image is available. The returned [`Frame`]
-    /// grants exclusive recording access to that image until it is presented
-    /// or dropped. Dropping an unpresented frame is well-defined: the image is
-    /// simply not displayed.
+    /// Blocks until a swapchain image is available, then begins the frame
+    /// command buffer and the render pass (clearing the image to the backend's
+    /// clear color) and records the viewport/scissor. The returned [`Frame`]
+    /// grants exclusive recording access — draw into it via
+    /// [`VulkanBackend::draw`], then present. Dropping an unpresented frame is
+    /// well-defined: the recording is discarded (the image is simply not
+    /// displayed).
     pub fn acquire_frame(&self) -> Result<Frame> {
+        let mut render = self.render.lock().expect("render state lock");
+
+        // Wait for the previous frame's command buffer to finish. The fence
+        // is signalled whenever no frame is in flight (created signalled, and
+        // left signalled by present's wait), so this passes immediately unless
+        // a submission is still executing. The fence is NOT reset here: it is
+        // reset only immediately before the submit that will signal it (see
+        // `present`), so a dropped frame never leaves an unsignalled fence to
+        // deadlock the next acquire.
+        unsafe {
+            self.device
+                .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
+                .map_err(|e| GraphicsError::AcquireFailed {
+                    message: format!("fence wait: {e}"),
+                })?;
+        }
+
         let (index, _suboptimal) = unsafe {
             self.swapchain_fn.acquire_next_image(
                 self.swapchain,
@@ -683,36 +803,380 @@ impl VulkanBackend {
         .map_err(|e| GraphicsError::AcquireFailed {
             message: format!("vkAcquireNextImageKHR: {e}"),
         })?;
+
+        // Reset the command buffer explicitly: a dropped frame leaves it
+        // mid-recording (begun, never ended), which vkBeginCommandBuffer alone
+        // cannot recover from. The pool's RESET_COMMAND_BUFFER flag permits
+        // this, discarding any stale recording.
+        unsafe {
+            self.device
+                .reset_command_buffer(render.cmd, vk::CommandBufferResetFlags::empty())
+                .map_err(|e| GraphicsError::AcquireFailed {
+                    message: format!("command buffer reset: {e}"),
+                })?;
+        }
+
+        // Begin the command buffer and the render pass with a clear.
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe {
+            self.device
+                .begin_command_buffer(render.cmd, &begin)
+                .map_err(|e| GraphicsError::AcquireFailed {
+                    message: format!("begin command buffer: {e}"),
+                })?;
+        }
+        let clear = [vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.1, 0.1, 0.1, 1.0],
+            },
+        }];
+        let rp_begin = vk::RenderPassBeginInfo::default()
+            .render_pass(self.render_pass)
+            .framebuffer(self.framebuffers[index as usize])
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: self.extent,
+            })
+            .clear_values(&clear);
+        unsafe {
+            self.device
+                .cmd_begin_render_pass(render.cmd, &rp_begin, vk::SubpassContents::INLINE);
+            let viewport = vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: self.extent.width as f32,
+                height: self.extent.height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            };
+            self.device
+                .cmd_set_viewport(render.cmd, 0, std::slice::from_ref(&viewport));
+            let scissor = vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: self.extent,
+            };
+            self.device
+                .cmd_set_scissor(render.cmd, 0, std::slice::from_ref(&scissor));
+        }
+        render.recording = Some(index);
+        drop(render);
+
         Ok(Frame::from_inner(FrameInner::Acquired { index }))
     }
 
-    /// Queue `frame` for display and block until it is safe to acquire the
-    /// next frame.
+    /// Record a non-indexed draw call into `frame`.
     ///
-    /// Consumes the frame. In this increment no rendering has been recorded, so
-    /// the image presents its previous (initial) contents — correct behaviour
-    /// for the frame-lifecycle slice.
+    /// `vertices` is bound as vertex input (interpreted per the pipeline's
+    /// vertex layout); `vertex_count` is the number of vertices to draw. Call
+    /// zero or more times per frame before
+    /// [`VulkanBackend::present`].
+    pub fn draw(
+        &self,
+        frame: &mut Frame,
+        pipeline: &RenderPipeline,
+        vertices: &GpuBuffer,
+        vertex_count: u32,
+    ) -> Result<()> {
+        let Some(frame_index) = frame.peek_index() else {
+            return Err(GraphicsError::InvalidDraw {
+                message: "frame has no acquired image (already presented?)".into(),
+            });
+        };
+        let pipeline_inner =
+            // Safety: `raw` was produced by `Box::into_raw::<VulkanPipelineInner>`
+            // in `compile_render_pipeline` and is still valid.
+            unsafe { &*(pipeline.raw as *const VulkanPipelineInner) };
+        // Safety: `raw` was produced by `Box::into_raw::<zunesha::Buffer>` in
+        // `create_buffer` and is still valid.
+        let zunesha_buffer = unsafe { &*(vertices.raw as *const zunesha::Buffer) };
+        let vertex_buffer = self.zunesha_device.raw_buffer(zunesha_buffer);
+
+        let render = self.render.lock().expect("render state lock");
+        if render.recording != Some(frame_index) {
+            return Err(GraphicsError::InvalidDraw {
+                message: format!(
+                    "frame {frame_index} is not the frame being recorded ({:?})",
+                    render.recording
+                ),
+            });
+        }
+
+        unsafe {
+            self.device.cmd_bind_pipeline(
+                render.cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_inner.pipeline,
+            );
+            self.device.cmd_bind_vertex_buffers(
+                render.cmd,
+                0,
+                std::slice::from_ref(&vertex_buffer),
+                &[0],
+            );
+            self.device.cmd_draw(render.cmd, vertex_count, 1, 0, 0);
+        }
+        Ok(())
+    }
+
+    /// Finish, submit, and display `frame`, then block until it is safe to
+    /// acquire the next frame.
+    ///
+    /// Ends the render pass and command buffer, submits on the graphics queue
+    /// (waiting the acquire semaphore, signalling the present semaphore and
+    /// the frame fence), presents, and waits the fence — the synchronous
+    /// present contract documented on the trait.
     pub fn present(&self, mut frame: Frame) -> Result<()> {
         let index = frame
             .take_index()
             .ok_or_else(|| GraphicsError::InvalidDraw {
                 message: "frame has no acquired image (already presented?)".into(),
             })?;
-        let swapchains = [self.swapchain];
-        let indices = [index];
-        let present_info = vk::PresentInfoKHR::default()
-            .swapchains(&swapchains)
-            .image_indices(&indices);
-        let result = unsafe {
+        let mut render = self.render.lock().expect("render state lock");
+        if render.recording != Some(index) {
+            return Err(GraphicsError::InvalidDraw {
+                message: format!(
+                    "frame {index} is not the frame being recorded ({:?})",
+                    render.recording
+                ),
+            });
+        }
+
+        let present_result = unsafe {
+            self.device.cmd_end_render_pass(render.cmd);
+            self.device.end_command_buffer(render.cmd).map_err(|e| {
+                GraphicsError::PresentFailed {
+                    message: format!("end command buffer: {e}"),
+                }
+            })?;
+
+            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+            let submit = vk::SubmitInfo::default()
+                .wait_semaphores(std::slice::from_ref(&self.image_available))
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(std::slice::from_ref(&render.cmd))
+                .signal_semaphores(std::slice::from_ref(&self.render_finished));
+            // Reset the fence only now — immediately before the submit that
+            // will signal it — so it is unsignalled for the shortest possible
+            // window (unobservable in the synchronous loop).
+            self.device
+                .reset_fences(std::slice::from_ref(&render.fence))
+                .map_err(|e| GraphicsError::PresentFailed {
+                    message: format!("fence reset: {e}"),
+                })?;
+            self.device
+                .queue_submit(
+                    self.graphics_queue,
+                    std::slice::from_ref(&submit),
+                    render.fence,
+                )
+                .map_err(|e| GraphicsError::PresentFailed {
+                    message: format!("vkQueueSubmit: {e}"),
+                })?;
+
+            let swapchains = [self.swapchain];
+            let indices = [index];
+            let present_info = vk::PresentInfoKHR::default()
+                .wait_semaphores(std::slice::from_ref(&self.render_finished))
+                .swapchains(&swapchains)
+                .image_indices(&indices);
             self.swapchain_fn
                 .queue_present(self.graphics_queue, &present_info)
         };
-        // Suboptimal is acceptable for the headless/synchronous v0.1 loop.
-        result
+        // Block until the frame's work is complete, so the next acquire can
+        // safely reset and reuse the command buffer (the synchronous
+        // frame-loop contract).
+        // Safety: the fence was submitted above on this device.
+        unsafe {
+            self.device
+                .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
+                .map_err(|e| GraphicsError::PresentFailed {
+                    message: format!("fence wait: {e}"),
+                })?;
+        }
+
+        render.recording = None;
+        present_result
             .map(|_| ())
             .map_err(|e| GraphicsError::PresentFailed {
                 message: format!("vkQueuePresentKHR: {e}"),
             })
+    }
+
+    /// Read a swapchain image's pixels back to host memory.
+    ///
+    /// Verification / screenshot path: barriers the image to a transfer
+    /// layout, copies to a Zunesha staging buffer, and reads it back. Returns
+    /// tightly packed `w*h*4` bytes, row-major, in the swapchain format's
+    /// channel order (B8G8R8A8 under the preferred UNORM format). Call only
+    /// when no frame is in flight (after [`VulkanBackend::present`] — which
+    /// blocks — or after the backend is otherwise idle).
+    pub fn read_pixels(&self, image_index: u32) -> Result<Vec<u8>> {
+        let Some(&image) = self.images.get(image_index as usize) else {
+            return Err(GraphicsError::InvalidDraw {
+                message: format!("image index {image_index} out of range"),
+            });
+        };
+        let width = self.extent.width;
+        let height = self.extent.height;
+        let size = (width as usize) * (height as usize) * 4;
+
+        // Staging via Zunesha (host-visible path), read via Zunesha.
+        let staging = self
+            .zunesha_device
+            .create_buffer(&vec![0u8; size])
+            .map_err(|e| GraphicsError::BufferCreationFailed {
+                message: format!("staging: {e}"),
+            })?;
+        let staging_vk = self.zunesha_device.raw_buffer(&staging);
+
+        // One-shot copy command buffer from the same pool.
+        let cb_ci = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cmd = unsafe { self.device.allocate_command_buffers(&cb_ci) }
+            .map_err(|e| GraphicsError::Internal(format!("one-shot allocate: {e}")))?
+            .first()
+            .copied()
+            .ok_or_else(|| GraphicsError::Internal("no one-shot command buffer".into()))?;
+
+        let subresource = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
+        let to_transfer = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::MEMORY_READ)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(subresource);
+        let to_present = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+            .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(subresource);
+        let copy = vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            });
+
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe {
+            self.device
+                .begin_command_buffer(cmd, &begin)
+                .map_err(|e| GraphicsError::Internal(format!("one-shot begin: {e}")))?;
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_transfer),
+            );
+            self.device.cmd_copy_image_to_buffer(
+                cmd,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                staging_vk,
+                std::slice::from_ref(&copy),
+            );
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_present),
+            );
+            self.device
+                .end_command_buffer(cmd)
+                .map_err(|e| GraphicsError::Internal(format!("one-shot end: {e}")))?;
+            let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+            self.device
+                .queue_submit(
+                    self.graphics_queue,
+                    std::slice::from_ref(&submit),
+                    vk::Fence::null(),
+                )
+                .map_err(|e| GraphicsError::Internal(format!("one-shot submit: {e}")))?;
+            self.device
+                .queue_wait_idle(self.graphics_queue)
+                .map_err(|e| GraphicsError::Internal(format!("one-shot wait: {e}")))?;
+            self.device
+                .free_command_buffers(self.command_pool, std::slice::from_ref(&cmd));
+        }
+
+        let pixels: Vec<u8> = self
+            .zunesha_device
+            .read_buffer(&staging)
+            .map_err(|e| GraphicsError::Internal(format!("staging readback: {e}")))?;
+        drop(staging);
+        Ok(pixels)
+    }
+}
+
+// ── GraphicsBackend trait impl ────────────────────────────────────
+
+impl crate::GraphicsBackend for VulkanBackend<'_> {
+    fn compile_render_pipeline(
+        &self,
+        vertex_entry: &str,
+        vertex_source: &str,
+        fragment_entry: &str,
+        fragment_source: &str,
+        config: &PipelineConfig,
+    ) -> Result<RenderPipeline> {
+        VulkanBackend::compile_render_pipeline(
+            self,
+            vertex_entry,
+            vertex_source,
+            fragment_entry,
+            fragment_source,
+            config,
+        )
+    }
+
+    fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<GpuBuffer> {
+        VulkanBackend::create_buffer(self, data)
+    }
+
+    fn acquire_frame(&self) -> Result<Frame> {
+        VulkanBackend::acquire_frame(self)
+    }
+
+    fn draw(
+        &self,
+        frame: &mut Frame,
+        pipeline: &RenderPipeline,
+        vertices: &GpuBuffer,
+        vertex_count: u32,
+    ) -> Result<()> {
+        VulkanBackend::draw(self, frame, pipeline, vertices, vertex_count)
+    }
+
+    fn present(&self, frame: Frame) -> Result<()> {
+        VulkanBackend::present(self, frame)
     }
 }
 
@@ -723,19 +1187,16 @@ mod tests {
     use std::ffi::c_void;
     use zunesha::InitRequest;
 
-    /// Build a backend over a headless surface (shared by the increment tests).
-    ///
-    /// Drop order (reverse declaration) is the Vulkan teardown contract:
-    /// backend (destroys swapchain + semaphore) → headless (destroys surface
-    /// while the instance is alive) → device (destroys the instance last).
-    struct TestRig {
-        backend: VulkanBackend,
-        _headless: HeadlessSurface,
-        _device: zunesha::vulkan::VulkanDevice,
+    /// Test context owning the device-lifetime resources. Field order is the
+    /// drop order (declaration order): the headless surface must be destroyed
+    /// before the device that owns its instance.
+    struct TestCtx {
+        headless: HeadlessSurface,
         _entry: Entry,
+        device: zunesha::vulkan::VulkanDevice,
     }
 
-    fn rig() -> Option<TestRig> {
+    fn rig() -> Option<TestCtx> {
         // NVIDIA's proprietary driver does not support headless-surface
         // swapchains (surface caps fail with ERROR_EXTENSION_NOT_PRESENT), so
         // headless tests pin to a driver that does — Intel (Mesa) by default,
@@ -753,66 +1214,29 @@ mod tests {
         let instance = device.raw_instance();
         let headless =
             unsafe { HeadlessSurface::new(&entry, &instance) }.expect("headless surface");
-        let surface = SurfaceHandle::VulkanSurface {
-            instance: std::ptr::null_mut(),
-            surface: headless.handle().as_raw() as usize as *mut c_void,
-        };
-        let backend = VulkanBackend::new(&device, surface).expect("VulkanBackend::new");
-        Some(TestRig {
-            backend,
-            _headless: headless,
-            _device: device,
+        Some(TestCtx {
+            headless,
             _entry: entry,
+            device,
         })
     }
 
-    /// The backend constructs, builds a swapchain, and exposes a sane extent.
-    #[test]
-    #[serial]
-    fn backend_constructs_with_swapchain() {
-        let Some(rig) = rig() else { return };
-        assert!(
-            rig.backend.image_count() >= 2,
-            "FIFO swapchain needs >= 2 images"
-        );
-        assert!(rig.backend.extent().width > 0 && rig.backend.extent().height > 0);
-        println!(
-            "swapchain: {} images, extent = {}x{}",
-            rig.backend.image_count(),
-            rig.backend.extent().width,
-            rig.backend.extent().height
-        );
-    }
-
-    /// The frame lifecycle: acquire → present, repeatedly.
-    #[test]
-    #[serial]
-    fn acquire_present_roundtrip() {
-        let Some(rig) = rig() else { return };
-        for i in 0..3 {
-            let frame = rig.backend.acquire_frame().expect("acquire_frame");
-            rig.backend.present(frame).expect("present");
-            println!("frame {i} acquired + presented");
+    impl TestCtx {
+        /// Build a backend borrowing this context's device. The backend is a
+        /// local in each test, so it drops before the context — the borrow
+        /// checker verifies it.
+        fn backend(&self) -> VulkanBackend<'_> {
+            let surface = SurfaceHandle::VulkanSurface {
+                instance: std::ptr::null_mut(),
+                surface: self.headless.handle().as_raw() as usize as *mut c_void,
+            };
+            VulkanBackend::new(&self.device, surface).expect("VulkanBackend::new")
         }
     }
 
-    /// Dropping an unpresented frame is well-defined: the next acquire works.
-    #[test]
-    #[serial]
-    fn dropping_unpresented_frame_is_safe() {
-        let Some(rig) = rig() else { return };
-        let frame = rig.backend.acquire_frame().expect("acquire_frame");
-        drop(frame); // not presented
-        let frame = rig.backend.acquire_frame().expect("acquire after drop");
-        rig.backend.present(frame).expect("present after drop");
-    }
-
-    /// A simple flat-triangle pipeline compiles from WGSL via naga.
-    #[test]
-    #[serial]
-    fn pipeline_compiles_from_flat_triangle_shaders() {
-        let Some(rig) = rig() else { return };
-        let config = PipelineConfig {
+    /// A flat-triangle vertex layout (vec2<f32> at location 0).
+    fn flat_config() -> PipelineConfig {
+        PipelineConfig {
             topology: Topology::TriangleList,
             cull_mode: CullMode::None,
             vertex_layout: crate::VertexLayout {
@@ -823,18 +1247,70 @@ mod tests {
                     format: VertexFormat::Float32x2,
                 }],
             },
-        };
-        let pipeline = rig
-            .backend
+        }
+    }
+
+    /// The backend constructs with a swapchain, render pass, framebuffers,
+    /// and a sane extent.
+    #[test]
+    #[serial]
+    fn backend_constructs_with_swapchain() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        assert!(
+            backend.image_count() >= 2,
+            "FIFO swapchain needs >= 2 images"
+        );
+        assert!(backend.extent().width > 0 && backend.extent().height > 0);
+        println!(
+            "swapchain: {} images, extent = {}x{}",
+            backend.image_count(),
+            backend.extent().width,
+            backend.extent().height
+        );
+    }
+
+    /// The frame lifecycle: acquire → present, repeatedly.
+    #[test]
+    #[serial]
+    fn acquire_present_roundtrip() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        for i in 0..3 {
+            let frame = backend.acquire_frame().expect("acquire_frame");
+            backend.present(frame).expect("present");
+            println!("frame {i} acquired + presented");
+        }
+    }
+
+    /// Dropping an unpresented frame is well-defined: the next acquire works.
+    #[test]
+    #[serial]
+    fn dropping_unpresented_frame_is_safe() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let frame = backend.acquire_frame().expect("acquire_frame");
+        drop(frame); // not presented
+        let frame = backend.acquire_frame().expect("acquire after drop");
+        backend.present(frame).expect("present after drop");
+    }
+
+    /// A simple flat-triangle pipeline compiles from WGSL via naga.
+    #[test]
+    #[serial]
+    fn pipeline_compiles_from_flat_triangle_shaders() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let pipeline = backend
             .compile_render_pipeline(
                 "vs_main",
                 crate::kernels::FLAT_TRIANGLE_VERT,
                 "fs_main",
                 crate::kernels::FLAT_TRIANGLE_FRAG,
-                &config,
+                &flat_config(),
             )
             .expect("compile_render_pipeline");
-        drop(pipeline); // exercises the pipeline drop path
+        drop(pipeline);
         println!("flat-triangle pipeline compiled + dropped cleanly");
     }
 
@@ -843,9 +1319,9 @@ mod tests {
     #[test]
     #[serial]
     fn bad_wgsl_is_rejected_with_stage_context() {
-        let Some(rig) = rig() else { return };
-        let err = rig
-            .backend
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let err = backend
             .compile_render_pipeline(
                 "vs_main",
                 "this is not wgsl at all",
@@ -868,9 +1344,9 @@ mod tests {
     #[test]
     #[serial]
     fn missing_entry_point_is_rejected() {
-        let Some(rig) = rig() else { return };
-        let err = rig
-            .backend
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let err = backend
             .compile_render_pipeline(
                 "no_such_entry",
                 crate::kernels::FLAT_TRIANGLE_VERT,
@@ -880,5 +1356,108 @@ mod tests {
             )
             .expect_err("missing entry must fail");
         assert!(matches!(err, GraphicsError::CompileFailed { .. }));
+    }
+
+    /// The complete path: draw a flat triangle, present, and read the pixels
+    /// back — proving the triangle actually rendered over the clear color.
+    ///
+    /// The fragment shader is magenta (1,0,1) and the clear is (0.1,0.1,0.1) —
+    /// both channel-order symmetric, so the assertions hold under either
+    /// B8G8R8A8 or R8G8B8A8 packing.
+    #[test]
+    #[serial]
+    fn draw_renders_triangle_verified_by_readback() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let pipeline = backend
+            .compile_render_pipeline(
+                "vs_main",
+                crate::kernels::FLAT_TRIANGLE_VERT,
+                "fs_main",
+                crate::kernels::FLAT_TRIANGLE_FRAG,
+                &flat_config(),
+            )
+            .expect("pipeline");
+        // Triangle spanning much of the viewport in NDC.
+        let vertices: [f32; 6] = [-0.5, -0.5, 0.5, -0.5, 0.0, 0.5];
+        let vb = backend.create_buffer(&vertices).expect("vertex buffer");
+
+        let mut frame = backend.acquire_frame().expect("acquire");
+        let index = frame.peek_index().expect("frame index");
+        backend.draw(&mut frame, &pipeline, &vb, 3).expect("draw");
+        backend.present(frame).expect("present");
+
+        let pixels = backend.read_pixels(index).expect("read_pixels");
+        let w = backend.extent().width as usize;
+        let h = backend.extent().height as usize;
+        assert_eq!(pixels.len(), w * h * 4, "tightly packed w*h*4 bytes");
+
+        let px = |x: usize, y: usize| -> [u8; 4] {
+            let o = (y * w + x) * 4;
+            [pixels[o], pixels[o + 1], pixels[o + 2], pixels[o + 3]]
+        };
+        // Inside the triangle (its centroid projects slightly below centre).
+        let inside = px(w / 2, h * 7 / 12);
+        // A corner far outside the triangle.
+        let outside = px(8, 8);
+        println!("inside pixel = {inside:?}, outside pixel = {outside:?}");
+
+        // Magenta: (255, 0, 255, 255) — R==B==255, G==0 regardless of channel
+        // order. Clear: 0.1 → ~26 for every channel.
+        assert!(
+            inside[0] == 255 && inside[2] == 255 && inside[1] == 0,
+            "inside pixel should be magenta, got {inside:?}"
+        );
+        assert!(
+            outside[0] == outside[1] && outside[1] == outside[2] && (24..=28).contains(&outside[0]),
+            "outside pixel should be the 0.1 gray clear, got {outside:?}"
+        );
+
+        // Not every pixel is the clear color → something was drawn.
+        let magenta_count = pixels
+            .chunks_exact(4)
+            .filter(|c| c[0] == 255 && c[1] == 0 && c[2] == 255)
+            .count();
+        println!("magenta pixels: {magenta_count} / {}", w * h);
+        assert!(
+            magenta_count > 0 && magenta_count < w * h,
+            "triangle covers part of the image"
+        );
+    }
+
+    /// Drawing into a frame that is not the one being recorded is rejected —
+    /// the frame-lifecycle guard.
+    #[test]
+    #[serial]
+    fn draw_rejects_stale_frame() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let pipeline = backend
+            .compile_render_pipeline(
+                "vs_main",
+                crate::kernels::FLAT_TRIANGLE_VERT,
+                "fs_main",
+                crate::kernels::FLAT_TRIANGLE_FRAG,
+                &flat_config(),
+            )
+            .expect("pipeline");
+        let vb = backend
+            .create_buffer(&[0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .expect("vb");
+
+        // Acquire a frame, drop it, acquire another — the first frame's index
+        // is stale (the second frame is the one being recorded).
+        let stale = backend.acquire_frame().expect("acquire");
+        let stale_index = stale.peek_index().unwrap();
+        drop(stale);
+        let _current = backend.acquire_frame().expect("acquire 2");
+
+        // Build a stale Frame manually with the old index.
+        let mut stale = Frame::from_inner(FrameInner::Acquired { index: stale_index });
+        assert!(matches!(
+            backend.draw(&mut stale, &pipeline, &vb, 3),
+            Err(GraphicsError::InvalidDraw { .. })
+        ));
+        // `_current` is dropped unpresented below — safe by design.
     }
 }

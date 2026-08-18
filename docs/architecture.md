@@ -119,6 +119,15 @@ Consequences:
 - NVIDIA-only machines cannot run Goldenweek's headless tests against real
   hardware; compute-only GB10 is refused by design (no graphics queue).
 
+### Frame-lifecycle concurrency note
+
+The frame loop is synchronous by design; `present` blocks on a per-frame
+fence. The fence is reset only immediately before the `vkQueueSubmit` that
+signals it — never in `acquire` — so a dropped (unpresented) frame can never
+leave an unsignalled fence that would deadlock the next acquire. A dropped
+frame's mid-recording command buffer is explicitly reset at the next
+`acquire`.
+
 ## Current state & next steps
 
 - ✅ Scaffold — `GraphicsBackend` trait, opaque handles, `PipelineConfig`,
@@ -132,7 +141,16 @@ Consequences:
     present mode, `acquire_frame()` / `present()` with null-on-present frame
     drop semantics. Verified headless on Intel ARL (4-image swapchain,
     repeated acquire→present).
-- ⏳ **Increment 4** — render pass + graphics pipeline (WGSL→SPIR-V via
-    `naga`), bake `PipelineConfig`.
-- ⏳ **Increment 5** — draw: flat triangle + readback/screenshot verification.
+- ✅ **Increment 4** — render pass + framebuffers + graphics pipeline
+    (WGSL→SPIR-V via `naga`, `PipelineConfig` baked: vertex input, topology,
+    culling; dynamic viewport/scissor; no blend/depth per the v0.1 refusals).
+- ✅ **Increment 5** — draw + verified rendering: `create_buffer` returns a
+    `zunesha::Buffer` (zero-copy compute→render, ADR 0001);
+    `acquire` (clear + render-pass begin) → `draw` (pipeline + vertex bind) →
+    `present` (submit with acquire/render semaphore chaining + fence, then
+    block — the synchronous loop); `read_pixels` verification:
+    a flat magenta triangle read back as (255,0,255) over the (26,26,26)
+    clear, on the Intel ARL. The backend borrows the Zunesha device
+    (`VulkanBackend<'a>` — borrow-checked lifetime, replacing the documented
+    invariant), and implements the full `GraphicsBackend` trait.
 - ⏳ Metal backend (raw `objc`) — mirroring Borsalino/Zunesha's backend split.

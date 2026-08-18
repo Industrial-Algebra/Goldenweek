@@ -225,12 +225,16 @@ impl Drop for RenderPipeline {
 
 /// Handle to a GPU buffer of vertex / index / uniform data.
 ///
-/// Created by [`GraphicsBackend::create_buffer`]. Wraps a backend-specific
-/// buffer object (Metal `MTLBuffer`, Vulkan `VkBuffer`).
+/// Created by [`GraphicsBackend::create_buffer`]. Under the shared-device
+/// architecture (Zunesha ADR 0001) a Goldenweek buffer **wraps a
+/// `zunesha::Buffer`**: a buffer Borsalino filled by compute can be bound as a
+/// vertex buffer here with zero copies.
 ///
 /// # Drop behaviour
 ///
-/// When dropped, releases its GPU resources.
+/// When dropped, releases its GPU resources (via the Zunesha buffer's own
+/// destructor). Must not outlive the backend, and in-flight frames reading it
+/// must complete first — the synchronous `present` guarantees this.
 pub struct GpuBuffer {
     pub(crate) raw: *mut c_void,
     pub(crate) len: usize,
@@ -374,13 +378,13 @@ impl GraphicsBackend for NoBackendStub {
 /// external surface.
 ///
 /// A thin, cfg-gated convenience over `vulkan::VulkanBackend::new`, mirroring
-/// `zunesha::init`. The device is borrowed (shared with Borsalino); the caller
-/// must keep it alive for the backend's lifetime.
+/// `zunesha::init`. The device is borrowed (shared with Borsalino) — the
+/// borrow checker enforces that it outlives the backend.
 #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
-pub fn init(
-    device: &zunesha::vulkan::VulkanDevice,
+pub fn init<'a>(
+    device: &'a zunesha::vulkan::VulkanDevice,
     surface: SurfaceHandle,
-) -> Result<vulkan::VulkanBackend> {
+) -> Result<vulkan::VulkanBackend<'a>> {
     vulkan::VulkanBackend::new(device, surface)
 }
 

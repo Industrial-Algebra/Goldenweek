@@ -68,6 +68,22 @@ impl Frame {
         }
     }
 
+    /// Peek at the acquired image index without consuming it.
+    ///
+    /// Returns `None` if the frame was already presented (handle null).
+    #[cfg(feature = "vulkan")]
+    pub(crate) fn peek_index(&self) -> Option<u32> {
+        if self.raw.is_null() {
+            return None;
+        }
+        // Safety: `raw` points at a live `FrameInner` produced by
+        // `from_inner`; reading without taking is safe while the frame lives.
+        let inner = unsafe { &*(self.raw as *const FrameInner) };
+        match *inner {
+            FrameInner::Acquired { index } => Some(index),
+        }
+    }
+
     /// Take the acquired image index, nulling the handle so the frame's
     /// subsequent `Drop` is a no-op.
     ///
