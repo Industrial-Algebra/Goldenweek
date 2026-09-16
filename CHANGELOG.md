@@ -49,6 +49,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `VK_EXT_headless_surface` (extension present but stubbed); headless
   graphics verification runs on Intel/Mesa. Windowed NVIDIA is unaffected.
 
+### Added — Documentation
+- **ADR 0002** — headless verification surfaces and device pinning: the
+  empirical driver matrix (NVIDIA stubs, Intel/Mesa works, llvmpipe crashes)
+  and the `GOLDENWEEK_TEST_DEVICE` convention, promoted from prose to a
+  decision record (carried by four consecutive research pulses).
+- Doc-sync pass: README quick-start now shows the real construction path
+  (borrowed Zunesha device + `goldenweek::init`), and the backend tables in
+  README and crate docs reflect the complete Vulkan backend.
+
 ### Design Refusals (v0.1 scope)
 - No `wgpu` — raw FFI (`ash`), pure Borsalino lineage.
 - No scene graph, no material system, no async frames, no depth, no

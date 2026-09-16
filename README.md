@@ -31,11 +31,16 @@ and a documented refusal list that defines the scope.
 
 ## Quick Start
 
-```rust
-use goldenweek::{GraphicsBackend, PipelineConfig, SurfaceHandle};
+```rust,ignore
+// cfg(feature = "vulkan") — construction borrows the shared Zunesha device
+// (ADR 0001: one device, shared with Borsalino's compute).
+let device = zunesha::vulkan::VulkanDevice::init_with(
+    zunesha::InitRequest::prefer_graphics(),
+)?;
 
-// Caller provides the platform surface (see SurfaceHandle docs).
-let gpu = goldenweek::init_for_surface(surface)?;
+// Caller provides the platform surface (see SurfaceHandle docs) —
+// Goldenweek never owns a window.
+let gpu = goldenweek::init(&device, surface)?;
 
 let pipeline = gpu.compile_render_pipeline(
     "vs_main", goldenweek::kernels::FLAT_TRIANGLE_VERT,
@@ -74,8 +79,8 @@ interop (particle systems, compute-then-draw) is a documented future concern
 
 | Backend | Platform | Feature | Status |
 |---|---|---|---|
-| Metal | macOS (Apple Silicon) | `metal` | 🚧 v0.2 — raw `objc_msgSend` FFI |
-| Vulkan | Linux, Windows | `vulkan` | 🚧 v0.2 — raw `ash` FFI |
+| Metal | macOS (Apple Silicon) | `metal` | 🚧 pending Zunesha-Metal (substrate-first) |
+| Vulkan | Linux, Windows | `vulkan` | ✅ v0.1 — swapchain, pipeline, draw, verified readback |
 | Stub | Any | (none) | ✅ `NoBackendStub` — safe fallback |
 
 v0.1 ships the trait, opaque handle types, and the stub. Both backends hand-roll
