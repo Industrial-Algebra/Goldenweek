@@ -20,8 +20,27 @@ The matrix below was established empirically during increments 3–5
 |---|---|---|
 | NVIDIA proprietary (RTX 5080 Laptop) | extension enumerated, surface caps / swapchain fail `ERROR_EXTENSION_NOT_PRESENT` | **unsupported** — the extension is a stub |
 | Intel / Mesa (ARL integrated) | full acquire → draw → present → readback loop | **the test device** |
-| llvmpipe (CPU rasterizer) | process crashes mid-probe | unusable — excluded |
+| llvmpipe (CPU rasterizer) | device + headless graphics loop run (2026-09-16); historically crashed mid-probe on an older stack | usable as a CPU fallback, still not pinned |
 | AMD / RADV (Phoenix1) | Zunesha device tests pass 22/22 on this hardware; Goldenweek's headless path not yet exercised there | untested for graphics |
+
+Two further Mesa findings (2026-09-16, loader 1.4.350 + current `/run/opengl-driver` Mesa, identical on ANV and llvmpipe — the shared WSI path):
+
+1. **Presented-image contents do not survive presentation.** Reading a
+   swapchain image *after* `vkQueuePresentKHR` returns converted float
+   garbage in the cleared background (the clear's UNORM bytes renormalised
+   and re-encoded as `f32` per pixel — e.g. `0.1 → 26 → f32(26/255)` →
+   `D2 D0 D0 3D`). This is spec-legal: a presented image's contents are
+   undefined until re-acquired. Consequence:
+   **`read_pixels` reads the rendered image, not the presented one** — it
+   flushes the pending recording and fence-waits *before* present.
+2. **Full-surface clears decompress wrong.** A full-surface clear — render-pass
+   load-op *or* an explicit `vkCmdClearAttachments` over the whole attachment
+   — takes the driver's fast-clear metadata path, which this Mesa build
+   decompresses to the same float garbage on WSI swapchain images. Sub-surface
+   clears and draws write real texels. Consequence: `acquire_frame` records
+   an explicit clear in **two sub-rects** covering the whole area, which
+   makes the background deterministic regardless of the fast-clear path.
+   (Verified: a one-pixel-short clear leaves exactly the last row mangled.)
 
 Enumerating the extension is *not* proof it works: a WSI-less instance
 happily returns a `vkCreateHeadlessSurfaceEXT` function pointer that then
@@ -46,14 +65,19 @@ channel order (`B8G8R8A8` vs `R8G8B8A8`).
 3. **Verification assertions are channel-order-symmetric.** The reference
    image is a flat magenta triangle (`R == B == 255`, `G == 0`) over a
    `0.1` gray clear (~26 per channel) — indistinguishable under either
-   channel order, so tests do not depend on the chosen format.
+   channel order, so tests do not depend on the chosen format. (Note the
+   per-driver clear conversion detail: Mesa truncates `0.1 → 25`, others
+   round to 26; the assertion range 24–28 absorbs both.)
 4. **The NVIDIA proprietary headless gap is accepted, documented, and
    worked around — not fixed.** Windowed presentation on NVIDIA is
    unaffected; only the headless extension is stubbed. NVIDIA-only
    contributors run the default-feature suite; the vulkan-graphics tests
    run where a headless-capable driver exists.
-5. **llvmpipe is excluded** from device enumeration for graphics tests
-   (it crashes the process mid-probe, before a skip could fire).
+5. **llvmpipe is no longer excluded** — on the current stack it runs the
+   headless loop cleanly; it is simply not pinned.
+6. **Verification reads pre-present, and clears are sub-rect** — the two
+   workarounds for the Mesa findings above, recorded in the frame-loop
+   implementation comments.
 
 ## Consequences
 
