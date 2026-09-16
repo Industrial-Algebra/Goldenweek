@@ -6,10 +6,10 @@ Goldenweek follows IA gitflow as defined in the
 [`ia-gitflow`](https://github.com/Industrial-Algebra/ia-toolkit/blob/main/skills/ia-gitflow/SKILL.md)
 skill. Read it before touching branches.
 
-> Note: the repo is currently bootstrapping on `main` (initial scaffold). Once
-> the gitflow structure is initialized — `develop` branch, branch protection,
-> CI — **all** feature work goes through `develop` via PRs. The rules below
-> apply from that point on.
+> The gitflow structure is live: `develop` exists, `main` and `develop` are
+> protected (PRs only, required CI checks, admins included), and CI runs on
+> every PR. All feature work goes through `develop` via PRs. The repo is
+> mirrored to the IA Forgejo (king-ghidorah) via dual-push on `origin`.
 
 ### Branch Model
 
