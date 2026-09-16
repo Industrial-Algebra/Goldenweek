@@ -68,11 +68,15 @@ impl Frame {
         }
     }
 
-    /// Peek at the acquired image index without consuming it.
+    /// Peek at the acquired swapchain image index without consuming it.
     ///
-    /// Returns `None` if the frame was already presented (handle null).
+    /// Useful for logging, multi-image strategies, or addressing the image
+    /// in custom readback paths (`read_pixels` itself takes the frame, so
+    /// ordinary verification does not need this). Returns `None` if the
+    /// frame was already presented (handle null).
     #[cfg(feature = "vulkan")]
-    pub(crate) fn peek_index(&self) -> Option<u32> {
+    #[must_use]
+    pub fn peek_index(&self) -> Option<u32> {
         if self.raw.is_null() {
             return None;
         }

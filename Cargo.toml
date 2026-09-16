@@ -11,8 +11,9 @@ categories = ["hardware-support", "rendering", "rendering::graphics-api"]
 
 [features]
 default = []
-# Render backends land in v0.2. v0.1 ships the trait + opaque-handle surface
-# plus a NoBackend stub, mirroring Borsalino's pre-backend state.
+# v0.1 ships the trait + opaque-handle surface, a NoBackend stub, and the
+# complete Vulkan backend over the shared Zunesha substrate. Metal lands
+# post-v0.1, substrate-first (Zunesha-Metal precedes Goldenweek-Metal).
 metal = []
 vulkan = ["dep:ash", "dep:zunesha", "zunesha/vulkan"]
 
@@ -36,3 +37,9 @@ zunesha = { path = "../Zunesha", optional = true }
 # instance/device creation (see Zunesha's serial-test note). `#[serial]`
 # keeps Goldenweek's vulkan tests from racing the loader.
 serial_test = "3"
+
+# Reference verification binary: the magenta-triangle readback proof the
+# test suite runs, promoted to a runnable example (ADR 0002 pinning applies).
+[[example]]
+name = "triangle"
+required-features = ["vulkan"]

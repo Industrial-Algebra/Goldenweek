@@ -212,8 +212,20 @@ struct RenderState {
     cmd: vk::CommandBuffer,
     /// Signalled when the frame's command buffer finishes.
     fence: vk::Fence,
-    /// The image index whose render pass is currently open, if recording.
-    recording: Option<u32>,
+    /// Where the current frame's recording stands.
+    phase: RenderPhase,
+}
+
+/// The frame-loop state machine (exhaustive — every transition is explicit).
+#[derive(Debug)]
+enum RenderPhase {
+    /// Image `u32` acquired; render pass open, commands recording.
+    Open(u32),
+    /// Recording submitted and fence-waited (a `read_pixels` flush);
+    /// contents stable, not yet presented.
+    Flushed(u32),
+    /// No frame in flight.
+    Idle,
 }
 
 /// Internal state for a compiled Vulkan pipeline, stored behind the opaque
@@ -544,7 +556,7 @@ impl<'a> VulkanBackend<'a> {
             render: Mutex::new(RenderState {
                 cmd,
                 fence,
-                recording: None,
+                phase: RenderPhase::Idle,
             }),
             graphics_queue,
             graphics_queue_family: graphics.family_index,
@@ -842,6 +854,66 @@ impl<'a> VulkanBackend<'a> {
         unsafe {
             self.device
                 .cmd_begin_render_pass(render.cmd, &rp_begin, vk::SubpassContents::INLINE);
+            // Explicit clear in two sub-rects, on top of the load-op clear.
+            //
+            // Full-surface clears — load-op or explicit — execute on the
+            // driver's "fast clear" metadata path, and at least one current
+            // Mesa build decompresses that metadata to converted float
+            // garbage on WSI swapchain images (headless). Sub-surface
+            // clears write real texels (empirically established — ADR 0002).
+            // Two rects covering the whole area between them make the
+            // background deterministic on every conformant driver,
+            // fast-clear bugs included; on healthy drivers this is a
+            // redundant overwrite of identical values. (Degenerate 1-px-high
+            // surfaces cannot avoid the full-surface path.)
+            let (w, h) = (self.extent.width, self.extent.height);
+            let mut clear_rects = Vec::with_capacity(2);
+            if h > 1 {
+                clear_rects.push(vk::ClearRect {
+                    base_array_layer: 0,
+                    layer_count: 1,
+                    rect: vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: vk::Extent2D {
+                            width: w,
+                            height: h - 1,
+                        },
+                    },
+                });
+                clear_rects.push(vk::ClearRect {
+                    base_array_layer: 0,
+                    layer_count: 1,
+                    rect: vk::Rect2D {
+                        offset: vk::Offset2D {
+                            x: 0,
+                            y: h as i32 - 1,
+                        },
+                        extent: vk::Extent2D {
+                            width: w,
+                            height: 1,
+                        },
+                    },
+                });
+            } else {
+                clear_rects.push(vk::ClearRect {
+                    base_array_layer: 0,
+                    layer_count: 1,
+                    rect: vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: vk::Extent2D {
+                            width: w,
+                            height: h,
+                        },
+                    },
+                });
+            }
+            let clear_attachments = [vk::ClearAttachment {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                color_attachment: 0,
+                clear_value: clear[0],
+            }];
+            self.device
+                .cmd_clear_attachments(render.cmd, &clear_attachments, &clear_rects);
             let viewport = vk::Viewport {
                 x: 0.0,
                 y: 0.0,
@@ -859,7 +931,7 @@ impl<'a> VulkanBackend<'a> {
             self.device
                 .cmd_set_scissor(render.cmd, 0, std::slice::from_ref(&scissor));
         }
-        render.recording = Some(index);
+        render.phase = RenderPhase::Open(index);
         drop(render);
 
         Ok(Frame::from_inner(FrameInner::Acquired { index }))
@@ -893,11 +965,11 @@ impl<'a> VulkanBackend<'a> {
         let vertex_buffer = self.zunesha_device.raw_buffer(zunesha_buffer);
 
         let render = self.render.lock().expect("render state lock");
-        if render.recording != Some(frame_index) {
+        if !matches!(render.phase, RenderPhase::Open(i) if i == frame_index) {
             return Err(GraphicsError::InvalidDraw {
                 message: format!(
                     "frame {frame_index} is not the frame being recorded ({:?})",
-                    render.recording
+                    render.phase
                 ),
             });
         }
@@ -933,60 +1005,78 @@ impl<'a> VulkanBackend<'a> {
                 message: "frame has no acquired image (already presented?)".into(),
             })?;
         let mut render = self.render.lock().expect("render state lock");
-        if render.recording != Some(index) {
-            return Err(GraphicsError::InvalidDraw {
-                message: format!(
-                    "frame {index} is not the frame being recorded ({:?})",
-                    render.recording
-                ),
-            });
-        }
+        let flushed = match render.phase {
+            RenderPhase::Open(i) if i == index => false,
+            // A `read_pixels` flush already submitted the rendering and
+            // fence-waited it; present without semaphore waits (the image is
+            // idle from the host's perspective).
+            RenderPhase::Flushed(i) if i == index => true,
+            ref other => {
+                return Err(GraphicsError::InvalidDraw {
+                    message: format!("frame {index} is not the frame being recorded ({other:?})"),
+                });
+            }
+        };
 
-        let present_result = unsafe {
-            self.device.cmd_end_render_pass(render.cmd);
-            self.device.end_command_buffer(render.cmd).map_err(|e| {
-                GraphicsError::PresentFailed {
-                    message: format!("end command buffer: {e}"),
-                }
-            })?;
-
-            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-            let submit = vk::SubmitInfo::default()
-                .wait_semaphores(std::slice::from_ref(&self.image_available))
-                .wait_dst_stage_mask(&wait_stages)
-                .command_buffers(std::slice::from_ref(&render.cmd))
-                .signal_semaphores(std::slice::from_ref(&self.render_finished));
-            // Reset the fence only now — immediately before the submit that
-            // will signal it — so it is unsignalled for the shortest possible
-            // window (unobservable in the synchronous loop).
-            self.device
-                .reset_fences(std::slice::from_ref(&render.fence))
-                .map_err(|e| GraphicsError::PresentFailed {
-                    message: format!("fence reset: {e}"),
-                })?;
-            self.device
-                .queue_submit(
-                    self.graphics_queue,
-                    std::slice::from_ref(&submit),
-                    render.fence,
-                )
-                .map_err(|e| GraphicsError::PresentFailed {
-                    message: format!("vkQueueSubmit: {e}"),
-                })?;
-
+        let present_result = if flushed {
             let swapchains = [self.swapchain];
             let indices = [index];
             let present_info = vk::PresentInfoKHR::default()
-                .wait_semaphores(std::slice::from_ref(&self.render_finished))
                 .swapchains(&swapchains)
                 .image_indices(&indices);
-            self.swapchain_fn
-                .queue_present(self.graphics_queue, &present_info)
+            // Safety: queue and image are idle (flush fence-waited).
+            unsafe {
+                self.swapchain_fn
+                    .queue_present(self.graphics_queue, &present_info)
+            }
+        } else {
+            unsafe {
+                self.device.cmd_end_render_pass(render.cmd);
+                self.device.end_command_buffer(render.cmd).map_err(|e| {
+                    GraphicsError::PresentFailed {
+                        message: format!("end command buffer: {e}"),
+                    }
+                })?;
+
+                let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+                let submit = vk::SubmitInfo::default()
+                    .wait_semaphores(std::slice::from_ref(&self.image_available))
+                    .wait_dst_stage_mask(&wait_stages)
+                    .command_buffers(std::slice::from_ref(&render.cmd))
+                    .signal_semaphores(std::slice::from_ref(&self.render_finished));
+                // Reset the fence only now — immediately before the submit that
+                // will signal it — so it is unsignalled for the shortest possible
+                // window (unobservable in the synchronous loop).
+                self.device
+                    .reset_fences(std::slice::from_ref(&render.fence))
+                    .map_err(|e| GraphicsError::PresentFailed {
+                        message: format!("fence reset: {e}"),
+                    })?;
+                self.device
+                    .queue_submit(
+                        self.graphics_queue,
+                        std::slice::from_ref(&submit),
+                        render.fence,
+                    )
+                    .map_err(|e| GraphicsError::PresentFailed {
+                        message: format!("vkQueueSubmit: {e}"),
+                    })?;
+
+                let swapchains = [self.swapchain];
+                let indices = [index];
+                let present_info = vk::PresentInfoKHR::default()
+                    .wait_semaphores(std::slice::from_ref(&self.render_finished))
+                    .swapchains(&swapchains)
+                    .image_indices(&indices);
+                self.swapchain_fn
+                    .queue_present(self.graphics_queue, &present_info)
+            }
         };
         // Block until the frame's work is complete, so the next acquire can
         // safely reset and reuse the command buffer (the synchronous
-        // frame-loop contract).
-        // Safety: the fence was submitted above on this device.
+        // frame-loop contract). In the Flushed path the fence is already
+        // signalled (and waited) — the wait returns immediately.
+        // Safety: the fence was submitted on this device (present or flush).
         unsafe {
             self.device
                 .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
@@ -995,7 +1085,7 @@ impl<'a> VulkanBackend<'a> {
                 })?;
         }
 
-        render.recording = None;
+        render.phase = RenderPhase::Idle;
         present_result
             .map(|_| ())
             .map_err(|e| GraphicsError::PresentFailed {
@@ -1003,18 +1093,81 @@ impl<'a> VulkanBackend<'a> {
             })
     }
 
-    /// Read a swapchain image's pixels back to host memory.
+    /// Read the current frame's pixels back to host memory.
     ///
-    /// Verification / screenshot path: barriers the image to a transfer
-    /// layout, copies to a Zunesha staging buffer, and reads it back. Returns
-    /// tightly packed `w*h*4` bytes, row-major, in the swapchain format's
-    /// channel order (B8G8R8A8 under the preferred UNORM format). Call only
-    /// when no frame is in flight (after [`VulkanBackend::present`] — which
-    /// blocks — or after the backend is otherwise idle).
-    pub fn read_pixels(&self, image_index: u32) -> Result<Vec<u8>> {
-        let Some(&image) = self.images.get(image_index as usize) else {
+    /// Verification / screenshot path: flushes the pending recording (the
+    /// frame loop submits at [`VulkanBackend::present`], so the rendering is
+    /// not yet on the GPU), fence-waits it, then barriers the image to a
+    /// transfer layout, copies to a Zunesha staging buffer, and reads it
+    /// back. Returns tightly packed `w*h*4` bytes, row-major, in the
+    /// swapchain format's channel order (B8G8R8A8 under the preferred UNORM
+    /// format).
+    ///
+    /// Call between [`VulkanBackend::draw`] and
+    /// [`VulkanBackend::present`] — **before** presenting. The Vulkan spec
+    /// does not guarantee a presented image's contents survive the
+    /// presentation operation (the WSI may composite or clobber it), and at
+    /// least one current Mesa headless-WSI build rewrites the background as
+    /// converted float data — verification must read the rendered image,
+    /// not the presented one (ADR 0002). Repeatable: a second call on the
+    /// same un-presented frame reads stable contents without re-submitting.
+    pub fn read_pixels(&self, frame: &Frame) -> Result<Vec<u8>> {
+        let Some(index) = frame.peek_index() else {
             return Err(GraphicsError::InvalidDraw {
-                message: format!("image index {image_index} out of range"),
+                message: "frame has no acquired image (already presented?)".into(),
+            });
+        };
+        {
+            let mut render = self.render.lock().expect("render state lock");
+            match render.phase {
+                RenderPhase::Open(i) if i == index => {
+                    // Flush the recording: end the pass, submit (consuming the
+                    // acquire semaphore), wait the fence. The image contents
+                    // are then stable on the host timeline.
+                    // Safety: command buffer is in recording state; fence is
+                    // signalled (reset immediately before the submit that
+                    // signals it).
+                    unsafe {
+                        self.device.cmd_end_render_pass(render.cmd);
+                        self.device
+                            .end_command_buffer(render.cmd)
+                            .map_err(|e| GraphicsError::Internal(format!("readback end: {e}")))?;
+                        let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+                        let submit = vk::SubmitInfo::default()
+                            .wait_semaphores(std::slice::from_ref(&self.image_available))
+                            .wait_dst_stage_mask(&wait_stages)
+                            .command_buffers(std::slice::from_ref(&render.cmd));
+                        self.device
+                            .reset_fences(std::slice::from_ref(&render.fence))
+                            .map_err(|e| GraphicsError::Internal(format!("fence reset: {e}")))?;
+                        self.device
+                            .queue_submit(
+                                self.graphics_queue,
+                                std::slice::from_ref(&submit),
+                                render.fence,
+                            )
+                            .map_err(|e| {
+                                GraphicsError::Internal(format!("readback submit: {e}"))
+                            })?;
+                        self.device
+                            .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
+                            .map_err(|e| GraphicsError::Internal(format!("readback wait: {e}")))?;
+                    }
+                    render.phase = RenderPhase::Flushed(index);
+                }
+                // Already flushed (repeat verification read) — contents stable.
+                RenderPhase::Flushed(i) if i == index => {}
+                ref other => {
+                    return Err(GraphicsError::InvalidDraw {
+                        message: format!("frame {index} is not the current frame ({other:?})"),
+                    });
+                }
+            }
+        }
+
+        let Some(&image) = self.images.get(index as usize) else {
+            return Err(GraphicsError::InvalidDraw {
+                message: format!("image index {index} out of range"),
             });
         };
         let width = self.extent.width;
@@ -1383,11 +1536,23 @@ mod tests {
         let vb = backend.create_buffer(&vertices).expect("vertex buffer");
 
         let mut frame = backend.acquire_frame().expect("acquire");
-        let index = frame.peek_index().expect("frame index");
+        let _index = frame.peek_index().expect("frame index");
         backend.draw(&mut frame, &pipeline, &vb, 3).expect("draw");
-        backend.present(frame).expect("present");
-
-        let pixels = backend.read_pixels(index).expect("read_pixels");
+        // Verification reads AFTER the render completes but BEFORE present —
+        // presented-image contents are not guaranteed to survive the WSI's
+        // presentation (spec) and current Mesa headless WSI mutates them
+        // (ADR 0002). `read_pixels` flushes the pending recording itself.
+        let pixels = backend
+            .read_pixels(&frame)
+            .expect("read_pixels pre-present");
+        let pixels_twice = backend
+            .read_pixels(&frame)
+            .expect("read_pixels is idempotent");
+        assert_eq!(
+            pixels, pixels_twice,
+            "second read of an unflushed-but-flushed frame"
+        );
+        backend.present(frame).expect("present after readback");
         let w = backend.extent().width as usize;
         let h = backend.extent().height as usize;
         assert_eq!(pixels.len(), w * h * 4, "tightly packed w*h*4 bytes");

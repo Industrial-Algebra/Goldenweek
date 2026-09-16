@@ -58,6 +58,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (borrowed Zunesha device + `goldenweek::init`), and the backend tables in
   README and crate docs reflect the complete Vulkan backend.
 
+### Added — `examples/triangle` (vulkan feature)
+- The magenta-triangle readback verification, promoted to a runnable binary
+  — pins the public API to something a consumer can target (report
+  recommendation, carried by three pulses). Pins via `GOLDENWEEK_TEST_DEVICE`,
+  skips gracefully on device-less hosts, `required-features = ["vulkan"]`.
+
+### Changed — Spec-safe verification (found via the example, 2026-09-16)
+- **`read_pixels(&frame)` now reads the *rendered* image, not the presented
+  one** — it flushes the pending recording and fence-waits before the
+  barrier/copy. Reading after `vkQueuePresentKHR` was spec-fragile: presented
+  contents are undefined (WSI may clobber), and the current Mesa headless
+  WSI does. Call between `draw` and `present`; repeat calls are idempotent.
+- **`present` accepts both frame-loop phases** (`Open` — submits with
+  semaphore chaining; `Flushed` — presents with no waits, the flush already
+  fence-waited). Internal `RenderPhase` state machine (`Open` / `Flushed` /
+  `Idle`) replaces the `recording: Option<u32>`.
+- **`acquire_frame` records an explicit clear in two sub-rects** —
+  full-surface clears (load-op or explicit) take the driver's fast-clear
+  metadata path, which the current Mesa decompresses to float garbage on
+  headless WSI swapchain images; sub-surface clears write real texels
+  (ADR 0002, findings 1–2).
+- `Frame::peek_index` is now public — verification consumers need the image
+  index after `present` consumes the frame handle.
+
 ### Design Refusals (v0.1 scope)
 - No `wgpu` — raw FFI (`ash`), pure Borsalino lineage.
 - No scene graph, no material system, no async frames, no depth, no
