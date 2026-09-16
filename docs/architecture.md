@@ -67,11 +67,12 @@ From Goldenweek's side, this means:
 - Goldenweek refuses to initialise where the device has no graphics queue
   (`has_graphics() == false`) — the compute-only-hardware case (GB10 / DGX Spark).
 
-> **Current state:** Goldenweek is not yet wired to depend on Zunesha. The
-> scaffold defines its own `GpuBuffer` and an `init_for_surface` entry point over
-> an independent device stub (`NoBackendStub`). The "Step C" reshape — making
-> `GpuBuffer` wrap `zunesha::Buffer` and constructing the backend over a
-> `zunesha::Device` — is the next integration step.
+> **Current state:** wired since Step C (commit `89a7659`): `GpuBuffer` wraps a
+> `zunesha::Buffer` (zero-copy compute→render interop per ADR 0001) and
+> `VulkanBackend<'a>` is constructed over a *borrowed*
+> `zunesha::vulkan::VulkanDevice` — the borrow checker enforces that the device
+> outlives the backend. Headless test posture is decided in
+> [ADR 0002](adr/0002-headless-verification-and-device-pinning.md).
 
 ## Verification posture
 
@@ -104,7 +105,8 @@ of the public API.
 ## Hardware compatibility notes (headless testing)
 
 Empirically established on the development laptop (RTX 5080 + Intel ARL +
-llvmpipe), 2026-08-12:
+llvmpipe), 2026-08-12 — promoted to a decision record in
+[ADR 0002](adr/0002-headless-verification-and-device-pinning.md):
 
 | Driver | Headless surface caps | Swapchain | Verdict |
 |---|---|---|---|

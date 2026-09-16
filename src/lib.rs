@@ -31,10 +31,10 @@
 //!
 //! ## Backends
 //!
-//! | Feature  | Platform       | Status (v0.1)         |
-//! |----------|----------------|-----------------------|
-//! | `metal`  | macOS          | 🚧 Trait + stub only  |
-//! | `vulkan` | Linux, Windows | 🚧 Trait + stub only  |
+//! | Feature  | Platform       | Status (v0.1)                                          |
+//! |----------|----------------|--------------------------------------------------------|
+//! | `metal`  | macOS          | 🚧 pending Zunesha-Metal (substrate-first)              |
+//! | `vulkan` | Linux, Windows | ✅ swapchain · pipeline · draw · verified readback     |
 //!
 //! v0.1 ships the [`GraphicsBackend`] trait, the opaque handle types, and a
 //! [`NoBackendStub`] that returns [`GraphicsError::NoBackend`] for every
