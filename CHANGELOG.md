@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0] — Unreleased
 
+### Changed
+- Zunesha dependency switched from path (`../Zunesha`) to the published
+  crates.io version (`0.1`) — Goldenweek now builds and verifies against
+  the released crate (13 tests + triangle example pass on RTX 5080
+  against registry zunesha 0.1.0).
+
 ### Added — Backend-Agnostic Surface
 - **`GraphicsBackend` trait** — the single graphics abstraction, mirroring
   Borsalino's `ComputeBackend` posture: construction is backend-specific
