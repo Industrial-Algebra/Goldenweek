@@ -99,7 +99,7 @@ collapses complexity and is reversible only via a documented ADR:
 | 2 | **No `wgpu` dependency.** Hand-roll Metal/Vulkan FFI. | Maximum auditability; true Borsalino lineage. |
 | 3 | **No scene graph, no materials, no text/font.** | Those belong to Miriami (the framework layer). Goldenweek is the dumb device layer. |
 | 4 | **No async-by-default.** Synchronous `acquire → draw → present`. | Matches Borsalino's dispatch model and the WASM-host story in Baedeker. |
-| 5 | **No depth/stencil, blend, or multisample at v0.1.** | Flat-shaded triangles prove the architecture first. |
+| 5 | **No stencil or multisample at v0.1** — depth testing and color blending ship via `PipelineConfig::depth` / `PipelineConfig::blend` (increment 6). | Depth + blending landed with hardware-verified tests; stencil/MSAA remain for later increments. |
 | 6 | **No textures at v0.1.** | Grow by proven need. |
 
 ## Architecture

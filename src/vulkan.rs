@@ -114,6 +114,53 @@ fn to_vk_format(f: VertexFormat) -> vk::Format {
     }
 }
 
+/// Map [`CompareOp`](crate::CompareOp) to Vulkan compare ops.
+fn to_vk_compare(op: crate::CompareOp) -> vk::CompareOp {
+    match op {
+        crate::CompareOp::Never => vk::CompareOp::NEVER,
+        crate::CompareOp::Less => vk::CompareOp::LESS,
+        crate::CompareOp::Equal => vk::CompareOp::EQUAL,
+        crate::CompareOp::LessEqual => vk::CompareOp::LESS_OR_EQUAL,
+        crate::CompareOp::Greater => vk::CompareOp::GREATER,
+        crate::CompareOp::NotEqual => vk::CompareOp::NOT_EQUAL,
+        crate::CompareOp::GreaterEqual => vk::CompareOp::GREATER_OR_EQUAL,
+        crate::CompareOp::Always => vk::CompareOp::ALWAYS,
+    }
+}
+
+/// Map [`BlendFactor`](crate::BlendFactor) to Vulkan blend factors.
+fn to_vk_blend_factor(f: crate::BlendFactor) -> vk::BlendFactor {
+    match f {
+        crate::BlendFactor::Zero => vk::BlendFactor::ZERO,
+        crate::BlendFactor::One => vk::BlendFactor::ONE,
+        crate::BlendFactor::SrcAlpha => vk::BlendFactor::SRC_ALPHA,
+        crate::BlendFactor::OneMinusSrcAlpha => vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+        crate::BlendFactor::SrcColor => vk::BlendFactor::SRC_COLOR,
+        crate::BlendFactor::OneMinusSrcColor => vk::BlendFactor::ONE_MINUS_SRC_COLOR,
+        crate::BlendFactor::DstColor => vk::BlendFactor::DST_COLOR,
+        crate::BlendFactor::OneMinusDstColor => vk::BlendFactor::ONE_MINUS_DST_COLOR,
+    }
+}
+
+/// Pick the first depth format the device supports as an optimal-tiling
+/// depth-stencil attachment. Preference order: D32 → D24S8 → D16.
+fn pick_depth_format(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<vk::Format> {
+    for format in [
+        vk::Format::D32_SFLOAT,
+        vk::Format::D24_UNORM_S8_UINT,
+        vk::Format::D16_UNORM,
+    ] {
+        let props = unsafe { instance.get_physical_device_format_properties(physical, format) };
+        if props
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+        {
+            return Some(format);
+        }
+    }
+    None
+}
+
 // ── Headless surface (tests / headless rendering) ──────────────────
 
 /// RAII headless presentation surface.
@@ -301,6 +348,16 @@ pub struct VulkanBackend<'a> {
     format: vk::Format,
     /// One image view per swapchain image.
     image_views: Vec<vk::ImageView>,
+    /// Depth image sized to the swapchain extent (always allocated — the
+    /// render pass carries the depth attachment; pipelines opt in per
+    /// [`PipelineConfig::depth`](crate::PipelineConfig::depth)).
+    depth_image: vk::Image,
+    /// Device memory backing [`Self::depth_image`].
+    depth_memory: vk::DeviceMemory,
+    /// View of [`Self::depth_image`] bound into every framebuffer.
+    depth_view: vk::ImageView,
+    /// Chosen depth attachment format.
+    depth_format: vk::Format,
     /// Render pass: single color attachment, clear→store, UNDEFINED→PRESENT.
     render_pass: vk::RenderPass,
     /// One framebuffer per swapchain image, sized to `extent`.
@@ -340,6 +397,9 @@ impl Drop for VulkanBackend<'_> {
                 self.device.destroy_image_view(view, None);
             }
             self.device.destroy_render_pass(self.render_pass, None);
+            self.device.destroy_image_view(self.depth_view, None);
+            self.device.destroy_image(self.depth_image, None);
+            self.device.free_memory(self.depth_memory, None);
             self.device.destroy_semaphore(self.image_available, None);
             self.device.destroy_semaphore(self.render_finished, None);
             self.device.destroy_command_pool(self.command_pool, None);
@@ -486,15 +546,89 @@ impl<'a> VulkanBackend<'a> {
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+
+        // Depth attachment: cleared to 1.0 (far plane) at pass begin, contents
+        // discarded at pass end — nothing outside the pass consumes depth.
+        // The image is allocated even when no pipeline uses it (v0.1
+        // simplification: one render pass, every pipeline subpass-compatible);
+        // at headless extents this is negligible, and a real window pays one
+        // depth-sized allocation.
+        let depth_format = pick_depth_format(&instance, physical_device).ok_or_else(|| {
+            GraphicsError::InitFailed("no supported depth format (D32/D24S8/D16)".into())
+        })?;
+        let depth_ci = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(depth_format)
+            .extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let depth_image = unsafe { logical.create_image(&depth_ci, None) }
+            .map_err(|e| GraphicsError::InitFailed(format!("vkCreateImage (depth): {e}")))?;
+        let depth_req = unsafe { logical.get_image_memory_requirements(depth_image) };
+        let memory_props =
+            unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let memory_type = (0..memory_props.memory_type_count)
+            .find(|&i| {
+                depth_req.memory_type_bits & (1 << i) != 0
+                    && memory_props.memory_types[i as usize]
+                        .property_flags
+                        .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            })
+            .ok_or_else(|| {
+                GraphicsError::InitFailed("no device-local memory type for depth image".into())
+            })?;
+        let depth_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(depth_req.size)
+            .memory_type_index(memory_type);
+        let depth_memory = unsafe { logical.allocate_memory(&depth_alloc, None) }
+            .map_err(|e| GraphicsError::InitFailed(format!("vkAllocateMemory (depth): {e}")))?;
+        unsafe { logical.bind_image_memory(depth_image, depth_memory, 0) }
+            .map_err(|e| GraphicsError::InitFailed(format!("vkBindImageMemory (depth): {e}")))?;
+        let depth_view_ci = vk::ImageViewCreateInfo::default()
+            .image(depth_image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(depth_format)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                    .level_count(1)
+                    .layer_count(1),
+            );
+        let depth_view = unsafe { logical.create_image_view(&depth_view_ci, None) }
+            .map_err(|e| GraphicsError::InitFailed(format!("vkCreateImageView (depth): {e}")))?;
+
+        let depth_attachment = vk::AttachmentDescription::default()
+            .format(depth_format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         let color_ref = [vk::AttachmentReference {
             attachment: 0,
             layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         }];
+        let depth_ref = vk::AttachmentReference {
+            attachment: 1,
+            layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        };
         let subpass = vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-            .color_attachments(&color_ref);
+            .color_attachments(&color_ref)
+            .depth_stencil_attachment(&depth_ref);
+        let attachments = [attachment, depth_attachment];
         let rp_ci = vk::RenderPassCreateInfo::default()
-            .attachments(std::slice::from_ref(&attachment))
+            .attachments(&attachments)
             .subpasses(std::slice::from_ref(&subpass));
         let render_pass = unsafe { logical.create_render_pass(&rp_ci, None) }
             .map_err(|e| GraphicsError::InitFailed(format!("vkCreateRenderPass: {e}")))?;
@@ -502,9 +636,10 @@ impl<'a> VulkanBackend<'a> {
         let framebuffers: Vec<vk::Framebuffer> = image_views
             .iter()
             .map(|&view| {
+                let fb_attachments = [view, depth_view];
                 let ci = vk::FramebufferCreateInfo::default()
                     .render_pass(render_pass)
-                    .attachments(std::slice::from_ref(&view))
+                    .attachments(&fb_attachments)
                     .width(extent.width)
                     .height(extent.height)
                     .layers(1);
@@ -550,6 +685,10 @@ impl<'a> VulkanBackend<'a> {
             extent,
             format: format.format,
             image_views,
+            depth_image,
+            depth_memory,
+            depth_view,
+            depth_format,
             render_pass,
             framebuffers,
             command_pool,
@@ -594,6 +733,13 @@ impl<'a> VulkanBackend<'a> {
     #[must_use]
     pub fn format(&self) -> vk::Format {
         self.format
+    }
+
+    /// The depth attachment format chosen at construction (D32 → D24S8 →
+    /// D16, first supported).
+    #[must_use]
+    pub fn depth_format(&self) -> vk::Format {
+        self.depth_format
     }
 
     /// Compile a WGSL vertex + fragment pair into a render pipeline.
@@ -696,8 +842,33 @@ impl<'a> VulkanBackend<'a> {
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-        let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
-            .color_write_mask(vk::ColorComponentFlags::RGBA);
+        // Depth: off unless the pipeline opts in. A pipeline with no depth
+        // state inside a subpass that *has* a depth attachment is legal — it
+        // simply never consults the buffer.
+        let depth_stencil = match config.depth {
+            Some(depth) => vk::PipelineDepthStencilStateCreateInfo::default()
+                .depth_test_enable(true)
+                .depth_write_enable(depth.write_enable)
+                .depth_compare_op(to_vk_compare(depth.compare))
+                .min_depth_bounds(0.0)
+                .max_depth_bounds(1.0),
+            None => vk::PipelineDepthStencilStateCreateInfo::default(),
+        };
+        // Blend: opaque write unless the pipeline opts in. v0.1 applies the
+        // same factors to the alpha channel as to color and only the Add op.
+        let blend_attachment = match config.blend {
+            Some(mode) => vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA)
+                .blend_enable(true)
+                .src_color_blend_factor(to_vk_blend_factor(mode.src_factor))
+                .dst_color_blend_factor(to_vk_blend_factor(mode.dst_factor))
+                .color_blend_op(vk::BlendOp::ADD)
+                .src_alpha_blend_factor(to_vk_blend_factor(mode.src_factor))
+                .dst_alpha_blend_factor(to_vk_blend_factor(mode.dst_factor))
+                .alpha_blend_op(vk::BlendOp::ADD),
+            None => vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA),
+        };
         let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
             .logic_op_enable(false)
             .attachments(std::slice::from_ref(&blend_attachment));
@@ -722,6 +893,7 @@ impl<'a> VulkanBackend<'a> {
             .viewport_state(&viewport_state)
             .rasterization_state(&rasterization)
             .multisample_state(&multisample)
+            .depth_stencil_state(&depth_stencil)
             .color_blend_state(&color_blend)
             .dynamic_state(&dynamic_state)
             .layout(layout)
@@ -838,11 +1010,19 @@ impl<'a> VulkanBackend<'a> {
                     message: format!("begin command buffer: {e}"),
                 })?;
         }
-        let clear = [vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: [0.1, 0.1, 0.1, 1.0],
+        let clear = [
+            vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [0.1, 0.1, 0.1, 1.0],
+                },
             },
-        }];
+            vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
+            },
+        ];
         let rp_begin = vk::RenderPassBeginInfo::default()
             .render_pass(self.render_pass)
             .framebuffer(self.framebuffers[index as usize])
@@ -1392,6 +1572,8 @@ mod tests {
         PipelineConfig {
             topology: Topology::TriangleList,
             cull_mode: CullMode::None,
+            depth: None,
+            blend: None,
             vertex_layout: crate::VertexLayout {
                 stride: 8,
                 attributes: vec![crate::VertexAttribute {
@@ -1587,6 +1769,200 @@ mod tests {
         assert!(
             magenta_count > 0 && magenta_count < w * h,
             "triangle covers part of the image"
+        );
+    }
+
+    // ── Depth + blend fixtures (increment 6) ───────────────────────────
+
+    /// Full-frame triangle with per-vertex z — clip-space (x, y, z).
+    const DEPTH_VERT: &str = r#"
+struct VOut { @builtin(position) pos: vec4<f32> };
+
+@vertex
+fn vs_main(@location(0) p: vec3<f32>) -> VOut {
+    return VOut(vec4<f32>(p, 1.0));
+}
+"#;
+
+    /// Solid green fragment.
+    const GREEN_FRAG: &str = r#"
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0, 1.0, 0.0, 1.0);
+}
+"#;
+
+    /// Solid red fragment.
+    const RED_FRAG: &str = r#"
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 0.0, 0.0, 1.0);
+}
+"#;
+
+    /// Semi-transparent magenta fragment (alpha 0.5) — for blending.
+    const HALF_ALPHA_MAGENTA_FRAG: &str = r#"
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 0.0, 1.0, 0.5);
+}
+"#;
+
+    /// A vec3 (x, y, z) vertex layout for the depth fixtures.
+    fn depth_config(depth: Option<crate::DepthState>) -> PipelineConfig {
+        PipelineConfig {
+            topology: Topology::TriangleList,
+            cull_mode: CullMode::None,
+            vertex_layout: crate::VertexLayout {
+                stride: 12,
+                attributes: vec![crate::VertexAttribute {
+                    location: 0,
+                    offset: 0,
+                    format: VertexFormat::Float32x3,
+                }],
+            },
+            depth,
+            blend: None,
+        }
+    }
+
+    /// Depth test: the NEAR triangle survives being drawn FIRST — the far
+    /// triangle drawn second fails the depth test instead of overwriting it.
+    /// Without a depth state the same draw order leaves the far colour (the
+    /// test's control), so the assertion discriminates depth from overdraw.
+    #[test]
+    #[serial]
+    fn depth_test_rejects_far_overdraw() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+
+        let near = backend
+            .compile_render_pipeline(
+                "vs_main",
+                DEPTH_VERT,
+                "fs_main",
+                GREEN_FRAG,
+                &depth_config(Some(crate::DepthState::default())),
+            )
+            .expect("near pipeline");
+        let far = backend
+            .compile_render_pipeline(
+                "vs_main",
+                DEPTH_VERT,
+                "fs_main",
+                RED_FRAG,
+                &depth_config(Some(crate::DepthState::default())),
+            )
+            .expect("far pipeline");
+
+        // Full-frame triangles: (-1,-1) (3,-1) (-1,3) covers every pixel,
+        // one at z = 0.0 (near), one at z = 0.5 (far).
+        let near_vb = backend
+            .create_buffer(&[-1.0f32, -1.0, 0.0, 3.0, -1.0, 0.0, -1.0, 3.0, 0.0])
+            .expect("near vb");
+        let far_vb = backend
+            .create_buffer(&[-1.0f32, -1.0, 0.5, 3.0, -1.0, 0.5, -1.0, 3.0, 0.5])
+            .expect("far vb");
+
+        let mut frame = backend.acquire_frame().expect("acquire");
+        backend
+            .draw(&mut frame, &near, &near_vb, 3)
+            .expect("draw near");
+        backend
+            .draw(&mut frame, &far, &far_vb, 3)
+            .expect("draw far");
+        let pixels = backend.read_pixels(&frame).expect("read_pixels");
+        backend.present(frame).expect("present");
+
+        let w = backend.extent().width as usize;
+        let h = backend.extent().height as usize;
+        let px = |x: usize, y: usize| -> [u8; 4] {
+            let o = (y * w + x) * 4;
+            [pixels[o], pixels[o + 1], pixels[o + 2], pixels[o + 3]]
+        };
+        let centre = px(w / 2, h / 2);
+        println!("depth centre pixel = {centre:?}");
+        // Green: R==B==0, G==255 regardless of channel order.
+        assert!(
+            centre[1] == 255 && centre[0] == 0 && centre[2] == 0,
+            "near (green) must survive the far (red) overdraw, got {centre:?}"
+        );
+    }
+
+    /// Alpha blending: a 0.5-alpha magenta triangle over the 0.1 gray clear
+    /// composites to ~half-magenta. The green channel is exact arithmetic
+    // (0.5 * 0 + 0.5 * 26 = 13) and the red/blue channels are 140.5 ± driver
+    /// rounding, so tolerance 1 covers unorm rounding.
+    #[test]
+    #[serial]
+    fn alpha_blend_composites_over_clear() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+
+        let opaque = backend
+            .compile_render_pipeline(
+                "vs_main",
+                DEPTH_VERT,
+                "fs_main",
+                HALF_ALPHA_MAGENTA_FRAG,
+                &depth_config(None), // depth off; blend default None (control)
+            )
+            .expect("opaque pipeline");
+        let blended = backend
+            .compile_render_pipeline(
+                "vs_main",
+                DEPTH_VERT,
+                "fs_main",
+                HALF_ALPHA_MAGENTA_FRAG,
+                &PipelineConfig {
+                    blend: Some(crate::BlendMode::alpha()),
+                    ..depth_config(None)
+                },
+            )
+            .expect("blended pipeline");
+
+        let vb = backend
+            .create_buffer(&[-1.0f32, -1.0, 0.0, 3.0, -1.0, 0.0, -1.0, 3.0, 0.0])
+            .expect("vb");
+
+        // Control frame: no blend → alpha is written raw, colour is full magenta.
+        let mut frame = backend.acquire_frame().expect("acquire control");
+        backend
+            .draw(&mut frame, &opaque, &vb, 3)
+            .expect("draw control");
+        let control = backend.read_pixels(&frame).expect("read control");
+        backend.present(frame).expect("present control");
+
+        // Blended frame: 0.5 * magenta + 0.5 * clear.
+        let mut frame = backend.acquire_frame().expect("acquire blended");
+        backend
+            .draw(&mut frame, &blended, &vb, 3)
+            .expect("draw blended");
+        let pixels = backend.read_pixels(&frame).expect("read blended");
+        backend.present(frame).expect("present blended");
+
+        let w = backend.extent().width as usize;
+        let h = backend.extent().height as usize;
+        let px = |p: &[u8], x: usize, y: usize| -> [u8; 4] {
+            let o = (y * w + x) * 4;
+            [p[o], p[o + 1], p[o + 2], p[o + 3]]
+        };
+        let c = px(&control, w / 2, h / 2);
+        let b = px(&pixels, w / 2, h / 2);
+        println!("control pixel = {c:?}, blended pixel = {b:?}");
+        assert!(
+            c[0] == 255 && c[2] == 255 && c[1] == 0,
+            "unblended control must be full magenta, got {c:?}"
+        );
+        // R/B: 0.5 * 255 + 0.5 * 26 = 140.5 → within 1 of 140.5 after unorm
+        // rounding. G: 0.5 * 0 + 0.5 * 26 = 13 exactly.
+        assert!(
+            (b[0] as i32 - 140).abs() <= 1 && (b[2] as i32 - 140).abs() <= 1,
+            "blended R/B ≈ 140.5, got {b:?}"
+        );
+        assert!(
+            (b[1] as i32 - 13).abs() <= 1,
+            "blended G = 13 (0.5 * clear), got {b:?}"
         );
     }
 

@@ -48,7 +48,7 @@ surface deliberately omits:
 | **No `wgpu`** — raw FFI (Vulkan/`ash`, Metal/`objc`, `naga`) | Borsalino lineage: maximum auditability, no hidden translation layer. |
 | **No scene graph / materials** | Those belong to Miriami, the framework layer above. Goldenweek renders what it is given. |
 | **No async** | Synchronous, auditable frame loop at this layer. |
-| **No depth/blend/textures** (v0.1) | Clear + flat vertex rendering first; these come in later increments. |
+| **No stencil/textures** (v0.1) | Depth testing and color blending ship in this release (increment 6); stencil, sampled images, and MSAA remain later increments. |
 
 Full rationale in [ADR 0001](adr/0001-graphics-surface-and-scope.md).
 
@@ -155,4 +155,14 @@ frame's mid-recording command buffer is explicitly reset at the next
     clear, on the Intel ARL. The backend borrows the Zunesha device
     (`VulkanBackend<'a>` — borrow-checked lifetime, replacing the documented
     invariant), and implements the full `GraphicsBackend` trait.
+- ✅ **Increment 6** — depth + blending: the render pass carries a depth
+    attachment (format chosen D32 → D24S8 → D16 by support, depth image
+    always allocated — one depth-sized allocation, documented v0.1
+    simplification), and `PipelineConfig` grows `depth: Option<DepthState>`
+    (compare op + write, default `Less` + write) and `blend:
+    Option<BlendMode>` (additive factors, `BlendMode::alpha()` / `additive()` /
+    `multiply()` presets) — both `None` by default, so existing pipelines are
+    unchanged. Hardware-verified: a near triangle drawn *first* survives a
+    far triangle drawn second (depth), and a 0.5-alpha magenta triangle
+    composites to textbook unorm values over the gray clear (blend).
 - ⏳ Metal backend (raw `objc`) — mirroring Borsalino/Zunesha's backend split.

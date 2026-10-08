@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0] — Unreleased
 
+### Added — Depth Testing & Blending (Increment 6)
+- **`DepthState`** (`PipelineConfig::depth`): fixed-function depth test —
+  `CompareOp` (Never/Less/Equal/LessEqual/Greater/NotEqual/GreaterEqual/
+  Always) + `write_enable`; defaults to `Less` + write.
+- **`BlendMode`** (`PipelineConfig::blend`): additive color blending with
+  `BlendFactor` pairs (alpha factors mirror color factors, v0.1); presets
+  `alpha()`, `additive()`, `multiply()`.
+- Both options default to `None` — existing pipelines compile and render
+  identically (additive surface).
+- The Vulkan render pass now carries a depth attachment (D32 → D24S8 → D16
+  by support; the depth image is always allocated — documented v0.1
+  simplification so any pipeline is subpass-compatible); `VulkanBackend::
+  depth_format()` exposes the chosen format.
+- Hardware-verified on a real device: depth — a near triangle drawn first
+  survives a far overdraw; blend — 0.5-alpha magenta over the 0.1 gray clear
+  reads back textbook unorm composites (140/12/140/191). New tests:
+  `depth_test_rejects_far_overdraw`, `alpha_blend_composites_over_clear`,
+  plus config-default unit tests.
+
 ### Added — Backend-Agnostic Surface
 - **`GraphicsBackend` trait** — the single graphics abstraction, mirroring
   Borsalino's `ComputeBackend` posture: construction is backend-specific
