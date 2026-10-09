@@ -317,18 +317,23 @@ pub(super) fn drop_zunesha_buffer_box(raw: *mut c_void) {
 
 /// RAII cleanup for `VulkanBackend::new`'s partial construction.
 ///
-/// Every object created after the swapchain is registered here; if `new`
-/// fails at any later `?`, `Drop` destroys exactly what exists so far (in
-/// reverse creation order) and nothing leaks on the caller's device. On
+/// Every object is registered with the guard the moment it is created —
+/// BEFORE the next fallible call — so if `new` fails at any later `?`,
+/// `Drop` destroys exactly what exists so far (in reverse creation order)
+/// and nothing leaks on the caller's device (review rounds 1–2). On
 /// success `disarm` empties the guard so its drop is a no-op and `Self`
-/// takes ownership (review round 1, P2).
+/// takes ownership.
 struct InitScratch<'a> {
     device: &'a ash::Device,
     swapchain_fn: &'a khr::swapchain::Device,
     swapchain: vk::SwapchainKHR,
     image_views: Vec<vk::ImageView>,
-    /// (view, image, memory) — destroyed in that order.
-    depth: Option<(vk::ImageView, vk::Image, vk::DeviceMemory)>,
+    /// Registered immediately after `vkCreateImage` (depth).
+    depth_image: Option<vk::Image>,
+    /// Registered immediately after `vkAllocateMemory` (depth).
+    depth_memory: Option<vk::DeviceMemory>,
+    /// Registered immediately after `vkCreateImageView` (depth).
+    depth_view: Option<vk::ImageView>,
     render_pass: Option<vk::RenderPass>,
     framebuffers: Vec<vk::Framebuffer>,
     command_pool: Option<vk::CommandPool>,
@@ -342,7 +347,9 @@ impl InitScratch<'_> {
     fn disarm(&mut self) {
         self.swapchain = vk::SwapchainKHR::null();
         self.image_views.clear();
-        self.depth = None;
+        self.depth_image = None;
+        self.depth_memory = None;
+        self.depth_view = None;
         self.render_pass = None;
         self.framebuffers.clear();
         self.command_pool = None;
@@ -356,7 +363,8 @@ impl Drop for InitScratch<'_> {
     fn drop(&mut self) {
         // Safety: every handle here was created in `new` and, because the
         // guard is still armed, was never handed to `Self` — it is owned
-        // exclusively and no submission has ever referenced it.
+        // exclusively and no submission has ever referenced it. Depth
+        // fields are independent Options so any partial trio is cleaned.
         unsafe {
             for &fb in &self.framebuffers {
                 self.device.destroy_framebuffer(fb, None);
@@ -364,9 +372,13 @@ impl Drop for InitScratch<'_> {
             if let Some(rp) = self.render_pass {
                 self.device.destroy_render_pass(rp, None);
             }
-            if let Some((view, image, memory)) = self.depth {
+            if let Some(view) = self.depth_view {
                 self.device.destroy_image_view(view, None);
+            }
+            if let Some(image) = self.depth_image {
                 self.device.destroy_image(image, None);
+            }
+            if let Some(memory) = self.depth_memory {
                 self.device.free_memory(memory, None);
             }
             for &view in &self.image_views {
@@ -604,7 +616,9 @@ impl<'a> VulkanBackend<'a> {
             swapchain_fn: &swapchain_fn,
             swapchain,
             image_views: Vec::new(),
-            depth: None,
+            depth_image: None,
+            depth_memory: None,
+            depth_view: None,
             render_pass: None,
             framebuffers: Vec::new(),
             command_pool: None,
@@ -621,19 +635,21 @@ impl<'a> VulkanBackend<'a> {
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .level_count(1)
             .layer_count(1);
-        let image_views: Vec<vk::ImageView> = images
-            .iter()
-            .map(|&image| {
-                let ci = vk::ImageViewCreateInfo::default()
-                    .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(format.format)
-                    .subresource_range(subresource);
-                unsafe { logical.create_image_view(&ci, None) }
-                    .map_err(|e| GraphicsError::InitFailed(format!("vkCreateImageView: {e}")))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        scratch.image_views = image_views.clone();
+        // Each handle is registered with the guard the moment it exists,
+        // before the next fallible call — a partial collection must not drop
+        // raw Vulkan handles as integers (review round 2, P2).
+        let mut image_views: Vec<vk::ImageView> = Vec::new();
+        for &image in &images {
+            let ci = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format.format)
+                .subresource_range(subresource);
+            let view = unsafe { logical.create_image_view(&ci, None) }
+                .map_err(|e| GraphicsError::InitFailed(format!("vkCreateImageView: {e}")))?;
+            scratch.image_views.push(view);
+            image_views.push(view);
+        }
 
         let attachment = vk::AttachmentDescription::default()
             .format(format.format)
@@ -670,6 +686,7 @@ impl<'a> VulkanBackend<'a> {
             .initial_layout(vk::ImageLayout::UNDEFINED);
         let depth_image = unsafe { logical.create_image(&depth_ci, None) }
             .map_err(|e| GraphicsError::InitFailed(format!("vkCreateImage (depth): {e}")))?;
+        scratch.depth_image = Some(depth_image);
         let depth_req = unsafe { logical.get_image_memory_requirements(depth_image) };
         let memory_props =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
@@ -688,6 +705,7 @@ impl<'a> VulkanBackend<'a> {
             .memory_type_index(memory_type);
         let depth_memory = unsafe { logical.allocate_memory(&depth_alloc, None) }
             .map_err(|e| GraphicsError::InitFailed(format!("vkAllocateMemory (depth): {e}")))?;
+        scratch.depth_memory = Some(depth_memory);
         unsafe { logical.bind_image_memory(depth_image, depth_memory, 0) }
             .map_err(|e| GraphicsError::InitFailed(format!("vkBindImageMemory (depth): {e}")))?;
         let depth_view_ci = vk::ImageViewCreateInfo::default()
@@ -702,7 +720,7 @@ impl<'a> VulkanBackend<'a> {
             );
         let depth_view = unsafe { logical.create_image_view(&depth_view_ci, None) }
             .map_err(|e| GraphicsError::InitFailed(format!("vkCreateImageView (depth): {e}")))?;
-        scratch.depth = Some((depth_view, depth_image, depth_memory));
+        scratch.depth_view = Some(depth_view);
 
         let depth_attachment = vk::AttachmentDescription::default()
             .format(depth_format)
@@ -733,21 +751,20 @@ impl<'a> VulkanBackend<'a> {
             .map_err(|e| GraphicsError::InitFailed(format!("vkCreateRenderPass: {e}")))?;
         scratch.render_pass = Some(render_pass);
 
-        let framebuffers: Vec<vk::Framebuffer> = image_views
-            .iter()
-            .map(|&view| {
-                let fb_attachments = [view, depth_view];
-                let ci = vk::FramebufferCreateInfo::default()
-                    .render_pass(render_pass)
-                    .attachments(&fb_attachments)
-                    .width(extent.width)
-                    .height(extent.height)
-                    .layers(1);
-                unsafe { logical.create_framebuffer(&ci, None) }
-                    .map_err(|e| GraphicsError::InitFailed(format!("vkCreateFramebuffer: {e}")))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        scratch.framebuffers = framebuffers.clone();
+        let mut framebuffers: Vec<vk::Framebuffer> = Vec::new();
+        for &view in &image_views {
+            let fb_attachments = [view, depth_view];
+            let ci = vk::FramebufferCreateInfo::default()
+                .render_pass(render_pass)
+                .attachments(&fb_attachments)
+                .width(extent.width)
+                .height(extent.height)
+                .layers(1);
+            let fb = unsafe { logical.create_framebuffer(&ci, None) }
+                .map_err(|e| GraphicsError::InitFailed(format!("vkCreateFramebuffer: {e}")))?;
+            scratch.framebuffers.push(fb);
+            framebuffers.push(fb);
+        }
 
         // Graphics command pool + frame command buffer + fence (created
         // signalled so the first acquire's wait passes immediately).
