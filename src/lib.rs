@@ -125,6 +125,120 @@ pub enum CullMode {
     Back,
 }
 
+// ── Depth test ──────────────────────────────────────────────────────────
+
+/// Depth comparison function for the fixed-function depth test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompareOp {
+    /// Never passes.
+    Never,
+    /// Passes when the fragment's depth is less than the buffer (default).
+    #[default]
+    Less,
+    /// Passes on exact equality.
+    Equal,
+    /// Passes when less than or equal — the usual choice for overlapping
+    /// coplanar geometry.
+    LessEqual,
+    /// Passes when the fragment's depth is greater than the buffer.
+    Greater,
+    /// Passes when different.
+    NotEqual,
+    /// Passes when greater than or equal.
+    GreaterEqual,
+    /// Always passes (depth write still applies when enabled).
+    Always,
+}
+
+/// Fixed-function depth test / write state (v0.1 has no stencil).
+///
+/// Selected per pipeline via [`PipelineConfig::depth`]. The backend owns a
+/// depth buffer sized to the swapchain regardless — the attachment is part
+/// of the render pass — but fragments only consult it when a pipeline
+/// configures a `DepthState`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DepthState {
+    /// Comparison a fragment must pass to be written.
+    pub compare: CompareOp,
+    /// Whether passing fragments write their depth to the depth buffer.
+    pub write_enable: bool,
+}
+
+impl Default for DepthState {
+    /// The conventional depth setup: pass when nearer, and write.
+    fn default() -> Self {
+        Self {
+            compare: CompareOp::Less,
+            write_enable: true,
+        }
+    }
+}
+
+// ── Color blending ───────────────────────────────────────────────────────
+
+/// Factor a color channel is multiplied by before the blend addition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendFactor {
+    /// `0` — drop the channel's contribution.
+    Zero,
+    /// `1` — use the value unchanged.
+    One,
+    /// The source alpha channel.
+    SrcAlpha,
+    /// `1 - src_alpha` — the classic transparency pairing with
+    /// [`SrcAlpha`](BlendFactor::SrcAlpha).
+    OneMinusSrcAlpha,
+    /// The source color channel itself (multiply blend).
+    SrcColor,
+    /// `1 - src_color`.
+    OneMinusSrcColor,
+    /// The destination color channel (multiplicative fade).
+    DstColor,
+    /// `1 - dst_color`.
+    OneMinusDstColor,
+}
+
+/// Fixed-function additive color blend for the single color target (v0.1:
+/// blend op `Add` only; the alpha channel uses the same factors).
+///
+/// Selected per pipeline via [`PipelineConfig::blend`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlendMode {
+    /// Factor applied to the incoming (source) fragment color.
+    pub src_factor: BlendFactor,
+    /// Factor applied to the existing (destination) color.
+    pub dst_factor: BlendFactor,
+}
+
+impl BlendMode {
+    /// Classic alpha blend: `src * src_alpha + dst * (1 - src_alpha)`.
+    #[must_use]
+    pub const fn alpha() -> Self {
+        Self {
+            src_factor: BlendFactor::SrcAlpha,
+            dst_factor: BlendFactor::OneMinusSrcAlpha,
+        }
+    }
+
+    /// Additive glow: `src * src_alpha + dst` — brightens what is behind.
+    #[must_use]
+    pub const fn additive() -> Self {
+        Self {
+            src_factor: BlendFactor::SrcAlpha,
+            dst_factor: BlendFactor::One,
+        }
+    }
+
+    /// Multiplicative fade: `src * dst + dst * 0` — tints what is behind.
+    #[must_use]
+    pub const fn multiply() -> Self {
+        Self {
+            src_factor: BlendFactor::DstColor,
+            dst_factor: BlendFactor::Zero,
+        }
+    }
+}
+
 /// Numeric format of a single vertex attribute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VertexFormat {
@@ -184,6 +298,12 @@ pub struct PipelineConfig {
     pub cull_mode: CullMode,
     /// Vertex input layout.
     pub vertex_layout: VertexLayout,
+    /// Fixed-function depth test / write. `None` (default) disables the
+    /// depth test entirely — fragments pass through in draw order.
+    pub depth: Option<DepthState>,
+    /// Fixed-function color blend. `None` (default) writes fragments
+    /// opaquely.
+    pub blend: Option<BlendMode>,
 }
 
 // ── Opaque handle types ───────────────────────────────────────────
@@ -439,6 +559,22 @@ mod tests {
         assert_eq!(cfg.cull_mode, CullMode::None);
         assert!(cfg.vertex_layout.attributes.is_empty());
         assert_eq!(cfg.vertex_layout.stride, 0);
+        assert!(cfg.depth.is_none(), "no depth test by default (additive)");
+        assert!(cfg.blend.is_none(), "no blending by default (additive)");
+    }
+
+    #[test]
+    fn depth_state_defaults_to_less_write() {
+        let d = DepthState::default();
+        assert_eq!(d.compare, CompareOp::Less);
+        assert!(d.write_enable);
+    }
+
+    #[test]
+    fn alpha_blend_defaults_to_src_alpha() {
+        let b = BlendMode::alpha();
+        assert_eq!(b.src_factor, BlendFactor::SrcAlpha);
+        assert_eq!(b.dst_factor, BlendFactor::OneMinusSrcAlpha);
     }
 
     #[test]

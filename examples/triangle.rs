@@ -73,6 +73,8 @@ fn main() -> ExitCode {
     let config = PipelineConfig {
         topology: Topology::TriangleList,
         cull_mode: CullMode::None,
+        depth: None,
+        blend: None,
         vertex_layout: VertexLayout {
             stride: 8,
             attributes: vec![VertexAttribute {
