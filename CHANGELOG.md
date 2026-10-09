@@ -21,10 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   simplification so any pipeline is subpass-compatible); `VulkanBackend::
   depth_format()` exposes the chosen format.
 - Hardware-verified on a real device: depth — a near triangle drawn first
-  survives a far overdraw; blend — 0.5-alpha magenta over the 0.1 gray clear
-  reads back textbook unorm composites (140/12/140/191). New tests:
+  survives a far overdraw (with a depth-off control frame asserting painter
+  order); blend — 0.5-alpha magenta over the 0.1 gray clear reads back
+  driver-dependent composites within ±1 (observed `[140,12,140,191]`; the
+  clear byte itself converts to 25 or 26 depending on the device), with
+  alpha-channel assertions pinning the mirrored-factor behaviour. New tests:
   `depth_test_rejects_far_overdraw`, `alpha_blend_composites_over_clear`,
   plus config-default unit tests.
+- Constructor robustness (review round 1): an RAII `InitScratch` guard
+  destroys every partially-created object if `VulkanBackend::new` fails
+  after the swapchain — including the depth trio — so error paths leak
+  nothing on the caller's device.
 
 ### Added — Backend-Agnostic Surface
 - **`GraphicsBackend` trait** — the single graphics abstraction, mirroring

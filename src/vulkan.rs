@@ -331,6 +331,84 @@ pub(super) fn drop_zunesha_buffer_box(raw: *mut c_void) {
 /// zero copies (ADR 0001). Pipelines own themselves; both handles must be
 /// dropped before the backend (enforced for the device by the borrow, and for
 /// pipelines by the documented invariant).
+// ── Constructor cleanup guard ──────────────────────────────────────
+
+/// RAII cleanup for `VulkanBackend::new`'s partial construction.
+///
+/// Every object created after the swapchain is registered here; if `new`
+/// fails at any later `?`, `Drop` destroys exactly what exists so far (in
+/// reverse creation order) and nothing leaks on the caller's device. On
+/// success `disarm` empties the guard so its drop is a no-op and `Self`
+/// takes ownership (review round 1, P2).
+struct InitScratch<'a> {
+    device: &'a ash::Device,
+    swapchain_fn: &'a khr::swapchain::Device,
+    swapchain: vk::SwapchainKHR,
+    image_views: Vec<vk::ImageView>,
+    /// (view, image, memory) — destroyed in that order.
+    depth: Option<(vk::ImageView, vk::Image, vk::DeviceMemory)>,
+    render_pass: Option<vk::RenderPass>,
+    framebuffers: Vec<vk::Framebuffer>,
+    command_pool: Option<vk::CommandPool>,
+    fence: Option<vk::Fence>,
+    image_available: Option<vk::Semaphore>,
+    render_finished: Option<vk::Semaphore>,
+}
+
+impl InitScratch<'_> {
+    /// Empty the guard — construction succeeded and `Self` owns everything.
+    fn disarm(&mut self) {
+        self.swapchain = vk::SwapchainKHR::null();
+        self.image_views.clear();
+        self.depth = None;
+        self.render_pass = None;
+        self.framebuffers.clear();
+        self.command_pool = None;
+        self.fence = None;
+        self.image_available = None;
+        self.render_finished = None;
+    }
+}
+
+impl Drop for InitScratch<'_> {
+    fn drop(&mut self) {
+        // Safety: every handle here was created in `new` and, because the
+        // guard is still armed, was never handed to `Self` — it is owned
+        // exclusively and no submission has ever referenced it.
+        unsafe {
+            for &fb in &self.framebuffers {
+                self.device.destroy_framebuffer(fb, None);
+            }
+            if let Some(rp) = self.render_pass {
+                self.device.destroy_render_pass(rp, None);
+            }
+            if let Some((view, image, memory)) = self.depth {
+                self.device.destroy_image_view(view, None);
+                self.device.destroy_image(image, None);
+                self.device.free_memory(memory, None);
+            }
+            for &view in &self.image_views {
+                self.device.destroy_image_view(view, None);
+            }
+            if let Some(fence) = self.fence {
+                self.device.destroy_fence(fence, None);
+            }
+            if let Some(sem) = self.image_available {
+                self.device.destroy_semaphore(sem, None);
+            }
+            if let Some(sem) = self.render_finished {
+                self.device.destroy_semaphore(sem, None);
+            }
+            if let Some(pool) = self.command_pool {
+                self.device.destroy_command_pool(pool, None);
+            }
+            if self.swapchain != vk::SwapchainKHR::null() {
+                self.swapchain_fn.destroy_swapchain(self.swapchain, None);
+            }
+        }
+    }
+}
+
 pub struct VulkanBackend<'a> {
     zunesha_device: &'a zunesha::vulkan::VulkanDevice,
     device: ash::Device,
@@ -516,6 +594,25 @@ impl<'a> VulkanBackend<'a> {
         let swapchain = unsafe { swapchain_fn.create_swapchain(&create_info, None) }
             .map_err(|e| GraphicsError::InitFailed(format!("vkCreateSwapchainKHR: {e}")))?;
 
+        // Everything created from here on is owned by `scratch`, which
+        // destroys whatever exists if construction fails part-way (P2
+        // review finding round 1: error paths after each `?` must not leak
+        // the depth trio — or anything else — on the caller's device).
+        // `release` disarms the guard and hands the objects to `Self`.
+        let mut scratch = InitScratch {
+            device: &logical,
+            swapchain_fn: &swapchain_fn,
+            swapchain,
+            image_views: Vec::new(),
+            depth: None,
+            render_pass: None,
+            framebuffers: Vec::new(),
+            command_pool: None,
+            fence: None,
+            image_available: None,
+            render_finished: None,
+        };
+
         // Image views + render pass + framebuffers — the swapchain's rendering
         // surface. One framebuffer per swapchain image, all sized to `extent`.
         let images = unsafe { swapchain_fn.get_swapchain_images(swapchain) }
@@ -536,6 +633,7 @@ impl<'a> VulkanBackend<'a> {
                     .map_err(|e| GraphicsError::InitFailed(format!("vkCreateImageView: {e}")))
             })
             .collect::<Result<Vec<_>>>()?;
+        scratch.image_views = image_views.clone();
 
         let attachment = vk::AttachmentDescription::default()
             .format(format.format)
@@ -604,6 +702,7 @@ impl<'a> VulkanBackend<'a> {
             );
         let depth_view = unsafe { logical.create_image_view(&depth_view_ci, None) }
             .map_err(|e| GraphicsError::InitFailed(format!("vkCreateImageView (depth): {e}")))?;
+        scratch.depth = Some((depth_view, depth_image, depth_memory));
 
         let depth_attachment = vk::AttachmentDescription::default()
             .format(depth_format)
@@ -632,6 +731,7 @@ impl<'a> VulkanBackend<'a> {
             .subpasses(std::slice::from_ref(&subpass));
         let render_pass = unsafe { logical.create_render_pass(&rp_ci, None) }
             .map_err(|e| GraphicsError::InitFailed(format!("vkCreateRenderPass: {e}")))?;
+        scratch.render_pass = Some(render_pass);
 
         let framebuffers: Vec<vk::Framebuffer> = image_views
             .iter()
@@ -647,6 +747,7 @@ impl<'a> VulkanBackend<'a> {
                     .map_err(|e| GraphicsError::InitFailed(format!("vkCreateFramebuffer: {e}")))
             })
             .collect::<Result<Vec<_>>>()?;
+        scratch.framebuffers = framebuffers.clone();
 
         // Graphics command pool + frame command buffer + fence (created
         // signalled so the first acquire's wait passes immediately).
@@ -655,6 +756,7 @@ impl<'a> VulkanBackend<'a> {
             .queue_family_index(graphics.family_index);
         let command_pool = unsafe { logical.create_command_pool(&pool_ci, None) }
             .map_err(|e| GraphicsError::InitFailed(format!("vkCreateCommandPool: {e}")))?;
+        scratch.command_pool = Some(command_pool);
         let cb_ci = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
@@ -667,13 +769,20 @@ impl<'a> VulkanBackend<'a> {
         let fence_ci = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
         let fence = unsafe { logical.create_fence(&fence_ci, None) }
             .map_err(|e| GraphicsError::InitFailed(format!("vkCreateFence: {e}")))?;
+        scratch.fence = Some(fence);
 
         let semaphore_ci = vk::SemaphoreCreateInfo::default();
         let image_available = unsafe { logical.create_semaphore(&semaphore_ci, None) }
             .map_err(|e| GraphicsError::InitFailed(format!("vkCreateSemaphore: {e}")))?;
+        scratch.image_available = Some(image_available);
         let render_finished = unsafe { logical.create_semaphore(&semaphore_ci, None) }
             .map_err(|e| GraphicsError::InitFailed(format!("vkCreateSemaphore: {e}")))?;
+        scratch.render_finished = Some(render_finished);
 
+        // Construction succeeded: disarm the cleanup guard (its Drop must
+        // not destroy what Self now owns), then hand everything over.
+        scratch.disarm();
+        drop(scratch);
         Ok(Self {
             zunesha_device: device,
             device: logical,
@@ -1828,8 +1937,9 @@ fn fs_main() -> @location(0) vec4<f32> {
 
     /// Depth test: the NEAR triangle survives being drawn FIRST — the far
     /// triangle drawn second fails the depth test instead of overwriting it.
-    /// Without a depth state the same draw order leaves the far colour (the
-    /// test's control), so the assertion discriminates depth from overdraw.
+    /// A depth-disabled control frame in the same test re-runs the identical
+    /// draw order and asserts painter's order (far red wins), proving the
+    /// enabled assertion discriminates depth from plain overdraw.
     #[test]
     #[serial]
     fn depth_test_rejects_far_overdraw() {
@@ -1887,12 +1997,61 @@ fn fs_main() -> @location(0) vec4<f32> {
             centre[1] == 255 && centre[0] == 0 && centre[2] == 0,
             "near (green) must survive the far (red) overdraw, got {centre:?}"
         );
+
+        // Control (same draw order, depth DISABLED): painter's order wins —
+        // the far red overdraws the near green. This pins that depth-off
+        // pipelines keep their historical behaviour inside the depth-capable
+        // render pass and proves the enabled assertion above discriminates.
+        let near_plain = backend
+            .compile_render_pipeline(
+                "vs_main",
+                DEPTH_VERT,
+                "fs_main",
+                GREEN_FRAG,
+                &depth_config(None),
+            )
+            .expect("near plain pipeline");
+        let far_plain = backend
+            .compile_render_pipeline(
+                "vs_main",
+                DEPTH_VERT,
+                "fs_main",
+                RED_FRAG,
+                &depth_config(None),
+            )
+            .expect("far plain pipeline");
+        let mut frame = backend.acquire_frame().expect("acquire control");
+        backend
+            .draw(&mut frame, &near_plain, &near_vb, 3)
+            .expect("draw near plain");
+        backend
+            .draw(&mut frame, &far_plain, &far_vb, 3)
+            .expect("draw far plain");
+        let pixels = backend.read_pixels(&frame).expect("read control");
+        backend.present(frame).expect("present control");
+        let control = {
+            let o = (h / 2 * w + w / 2) * 4;
+            [pixels[o], pixels[o + 1], pixels[o + 2], pixels[o + 3]]
+        };
+        println!("depth-off control pixel = {control:?}");
+        // Red is channel-order-sensitive ((255,0,0) in RGBA, (0,0,255) in
+        // BGRA readback), so assert order-agnostically: green must be absent
+        // and exactly one of R/B at full — i.e. the far red won painter order.
+        assert!(
+            control[1] == 0
+                && ((control[0] == 255 && control[2] == 0)
+                    || (control[0] == 0 && control[2] == 255))
+                && control[3] == 255,
+            "depth-off control must keep painter order (far red wins), got {control:?}"
+        );
     }
 
     /// Alpha blending: a 0.5-alpha magenta triangle over the 0.1 gray clear
-    /// composites to ~half-magenta. The green channel is exact arithmetic
-    // (0.5 * 0 + 0.5 * 26 = 13) and the red/blue channels are 140.5 ± driver
-    /// rounding, so tolerance 1 covers unorm rounding.
+    /// composites to roughly half-magenta. Exact bytes are driver-dependent
+    /// (the observed clear byte is 25 or 26 depending on the device's f32→
+    /// unorm conversion of 0.1, and blend result rounding varies with it), so
+    /// every assertion carries a ±1 tolerance sized for that variance rather
+    /// than claiming exact RNE: R/B ≈ 140.5, G ≈ 12.5–13, A = 0.75 → ≈191.
     #[test]
     #[serial]
     fn alpha_blend_composites_over_clear() {
@@ -1954,15 +2113,28 @@ fn fs_main() -> @location(0) vec4<f32> {
             c[0] == 255 && c[2] == 255 && c[1] == 0,
             "unblended control must be full magenta, got {c:?}"
         );
-        // R/B: 0.5 * 255 + 0.5 * 26 = 140.5 → within 1 of 140.5 after unorm
-        // rounding. G: 0.5 * 0 + 0.5 * 26 = 13 exactly.
+        // R/B: 0.5 * 255 + 0.5 * clear(25–26) = 140–140.5 → 140 ± 1.
+        // G: 0.5 * 0 + 0.5 * clear = 12.5–13 → 13 ± 1.
         assert!(
             (b[0] as i32 - 140).abs() <= 1 && (b[2] as i32 - 140).abs() <= 1,
-            "blended R/B ≈ 140.5, got {b:?}"
+            "blended R/B ≈ 140, got {b:?}"
         );
         assert!(
             (b[1] as i32 - 13).abs() <= 1,
-            "blended G = 13 (0.5 * clear), got {b:?}"
+            "blended G ≈ 12.5–13 (0.5 * clear), got {b:?}"
+        );
+        // A: with the documented v0.1 rule that alpha mirrors the color
+        // factors — 0.5 (src a) * 0.5 + 1.0 (dst a) * 0.5 = 0.75 → 191 ± 1.
+        // This pins the alpha-factor wiring: a wrong src/dst alpha factor
+        // pair (e.g. ONE/ZERO → raw 0.5 → 128) must fail here.
+        assert!(
+            (b[3] as i32 - 191).abs() <= 1,
+            "blended A ≈ 191 (mirrored alpha factors), got {b:?}"
+        );
+        // Control wrote the fragment alpha raw: 0.5 → 128 ± 1.
+        assert!(
+            (c[3] as i32 - 128).abs() <= 1,
+            "unblended control A = raw 0.5 → 128, got {c:?}"
         );
     }
 
