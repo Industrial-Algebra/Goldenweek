@@ -556,6 +556,9 @@ mod tests {
     fn pipeline_config_default_is_minimal() {
         let cfg = PipelineConfig::default();
         assert_eq!(cfg.topology, Topology::TriangleList);
+        assert_eq!(cfg.cull_mode, CullMode::None);
+        assert!(cfg.vertex_layout.attributes.is_empty());
+        assert_eq!(cfg.vertex_layout.stride, 0);
         assert!(cfg.depth.is_none(), "no depth test by default (additive)");
         assert!(cfg.blend.is_none(), "no blending by default (additive)");
     }
