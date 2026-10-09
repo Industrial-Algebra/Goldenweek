@@ -469,6 +469,8 @@ dependencies = [
 [[package]]
 name = "zunesha"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7a406e7b58681199e54fec5be914ba8e27ca0008d66380c5a11cdbfe8fd9874"
 dependencies = [
  "ash",
  "bytemuck",
