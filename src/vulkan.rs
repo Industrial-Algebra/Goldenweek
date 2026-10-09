@@ -313,24 +313,6 @@ pub(super) fn drop_zunesha_buffer_box(raw: *mut c_void) {
     }
 }
 
-// ── Render backend ────────────────────────────────────────────────
-
-/// Vulkan render backend — a borrowed view over a
-/// [`zunesha::vulkan::VulkanDevice`] plus a caller-owned presentation surface.
-///
-/// The backend borrows the Zunesha device (`'a` lifetime, borrow-checked: the
-/// device outlives the backend) and holds cloned Vulkan handles, the graphics
-/// queue, a swapchain with its render pass / framebuffers, and the per-frame
-/// command-recording state. The caller must keep the surface alive for the
-/// backend's lifetime. On drop the backend destroys only what it created
-/// (swapchain, views, render pass, framebuffers, pool, semaphores, fence); the
-/// device and surface are torn down by their owners.
-///
-/// Buffers created via [`VulkanBackend::create_buffer`] are `zunesha::Buffer`s
-/// — a buffer Borsalino filled by compute can be bound as a vertex buffer with
-/// zero copies (ADR 0001). Pipelines own themselves; both handles must be
-/// dropped before the backend (enforced for the device by the borrow, and for
-/// pipelines by the documented invariant).
 // ── Constructor cleanup guard ──────────────────────────────────────
 
 /// RAII cleanup for `VulkanBackend::new`'s partial construction.
@@ -409,6 +391,24 @@ impl Drop for InitScratch<'_> {
     }
 }
 
+// ── Render backend ────────────────────────────────────────────────
+
+/// Vulkan render backend — a borrowed view over a
+/// [`zunesha::vulkan::VulkanDevice`] plus a caller-owned presentation surface.
+///
+/// The backend borrows the Zunesha device (`'a` lifetime, borrow-checked: the
+/// device outlives the backend) and holds cloned Vulkan handles, the graphics
+/// queue, a swapchain with its render pass / framebuffers, and the per-frame
+/// command-recording state. The caller must keep the surface alive for the
+/// backend's lifetime. On drop the backend destroys only what it created
+/// (swapchain, views, render pass, framebuffers, pool, semaphores, fence); the
+/// device and surface are torn down by their owners.
+///
+/// Buffers created via [`VulkanBackend::create_buffer`] are `zunesha::Buffer`s
+/// — a buffer Borsalino filled by compute can be bound as a vertex buffer with
+/// zero copies (ADR 0001). Pipelines own themselves; both handles must be
+/// dropped before the backend (enforced for the device by the borrow, and for
+/// pipelines by the documented invariant).
 pub struct VulkanBackend<'a> {
     zunesha_device: &'a zunesha::vulkan::VulkanDevice,
     device: ash::Device,
