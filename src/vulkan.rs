@@ -930,7 +930,7 @@ impl<'a> VulkanBackend<'a> {
     ///
     /// # Contract
     ///
-    /// - **No live [`Frame``](crate::Frame) may outlive this call** — a frame
+    /// - **No live [`Frame`] may outlive this call** — a frame
     ///   acquired before the recreate refers to a destroyed swapchain and
     ///   must not be drawn into or presented afterwards (present it or drop
     ///   it first; a *dropped* unpresented frame is fully supported — the
