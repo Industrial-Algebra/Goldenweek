@@ -165,4 +165,10 @@ frame's mid-recording command buffer is explicitly reset at the next
     unchanged. Hardware-verified: a near triangle drawn *first* survives a
     far triangle drawn second (depth), and a 0.5-alpha magenta triangle
     composites to textbook unorm values over the gray clear (blend).
+- ✅ **Increment 7** — swapchain resize/recreate: `recreate_swapchain`
+    rebuilds the swapchain + depth buffer at a new extent while reusing the
+    render pass (pipelines survive); dropped-frame-safe; refused on surface
+    format change (`RecreateRefused`) since pipelines are format-bound;
+    failure leaves the old swapchain intact (`InitScratch` discipline, no
+    oldSwapchain retirement).
 - ⏳ Metal backend (raw `objc`) — mirroring Borsalino/Zunesha's backend split.
