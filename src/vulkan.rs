@@ -233,21 +233,73 @@ fn choose_surface_format(formats: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatK
 
 /// Choose the swap extent: the surface's current extent when it is defined,
 /// otherwise a fixed headless default.
-fn choose_extent(caps: &vk::SurfaceCapabilitiesKHR) -> vk::Extent2D {
+/// Resolve the swapchain extent for a (re)creation: a defined current
+/// extent (real windows) always wins; otherwise an explicit request is
+/// clamped to the surface's limits, falling back to the 256 test default.
+fn resolve_extent(caps: &vk::SurfaceCapabilitiesKHR, requested: Option<(u32, u32)>) -> (u32, u32) {
     if caps.current_extent.width != u32::MAX {
-        caps.current_extent
-    } else {
-        // Undefined extent (headless surfaces typically report this): pick a
-        // sane test default clamped to the surface's limits.
-        let width = 256u32.clamp(
-            caps.min_image_extent.width,
-            caps.max_image_extent.width.max(1),
-        );
-        let height = 256u32.clamp(
-            caps.min_image_extent.height,
-            caps.max_image_extent.height.max(1),
-        );
-        vk::Extent2D { width, height }
+        return (caps.current_extent.width, caps.current_extent.height);
+    }
+    let (dw, dh) = requested.unwrap_or((256, 256));
+    let width = dw.clamp(
+        caps.min_image_extent.width,
+        caps.max_image_extent.width.max(1),
+    );
+    let height = dh.clamp(
+        caps.min_image_extent.height,
+        caps.max_image_extent.height.max(1),
+    );
+    (width, height)
+}
+
+fn choose_extent(caps: &vk::SurfaceCapabilitiesKHR) -> vk::Extent2D {
+    // Undefined extent (headless surfaces typically report this): pick a
+    // sane test default clamped to the surface's limits.
+    let (width, height) = resolve_extent(caps, None);
+    vk::Extent2D { width, height }
+}
+
+#[cfg(test)]
+mod extent_tests {
+    use super::*;
+
+    fn caps(current: u32, min: u32, max: u32) -> vk::SurfaceCapabilitiesKHR {
+        vk::SurfaceCapabilitiesKHR::default()
+            .current_extent(vk::Extent2D {
+                width: current,
+                height: current,
+            })
+            .min_image_extent(vk::Extent2D {
+                width: min,
+                height: min,
+            })
+            .max_image_extent(vk::Extent2D {
+                width: max,
+                height: max,
+            })
+    }
+
+    /// A defined current extent wins over any request (real windows).
+    #[test]
+    fn defined_current_extent_wins() {
+        let got = choose_extent(&caps(800, 64, 2048));
+        assert_eq!((got.width, got.height), (800, 800));
+    }
+
+    /// Undefined extent + no request → the 256 default.
+    #[test]
+    fn undefined_extent_defaults_to_256() {
+        let got = choose_extent(&caps(u32::MAX, 4, 4096));
+        assert_eq!((got.width, got.height), (256, 256));
+    }
+
+    /// Requests clamp to the surface's limits.
+    #[test]
+    fn requested_extent_clamps_to_caps() {
+        let caps = caps(u32::MAX, 64, 1024);
+        assert_eq!(resolve_extent(&caps, Some((8, 8))), (64, 64));
+        assert_eq!(resolve_extent(&caps, Some((2048, 2048))), (1024, 1024));
+        assert_eq!(resolve_extent(&caps, Some((300, 200))), (300, 200));
     }
 }
 
@@ -866,6 +918,264 @@ impl<'a> VulkanBackend<'a> {
     #[must_use]
     pub fn depth_format(&self) -> vk::Format {
         self.depth_format
+    }
+
+    /// Tear down and rebuild the swapchain (and the extent-sized depth
+    /// buffer) at a new size, reusing the render pass so previously compiled
+    /// pipelines stay valid.
+    ///
+    /// `requested` is the desired extent; on surfaces with a defined current
+    /// extent (real windows) the surface's extent always wins, otherwise the
+    /// request is clamped to the surface's limits (`None` → the 256 default).
+    ///
+    /// # Contract
+    ///
+    /// - **No live [`Frame``](crate::Frame) may outlive this call** — a frame
+    ///   acquired before the recreate refers to a destroyed swapchain and
+    ///   must not be drawn into or presented afterwards (present it or drop
+    ///   it first; a *dropped* unpresented frame is fully supported — the
+    ///   stale recording is discarded exactly as the next acquire would).
+    /// - **Refused** with [`GraphicsError::RecreateRefused`] if the surface's
+    ///   format changed: the render pass and every compiled pipeline are
+    ///   bound to the old format. Drop the pipelines, recreate, recompile.
+    /// - On any other failure the old swapchain is left intact and usable.
+    pub fn recreate_swapchain(&mut self, requested: Option<(u32, u32)>) -> Result<()> {
+        // Recover exactly like the next acquire would from a dropped frame:
+        // wait for any in-flight execution, then discard any stale recording.
+        // (A live Frame cannot be detected — the documented contract above
+        // governs it.)
+        {
+            let mut render = self.render.lock().expect("render state lock");
+            unsafe {
+                let _ = self.device.wait_for_fences(
+                    std::slice::from_ref(&render.fence),
+                    true,
+                    u64::MAX,
+                );
+                let _ = self
+                    .device
+                    .reset_command_buffer(render.cmd, vk::CommandBufferResetFlags::empty());
+            }
+            render.phase = RenderPhase::Idle;
+        }
+        // Safety: no submission may reference the objects being destroyed.
+        unsafe {
+            let _ = self.device.device_wait_idle();
+        }
+
+        let instance = self.zunesha_device.raw_instance();
+        let surface_fn = khr::surface::Instance::new(self.zunesha_device.entry(), &instance);
+        let caps = unsafe {
+            surface_fn
+                .get_physical_device_surface_capabilities(self.physical_device, self.surface)
+                .map_err(|e| GraphicsError::SurfaceUnavailable {
+                    message: format!("vkGetPhysicalDeviceSurfaceCapabilitiesKHR: {e}"),
+                })?
+        };
+        let formats = unsafe {
+            surface_fn
+                .get_physical_device_surface_formats(self.physical_device, self.surface)
+                .map_err(|e| GraphicsError::SurfaceUnavailable {
+                    message: format!("vkGetPhysicalDeviceSurfaceFormatsKHR: {e}"),
+                })?
+        };
+        if formats.is_empty() {
+            return Err(GraphicsError::SurfaceUnavailable {
+                message: "surface offers no formats".into(),
+            });
+        }
+        let chosen = choose_surface_format(&formats);
+        if chosen.format != self.format {
+            return Err(GraphicsError::RecreateRefused {
+                message: format!(
+                    "surface format changed ({:?} -> {:?}); pipelines bound to the old \
+                     render pass must be recompiled after recreating",
+                    self.format, chosen.format
+                ),
+            });
+        }
+        let (width, height) = resolve_extent(&caps, requested);
+        let extent = vk::Extent2D { width, height };
+
+        // Image count: same policy as construction (FIFO, >= 2, <= max).
+        let min_count = caps.min_image_count.max(2);
+        let image_count = if caps.max_image_count > 0 {
+            min_count.min(caps.max_image_count)
+        } else {
+            min_count
+        };
+
+        // Build the replacement under the same RAII guard discipline as
+        // `new`: any failure destroys the partial new state and leaves the
+        // old swapchain untouched. The new swapchain is created WITHOUT the
+        // oldSwapchain handoff — passing it would retire the old one, making
+        // it unusable if a later step here fails.
+        let mut scratch = InitScratch {
+            device: &self.device,
+            swapchain_fn: &self.swapchain_fn,
+            swapchain: vk::SwapchainKHR::null(),
+            image_views: Vec::new(),
+            depth_image: None,
+            depth_memory: None,
+            depth_view: None,
+            render_pass: None,
+            framebuffers: Vec::new(),
+            command_pool: None,
+            fence: None,
+            image_available: None,
+            render_finished: None,
+        };
+
+        let create_info = vk::SwapchainCreateInfoKHR::default()
+            .surface(self.surface)
+            .min_image_count(image_count)
+            .image_format(chosen.format)
+            .image_color_space(chosen.color_space)
+            .image_extent(extent)
+            .image_array_layers(1)
+            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .pre_transform(caps.current_transform)
+            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+            .present_mode(vk::PresentModeKHR::FIFO)
+            .clipped(false)
+            .old_swapchain(vk::SwapchainKHR::null());
+        let new_swapchain = unsafe { self.swapchain_fn.create_swapchain(&create_info, None) }
+            .map_err(|e| {
+                GraphicsError::InitFailed(format!("vkCreateSwapchainKHR (recreate): {e}"))
+            })?;
+        let images = unsafe { self.swapchain_fn.get_swapchain_images(new_swapchain) }
+            .map_err(|e| GraphicsError::InitFailed(format!("swapchain images (recreate): {e}")))?;
+
+        let subresource = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
+        let mut new_views: Vec<vk::ImageView> = Vec::new();
+        for &image in &images {
+            let ci = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(self.format)
+                .subresource_range(subresource);
+            let view = unsafe { self.device.create_image_view(&ci, None) }.map_err(|e| {
+                GraphicsError::InitFailed(format!("vkCreateImageView (recreate): {e}"))
+            })?;
+            scratch.image_views.push(view);
+            new_views.push(view);
+        }
+
+        // Depth buffer at the new extent (format re-picked; same device →
+        // same result).
+        let depth_format = pick_depth_format(&instance, self.physical_device).ok_or_else(|| {
+            GraphicsError::InitFailed("no supported depth format (D32/D24S8/D16)".into())
+        })?;
+        let depth_ci = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(depth_format)
+            .extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let new_depth_image =
+            unsafe { self.device.create_image(&depth_ci, None) }.map_err(|e| {
+                GraphicsError::InitFailed(format!("vkCreateImage (depth, recreate): {e}"))
+            })?;
+        scratch.depth_image = Some(new_depth_image);
+        let depth_req = unsafe { self.device.get_image_memory_requirements(new_depth_image) };
+        let memory_props =
+            unsafe { instance.get_physical_device_memory_properties(self.physical_device) };
+        let memory_type = (0..memory_props.memory_type_count)
+            .find(|&i| {
+                depth_req.memory_type_bits & (1 << i) != 0
+                    && memory_props.memory_types[i as usize]
+                        .property_flags
+                        .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            })
+            .ok_or_else(|| {
+                GraphicsError::InitFailed("no device-local memory type for depth image".into())
+            })?;
+        let depth_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(depth_req.size)
+            .memory_type_index(memory_type);
+        let new_depth_memory =
+            unsafe { self.device.allocate_memory(&depth_alloc, None) }.map_err(|e| {
+                GraphicsError::InitFailed(format!("vkAllocateMemory (depth, recreate): {e}"))
+            })?;
+        scratch.depth_memory = Some(new_depth_memory);
+        unsafe {
+            self.device
+                .bind_image_memory(new_depth_image, new_depth_memory, 0)
+        }
+        .map_err(|e| {
+            GraphicsError::InitFailed(format!("vkBindImageMemory (depth, recreate): {e}"))
+        })?;
+        let depth_view_ci = vk::ImageViewCreateInfo::default()
+            .image(new_depth_image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(depth_format)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                    .level_count(1)
+                    .layer_count(1),
+            );
+        let new_depth_view = unsafe { self.device.create_image_view(&depth_view_ci, None) }
+            .map_err(|e| {
+                GraphicsError::InitFailed(format!("vkCreateImageView (depth, recreate): {e}"))
+            })?;
+        scratch.depth_view = Some(new_depth_view);
+
+        // Render pass is REUSED: same formats → every compiled pipeline
+        // stays subpass-compatible.
+        let mut new_framebuffers: Vec<vk::Framebuffer> = Vec::new();
+        for &view in &new_views {
+            let fb_attachments = [view, new_depth_view];
+            let ci = vk::FramebufferCreateInfo::default()
+                .render_pass(self.render_pass)
+                .attachments(&fb_attachments)
+                .width(extent.width)
+                .height(extent.height)
+                .layers(1);
+            let fb = unsafe { self.device.create_framebuffer(&ci, None) }.map_err(|e| {
+                GraphicsError::InitFailed(format!("vkCreateFramebuffer (recreate): {e}"))
+            })?;
+            scratch.framebuffers.push(fb);
+            new_framebuffers.push(fb);
+        }
+
+        // All steps succeeded — the scratch guard is disarmed, the old
+        // extent-sized objects are destroyed, and the new state lands.
+        scratch.disarm();
+        drop(scratch);
+        unsafe {
+            for &fb in &self.framebuffers {
+                self.device.destroy_framebuffer(fb, None);
+            }
+            for &view in &self.image_views {
+                self.device.destroy_image_view(view, None);
+            }
+            self.device.destroy_image_view(self.depth_view, None);
+            self.device.destroy_image(self.depth_image, None);
+            self.device.free_memory(self.depth_memory, None);
+            self.swapchain_fn.destroy_swapchain(self.swapchain, None);
+        }
+        self.swapchain = new_swapchain;
+        self.images = images;
+        self.extent = extent;
+        self.image_views = new_views;
+        self.depth_image = new_depth_image;
+        self.depth_memory = new_depth_memory;
+        self.depth_view = new_depth_view;
+        self.framebuffers = new_framebuffers;
+        Ok(())
     }
 
     /// Compile a WGSL vertex + fragment pair into a render pipeline.
@@ -1729,6 +2039,87 @@ mod tests {
             backend.extent().width,
             backend.extent().height
         );
+    }
+
+    // ── Swapchain resize/recreate fixtures (increment 7) ────────────────
+
+    /// Recreating the swapchain at a new extent keeps the render pass and
+    /// previously compiled pipelines valid, and the frame loop renders +
+    /// reads back at the new size.
+    #[test]
+    #[serial]
+    fn recreate_swapchain_renders_at_new_extent() {
+        let Some(ctx) = rig() else { return };
+        let mut backend = ctx.backend();
+        let before = backend.extent();
+        let format_before = backend.format();
+
+        // Compile a pipeline BEFORE the resize — it must survive it.
+        let pipeline = backend
+            .compile_render_pipeline(
+                "vs_main",
+                DEPTH_VERT,
+                "fs_main",
+                GREEN_FRAG,
+                &depth_config(None),
+            )
+            .expect("pipeline before recreate");
+        // One full frame cycle first.
+        let frame = backend.acquire_frame().expect("acquire pre-recreate");
+        backend.present(frame).expect("present pre-recreate");
+
+        backend
+            .recreate_swapchain(Some((128, 128)))
+            .expect("recreate_swapchain");
+        let after = backend.extent();
+        assert_eq!(
+            (after.width, after.height),
+            (128, 128),
+            "new extent honoured"
+        );
+        assert_eq!(backend.format(), format_before, "format preserved");
+        assert!(backend.image_count() >= 2, "swapchain still multi-image");
+        println!(
+            "recreated swapchain: {}x{} -> {}x{}",
+            before.width, before.height, after.width, after.height
+        );
+
+        // Draw + verify with the PRE-recreate pipeline at the new extent.
+        let vb = backend
+            .create_buffer(&[-1.0f32, -1.0, 0.0, 3.0, -1.0, 0.0, -1.0, 3.0, 0.0])
+            .expect("vb");
+        let mut frame = backend.acquire_frame().expect("acquire post-recreate");
+        backend
+            .draw(&mut frame, &pipeline, &vb, 3)
+            .expect("draw post-recreate");
+        let pixels = backend.read_pixels(&frame).expect("read post-recreate");
+        backend.present(frame).expect("present post-recreate");
+        let w = after.width as usize;
+        let h = after.height as usize;
+        assert_eq!(pixels.len(), w * h * 4, "readback sized to the NEW extent");
+        let o = (h / 2 * w + w / 2) * 4;
+        let centre = [pixels[o], pixels[o + 1], pixels[o + 2], pixels[o + 3]];
+        assert!(
+            centre[1] == 255 && centre[0] == 0 && centre[2] == 0,
+            "pre-recreate pipeline must render green at the new extent, got {centre:?}"
+        );
+    }
+
+    /// Recreating after a dropped (unpresented) frame is safe — the stale
+    /// recording is discarded exactly like the next acquire would.
+    #[test]
+    #[serial]
+    fn recreate_after_dropped_frame_is_safe() {
+        let Some(ctx) = rig() else { return };
+        let mut backend = ctx.backend();
+        let frame = backend.acquire_frame().expect("acquire");
+        drop(frame); // unpresented
+        backend
+            .recreate_swapchain(Some((96, 96)))
+            .expect("recreate after dropped frame");
+        assert_eq!((backend.extent().width, backend.extent().height), (96, 96));
+        let frame = backend.acquire_frame().expect("acquire after recreate");
+        backend.present(frame).expect("present after recreate");
     }
 
     /// The frame lifecycle: acquire → present, repeatedly.

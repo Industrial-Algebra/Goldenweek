@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0] — Unreleased
 
+### Added — Swapchain Resize/Recreate (Increment 7)
+- **`VulkanBackend::recreate_swapchain(&mut self, requested)`** — tears
+  down and rebuilds the swapchain + extent-sized depth buffer at a new
+  size. The render pass is reused, so previously compiled pipelines stay
+  valid across a resize (hardware-verified: pipeline compiled at 256×256
+  renders green at 128×128).
+- `requested` clamps to the surface limits on undefined-extent surfaces
+  (headless); a defined current extent (real windows) always wins.
+  `resolve_extent` unit-tested for all three behaviours.
+- Recreating after a **dropped unpresented frame** is safe — the stale
+  recording is discarded exactly as the next acquire would (mirrors the
+  increment-5 dropped-frame guarantee).
+- Refused with a new `GraphicsError::RecreateRefused` when the surface
+  **format** changed (render pass + pipelines are format-bound; caller
+  drops pipelines and recompiles). On any other failure the old swapchain
+  is left intact and usable — the replacement is built under the same
+  `InitScratch` RAII discipline as construction, without the
+  oldSwapchain handoff (which would retire the old swapchain even if a
+  later step fails).
+- Documented contract: no live `Frame` may outlive a recreate.
+
 ### Added — Depth Testing & Blending (Increment 6)
 - **`DepthState`** (`PipelineConfig::depth`): fixed-function depth test —
   `CompareOp` (Never/Less/Equal/LessEqual/Greater/NotEqual/GreaterEqual/

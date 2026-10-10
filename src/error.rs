@@ -43,6 +43,15 @@ pub enum GraphicsError {
         /// What went wrong with the surface.
         message: String,
     },
+    #[error("swapchain recreation refused: {message}")]
+    /// A swapchain recreation was refused: the surface format changed (the
+    /// render pass and every compiled pipeline are bound to the old format —
+    /// drop the pipelines, recreate, recompile) or another precondition of
+    /// [`VulkanBackend::recreate_swapchain`] failed.
+    RecreateRefused {
+        /// Why the recreation was refused.
+        message: String,
+    },
 
     /// Shader compilation failed.
     ///
