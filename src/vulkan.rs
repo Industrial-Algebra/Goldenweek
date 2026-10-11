@@ -233,6 +233,24 @@ fn choose_surface_format(formats: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatK
 
 /// Choose the swap extent: the surface's current extent when it is defined,
 /// otherwise a fixed headless default.
+/// Image usage for swapchain images: `COLOR_ATTACHMENT | TRANSFER_SRC`
+/// when the surface supports it — `read_pixels` transitions the image to
+/// `TRANSFER_SRC_OPTIMAL` and copies it, which requires the usage bit
+/// (VUID-VkImageMemoryBarrier-oldLayout-01212 /
+/// VUID-vkCmdCopyImageToBuffer-srcImage-00186). Surfaces without
+/// `TRANSFER_SRC` support get the bare flag set so construction still
+/// succeeds; readback there errors at the copy (documented limitation).
+fn swapchain_usage_flags(caps: &vk::SurfaceCapabilitiesKHR) -> vk::ImageUsageFlags {
+    if caps
+        .supported_usage_flags
+        .contains(vk::ImageUsageFlags::TRANSFER_SRC)
+    {
+        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC
+    } else {
+        vk::ImageUsageFlags::COLOR_ATTACHMENT
+    }
+}
+
 /// Resolve the swapchain extent for a (re)creation: a defined current
 /// extent (real windows) always wins; otherwise an explicit request is
 /// clamped to the surface's limits, falling back to the 256 test default.
@@ -515,6 +533,13 @@ pub struct VulkanBackend<'a> {
     /// Signalled when a swapchain image is acquired.
     image_available: vk::Semaphore,
     /// Signalled when the frame's rendering is complete (present waits on it).
+    ///
+    /// Known limitation (validation-confirmed): back-to-back presents can
+    /// re-signal this binary semaphore before the presentation engine
+    /// consumed the previous signal (VUID-vkQueueSubmit-pSignalSemaphores-
+    /// 00067) — a narrow race pre-dating this backend. The proper fix is a
+    /// timeline-semaphore refactor of the acquire/submit/present chain;
+    /// tracked as a follow-up increment (see ROADMAP sequencing notes).
     render_finished: vk::Semaphore,
 }
 
@@ -648,7 +673,7 @@ impl<'a> VulkanBackend<'a> {
             .image_color_space(format.color_space)
             .image_extent(extent)
             .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_usage(swapchain_usage_flags(&caps))
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(caps.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
@@ -920,6 +945,56 @@ impl<'a> VulkanBackend<'a> {
         self.depth_format
     }
 
+    /// Consume an outstanding acquire-semaphore signal left by a dropped
+    /// Open frame.
+    ///
+    /// `vkAcquireNextImageKHR` signals the binary `image_available`
+    /// semaphore; only a submission that *waits* on it drains it. Dropping a
+    /// frame without presenting (or flushing) leaves it signaled, and the
+    /// next acquire may not reuse a signaled semaphore
+    /// (VUID-vkAcquireNextImageKHR-semaphore-01286). An empty submission —
+    /// wait on the signal, signal the frame fence, wait the fence — drains
+    /// it exactly like the readback flush does.
+    fn consume_outstanding_acquire_signal(
+        &self,
+        render: &mut RenderState,
+    ) -> std::result::Result<(), String> {
+        unsafe {
+            // A stale Open frame left the command buffer mid-recording (begun,
+            // render pass open, never ended) — reset before re-beginning
+            // (VUID-vkBeginCommandBuffer-commandBuffer-00049).
+            let _ = self
+                .device
+                .reset_command_buffer(render.cmd, vk::CommandBufferResetFlags::empty());
+            let begin = vk::CommandBufferBeginInfo::default();
+            self.device
+                .begin_command_buffer(render.cmd, &begin)
+                .map_err(|e| format!("consume begin: {e}"))?;
+            self.device
+                .end_command_buffer(render.cmd)
+                .map_err(|e| format!("consume end: {e}"))?;
+            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+            let submit = vk::SubmitInfo::default()
+                .wait_semaphores(std::slice::from_ref(&self.image_available))
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(std::slice::from_ref(&render.cmd));
+            self.device
+                .reset_fences(std::slice::from_ref(&render.fence))
+                .map_err(|e| format!("consume fence reset: {e}"))?;
+            self.device
+                .queue_submit(
+                    self.graphics_queue,
+                    std::slice::from_ref(&submit),
+                    render.fence,
+                )
+                .map_err(|e| format!("consume submit: {e}"))?;
+            self.device
+                .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
+                .map_err(|e| format!("consume fence wait: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// Tear down and rebuild the swapchain (and the extent-sized depth
     /// buffer) at a new size, reusing the render pass so previously compiled
     /// pipelines stay valid.
@@ -938,7 +1013,13 @@ impl<'a> VulkanBackend<'a> {
     /// - **Refused** with [`GraphicsError::RecreateRefused`] if the surface's
     ///   format changed: the render pass and every compiled pipeline are
     ///   bound to the old format. Drop the pipelines, recreate, recompile.
-    /// - On any other failure the old swapchain is left intact and usable.
+    /// - **Failure semantics** (two windows): a failure *before* the
+    ///   replacement swapchain is created (caps/format/extent) leaves the
+    ///   old swapchain intact and usable. The replacement is created with
+    ///   the required `oldSwapchain` handoff (a native window cannot be
+    ///   re-associated without it), which *retires* the old swapchain — so
+    ///   a failure *after* that point leaves the backend without a usable
+    ///   swapchain: drop the backend and construct a new one.
     pub fn recreate_swapchain(&mut self, requested: Option<(u32, u32)>) -> Result<()> {
         // Recover exactly like the next acquire would from a dropped frame:
         // wait for any in-flight execution, then discard any stale recording.
@@ -952,6 +1033,14 @@ impl<'a> VulkanBackend<'a> {
                     true,
                     u64::MAX,
                 );
+                // A stale Open frame left the acquire semaphore signaled —
+                // drain it before the teardown (review round 1, P1).
+                if matches!(render.phase, RenderPhase::Open(_)) {
+                    self.consume_outstanding_acquire_signal(&mut render)
+                        .map_err(|e| GraphicsError::RecreateRefused {
+                            message: format!("acquire-signal recovery: {e}"),
+                        })?;
+                }
                 let _ = self
                     .device
                     .reset_command_buffer(render.cmd, vk::CommandBufferResetFlags::empty());
@@ -1033,17 +1122,35 @@ impl<'a> VulkanBackend<'a> {
             .image_color_space(chosen.color_space)
             .image_extent(extent)
             .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_usage(swapchain_usage_flags(&caps))
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(caps.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
             .present_mode(vk::PresentModeKHR::FIFO)
             .clipped(false)
-            .old_swapchain(vk::SwapchainKHR::null());
+            // The handoff is REQUIRED on native windows: creating a
+            // replacement for a surface whose native window is already
+            // associated with a live swapchain, with oldSwapchain = null,
+            // returns VK_ERROR_NATIVE_WINDOW_IN_USE_KHR (WSI spec). The
+            // handoff retires the old swapchain — with no frame outstanding
+            // (phase Idle above) it has no pending presents, so it is
+            // destroyed immediately once the replacement exists.
+            .old_swapchain(self.swapchain);
         let new_swapchain = unsafe { self.swapchain_fn.create_swapchain(&create_info, None) }
             .map_err(|e| {
                 GraphicsError::InitFailed(format!("vkCreateSwapchainKHR (recreate): {e}"))
             })?;
+        // Registered before the next fallible call — a later failure must
+        // not leak the replacement (review round 1, P1).
+        scratch.swapchain = new_swapchain;
+        // The handed-off (retired) old swapchain: no outstanding presents,
+        // no acquireable images — destroy it now. From this point a failure
+        // of any later step leaves the backend WITHOUT a usable swapchain
+        // (old retired+destroyed, partial replacement cleaned by the
+        // scratch guard): drop the backend and construct a new one.
+        unsafe {
+            self.swapchain_fn.destroy_swapchain(self.swapchain, None);
+        }
         let images = unsafe { self.swapchain_fn.get_swapchain_images(new_swapchain) }
             .map_err(|e| GraphicsError::InitFailed(format!("swapchain images (recreate): {e}")))?;
 
@@ -1165,7 +1272,8 @@ impl<'a> VulkanBackend<'a> {
             self.device.destroy_image_view(self.depth_view, None);
             self.device.destroy_image(self.depth_image, None);
             self.device.free_memory(self.depth_memory, None);
-            self.swapchain_fn.destroy_swapchain(self.swapchain, None);
+            // (the old swapchain was already destroyed right after the
+            // handoff retired it)
         }
         self.swapchain = new_swapchain;
         self.images = images;
@@ -1410,12 +1518,26 @@ impl<'a> VulkanBackend<'a> {
                 .map_err(|e| GraphicsError::AcquireFailed {
                     message: format!("fence wait: {e}"),
                 })?;
+            // A dropped Open frame left the acquire semaphore signaled —
+            // drain it before re-signaling it below
+            // (VUID-vkAcquireNextImageKHR-semaphore-01286; review round 1
+            // on the resize PR — the defect predates it, living here).
+            if matches!(render.phase, RenderPhase::Open(_)) {
+                self.consume_outstanding_acquire_signal(&mut render)
+                    .map_err(|e| GraphicsError::AcquireFailed {
+                        message: format!("acquire-signal recovery: {e}"),
+                    })?;
+            }
         }
 
         let (index, _suboptimal) = unsafe {
             self.swapchain_fn.acquire_next_image(
                 self.swapchain,
-                u64::MAX,
+                // Finite timeout: a surface that cannot guarantee forward
+                // progress (e.g. headless WSI) must not be handed
+                // UINT64_MAX (VUID-vkAcquireNextImageKHR-surface-07783).
+                // 10 minutes is far beyond any real FIFO acquire.
+                600_000_000_000,
                 self.image_available,
                 vk::Fence::null(),
             )
@@ -2106,7 +2228,8 @@ mod tests {
     }
 
     /// Recreating after a dropped (unpresented) frame is safe — the stale
-    /// recording is discarded exactly like the next acquire would.
+    /// recording is discarded exactly like the next acquire would, and the
+    /// outstanding acquire-semaphore signal is drained.
     #[test]
     #[serial]
     fn recreate_after_dropped_frame_is_safe() {
@@ -2120,6 +2243,22 @@ mod tests {
         assert_eq!((backend.extent().width, backend.extent().height), (96, 96));
         let frame = backend.acquire_frame().expect("acquire after recreate");
         backend.present(frame).expect("present after recreate");
+    }
+
+    /// Repeatedly dropping unpresented frames recovers each time — every
+    /// stale Open frame's acquire-semaphore signal is drained before the
+    /// next acquire re-signals it.
+    #[test]
+    #[serial]
+    fn repeated_dropped_frames_recover() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        for _ in 0..3 {
+            let frame = backend.acquire_frame().expect("acquire");
+            drop(frame);
+        }
+        let frame = backend.acquire_frame().expect("acquire after drops");
+        backend.present(frame).expect("present after drops");
     }
 
     /// The frame lifecycle: acquire → present, repeatedly.
