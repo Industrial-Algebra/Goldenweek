@@ -239,7 +239,8 @@ fn choose_surface_format(formats: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatK
 /// (VUID-VkImageMemoryBarrier-oldLayout-01212 /
 /// VUID-vkCmdCopyImageToBuffer-srcImage-00186). Surfaces without
 /// `TRANSFER_SRC` support get the bare flag set so construction still
-/// succeeds; readback there errors at the copy (documented limitation).
+/// succeeds; `read_pixels` tracks the capability and REFUSES with an error
+/// there rather than issuing invalid transfers (review round 2, P1).
 fn swapchain_usage_flags(caps: &vk::SurfaceCapabilitiesKHR) -> vk::ImageUsageFlags {
     if caps
         .supported_usage_flags
@@ -500,6 +501,11 @@ pub struct VulkanBackend<'a> {
     swapchain_fn: khr::swapchain::Device,
     surface: vk::SurfaceKHR,
     swapchain: vk::SwapchainKHR,
+    /// Whether the current swapchain's images carry `TRANSFER_SRC` usage
+    /// (required by [`Self::read_pixels`]). False on surfaces that do not
+    /// support it — readback is refused there instead of issuing invalid
+    /// transfers (review round 2, P1).
+    readback_supported: bool,
     /// The swapchain images (indexed by acquire index).
     images: Vec<vk::Image>,
     /// Chosen swap extent.
@@ -570,7 +576,11 @@ impl Drop for VulkanBackend<'_> {
             self.device.destroy_semaphore(self.image_available, None);
             self.device.destroy_semaphore(self.render_finished, None);
             self.device.destroy_command_pool(self.command_pool, None);
-            self.swapchain_fn.destroy_swapchain(self.swapchain, None);
+            // Null after a failed recreate destroyed the retired swapchain
+            // (round 2, P1) — never double-destroy.
+            if self.swapchain != vk::SwapchainKHR::null() {
+                self.swapchain_fn.destroy_swapchain(self.swapchain, None);
+            }
         }
     }
 }
@@ -682,6 +692,11 @@ impl<'a> VulkanBackend<'a> {
             .old_swapchain(vk::SwapchainKHR::null());
         let swapchain = unsafe { swapchain_fn.create_swapchain(&create_info, None) }
             .map_err(|e| GraphicsError::InitFailed(format!("vkCreateSwapchainKHR: {e}")))?;
+        // Whether readback will be possible on these images (see
+        // `swapchain_usage_flags`).
+        let readback_supported = caps
+            .supported_usage_flags
+            .contains(vk::ImageUsageFlags::TRANSFER_SRC);
 
         // Everything created from here on is owned by `scratch`, which
         // destroys whatever exists if construction fails part-way (P2
@@ -884,6 +899,7 @@ impl<'a> VulkanBackend<'a> {
             swapchain_fn,
             surface,
             swapchain,
+            readback_supported,
             images,
             extent,
             format: format.format,
@@ -1013,13 +1029,14 @@ impl<'a> VulkanBackend<'a> {
     /// - **Refused** with [`GraphicsError::RecreateRefused`] if the surface's
     ///   format changed: the render pass and every compiled pipeline are
     ///   bound to the old format. Drop the pipelines, recreate, recompile.
-    /// - **Failure semantics** (two windows): a failure *before* the
-    ///   replacement swapchain is created (caps/format/extent) leaves the
-    ///   old swapchain intact and usable. The replacement is created with
-    ///   the required `oldSwapchain` handoff (a native window cannot be
-    ///   re-associated without it), which *retires* the old swapchain — so
-    ///   a failure *after* that point leaves the backend without a usable
-    ///   swapchain: drop the backend and construct a new one.
+    /// - **Failure semantics** (two windows, boundary = the `oldSwapchain`
+    ///   handoff CALL): a failure *before* the handoff (caps/format/
+    ///   extent) leaves the old swapchain intact and usable. The handoff is
+    ///   required (a native window cannot be re-associated without it) and
+    ///   *retires the old swapchain whether or not the creation succeeds*
+    ///   (WSI spec) — so a failure *at or after* the handoff leaves the
+    ///   backend without a usable swapchain (the retired handle is
+    ///   destroyed and cleared): drop the backend and construct a new one.
     pub fn recreate_swapchain(&mut self, requested: Option<(u32, u32)>) -> Result<()> {
         // Recover exactly like the next acquire would from a dropped frame:
         // wait for any in-flight execution, then discard any stale recording.
@@ -1131,26 +1148,39 @@ impl<'a> VulkanBackend<'a> {
             // The handoff is REQUIRED on native windows: creating a
             // replacement for a surface whose native window is already
             // associated with a live swapchain, with oldSwapchain = null,
-            // returns VK_ERROR_NATIVE_WINDOW_IN_USE_KHR (WSI spec). The
-            // handoff retires the old swapchain — with no frame outstanding
-            // (phase Idle above) it has no pending presents, so it is
-            // destroyed immediately once the replacement exists.
+            // returns VK_ERROR_NATIVE_WINDOW_IN_USE_KHR (WSI spec).
             .old_swapchain(self.swapchain);
-        let new_swapchain = unsafe { self.swapchain_fn.create_swapchain(&create_info, None) }
-            .map_err(|e| {
-                GraphicsError::InitFailed(format!("vkCreateSwapchainKHR (recreate): {e}"))
-            })?;
+        // The handoff retires the old swapchain REGARDLESS of whether this
+        // call succeeds (WSI spec; review round 2, P2) — so both outcomes
+        // must destroy the retired handle and clear the field (Drop would
+        // otherwise double-destroy it).
+        let new_swapchain = match unsafe { self.swapchain_fn.create_swapchain(&create_info, None) }
+        {
+            Ok(s) => s,
+            Err(e) => {
+                unsafe {
+                    self.swapchain_fn.destroy_swapchain(self.swapchain, None);
+                }
+                self.swapchain = vk::SwapchainKHR::null();
+                return Err(GraphicsError::InitFailed(format!(
+                    "vkCreateSwapchainKHR (recreate): {e}"
+                )));
+            }
+        };
         // Registered before the next fallible call — a later failure must
         // not leak the replacement (review round 1, P1).
         scratch.swapchain = new_swapchain;
-        // The handed-off (retired) old swapchain: no outstanding presents,
-        // no acquireable images — destroy it now. From this point a failure
-        // of any later step leaves the backend WITHOUT a usable swapchain
-        // (old retired+destroyed, partial replacement cleaned by the
-        // scratch guard): drop the backend and construct a new one.
+        // The retired old swapchain: no outstanding presents, no
+        // acquireable images — destroy it NOW and clear the field so the
+        // backend Drop (which a later failure reaches) cannot
+        // double-destroy it (review round 2, P1). From the handoff onward
+        // a failure of any later step leaves the backend WITHOUT a usable
+        // swapchain (old retired+destroyed, partial replacement cleaned by
+        // the scratch guard): drop the backend and construct a new one.
         unsafe {
             self.swapchain_fn.destroy_swapchain(self.swapchain, None);
         }
+        self.swapchain = vk::SwapchainKHR::null();
         let images = unsafe { self.swapchain_fn.get_swapchain_images(new_swapchain) }
             .map_err(|e| GraphicsError::InitFailed(format!("swapchain images (recreate): {e}")))?;
 
@@ -1276,6 +1306,9 @@ impl<'a> VulkanBackend<'a> {
             // handoff retired it)
         }
         self.swapchain = new_swapchain;
+        self.readback_supported = caps
+            .supported_usage_flags
+            .contains(vk::ImageUsageFlags::TRANSFER_SRC);
         self.images = images;
         self.extent = extent;
         self.image_views = new_views;
@@ -1855,6 +1888,16 @@ impl<'a> VulkanBackend<'a> {
                 message: "frame has no acquired image (already presented?)".into(),
             });
         };
+        // Surfaces without TRANSFER_SRC support got COLOR_ATTACHMENT-only
+        // swapchain images — the transfer below would be invalid usage.
+        // Refuse instead (review round 2, P1).
+        if !self.readback_supported {
+            return Err(GraphicsError::Internal(
+                "surface does not support TRANSFER_SRC usage on swapchain images; \
+                 readback unavailable"
+                    .into(),
+            ));
+        }
         {
             let mut render = self.render.lock().expect("render state lock");
             match render.phase {

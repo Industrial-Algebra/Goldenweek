@@ -167,8 +167,12 @@ frame's mid-recording command buffer is explicitly reset at the next
     composites to textbook unorm values over the gray clear (blend).
 - ✅ **Increment 7** — swapchain resize/recreate: `recreate_swapchain`
     rebuilds the swapchain + depth buffer at a new extent while reusing the
-    render pass (pipelines survive); dropped-frame-safe; refused on surface
-    format change (`RecreateRefused`) since pipelines are format-bound;
-    failure leaves the old swapchain intact (`InitScratch` discipline, no
-    oldSwapchain retirement).
+    render pass (pipelines survive); dropped-frame-safe (stale recording
+    discarded, outstanding acquire-semaphore signal drained); refused on
+    surface format change (`RecreateRefused`) since pipelines are
+    format-bound; failure semantics two-windowed at the required
+    `oldSwapchain` handoff (retires the old swapchain whether or not
+    creation succeeds — retired handles destroyed + cleared, replacement
+    built under `InitScratch` discipline); `TRANSFER_SRC` requested for
+    spec-valid readback with capability-tracked refusal where unsupported.
 - ⏳ Metal backend (raw `objc`) — mirroring Borsalino/Zunesha's backend split.
