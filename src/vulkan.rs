@@ -1948,15 +1948,19 @@ impl<'a> VulkanBackend<'a> {
                     .map_err(|e| GraphicsError::PresentFailed {
                         message: format!("fence reset: {e}"),
                     })?;
-                self.device
-                    .queue_submit(
-                        self.graphics_queue,
-                        std::slice::from_ref(&submit),
-                        render.fence,
-                    )
-                    .map_err(|e| GraphicsError::PresentFailed {
+                // A submission failure here strands the unsignaled fence
+                // exactly as in frame recovery — poison so entry points fail
+                // fast instead of deadlocking (review round 6, P1).
+                if let Err(e) = self.device.queue_submit(
+                    self.graphics_queue,
+                    std::slice::from_ref(&submit),
+                    render.fence,
+                ) {
+                    render.broken = true;
+                    return Err(GraphicsError::PresentFailed {
                         message: format!("vkQueueSubmit: {e}"),
-                    })?;
+                    });
+                }
 
                 let swapchains = [self.swapchain];
                 let indices = [index];
@@ -1976,8 +1980,11 @@ impl<'a> VulkanBackend<'a> {
         unsafe {
             self.device
                 .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
-                .map_err(|e| GraphicsError::PresentFailed {
-                    message: format!("fence wait: {e}"),
+                .map_err(|e| {
+                    render.broken = true;
+                    GraphicsError::PresentFailed {
+                        message: format!("fence wait: {e}"),
+                    }
                 })?;
         }
 
@@ -2047,18 +2054,26 @@ impl<'a> VulkanBackend<'a> {
                         self.device
                             .reset_fences(std::slice::from_ref(&render.fence))
                             .map_err(|e| GraphicsError::Internal(format!("fence reset: {e}")))?;
-                        self.device
-                            .queue_submit(
-                                self.graphics_queue,
-                                std::slice::from_ref(&submit),
-                                render.fence,
-                            )
-                            .map_err(|e| {
-                                GraphicsError::Internal(format!("readback submit: {e}"))
-                            })?;
-                        self.device
-                            .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
-                            .map_err(|e| GraphicsError::Internal(format!("readback wait: {e}")))?;
+                        // A submission failure here strands the unsignaled
+                        // fence exactly as in frame recovery — poison so
+                        // entry points fail fast instead of deadlocking
+                        // (review round 6, P1).
+                        if let Err(e) = self.device.queue_submit(
+                            self.graphics_queue,
+                            std::slice::from_ref(&submit),
+                            render.fence,
+                        ) {
+                            render.broken = true;
+                            return Err(GraphicsError::Internal(format!("readback submit: {e}")));
+                        }
+                        if let Err(e) = self.device.wait_for_fences(
+                            std::slice::from_ref(&render.fence),
+                            true,
+                            u64::MAX,
+                        ) {
+                            render.broken = true;
+                            return Err(GraphicsError::Internal(format!("readback wait: {e}")));
+                        }
                     }
                     render.phase = RenderPhase::Flushed(index);
                 }
