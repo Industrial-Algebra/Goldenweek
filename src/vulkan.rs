@@ -993,68 +993,90 @@ impl<'a> VulkanBackend<'a> {
     /// same submission consumes the semaphore), waits the fence, then
     /// presents with no wait semaphore — the image's contents are garbage,
     /// which a recovery frame is allowed to be.
-    fn recover_stale_frame(
-        &self,
-        render: &mut RenderState,
-        index: u32,
-    ) -> std::result::Result<(), String> {
-        unsafe {
-            // A stale Open frame left the command buffer mid-recording (begun,
-            // render pass open, never ended) — reset before re-beginning
-            // (VUID-vkBeginCommandBuffer-commandBuffer-00049).
-            let _ = self
-                .device
-                .reset_command_buffer(render.cmd, vk::CommandBufferResetFlags::empty());
-            let begin = vk::CommandBufferBeginInfo::default();
-            self.device
-                .begin_command_buffer(render.cmd, &begin)
-                .map_err(|e| format!("recover begin: {e}"))?;
-            let barrier = vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::empty())
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(self.images[index as usize])
-                .subresource_range(
-                    vk::ImageSubresourceRange::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .level_count(1)
-                        .layer_count(1),
+    /// Recover whatever stale frame state exists — returning any acquired
+    /// image to the pool and draining any outstanding acquire-semaphore
+    /// signal — so the caller may safely acquire (or tear down) next.
+    ///
+    /// - **Open(index)**: the recording was discarded, so a layout-only
+    ///   `UNDEFINED → PRESENT_SRC` barrier is submitted (the same submission
+    ///   drains the semaphore), fence-waited, then presented back.
+    /// - **Flushed(index)**: a `read_pixels` flush already submitted the
+    ///   render pass (consuming the semaphore and carrying the final
+    ///   `PRESENT_SRC` transition) — only the image needs presenting back.
+    /// - **Idle**: nothing to do.
+    ///
+    /// Callers MUST commit the phase to `Idle` on success BEFORE any
+    /// subsequent fallible operation — a stale phase surviving a failed
+    /// acquire would re-run this recovery and block forever on the
+    /// already-consumed semaphore (review round 4, P1).
+    fn recover_stale_frame(&self, render: &mut RenderState) -> std::result::Result<(), String> {
+        let index = match render.phase {
+            RenderPhase::Idle => return Ok(()),
+            RenderPhase::Open(i) | RenderPhase::Flushed(i) => i,
+        };
+        if matches!(render.phase, RenderPhase::Open(_)) {
+            unsafe {
+                // A stale Open frame left the command buffer mid-recording (begun,
+                // render pass open, never ended) — reset before re-beginning
+                // (VUID-vkBeginCommandBuffer-commandBuffer-00049).
+                let _ = self
+                    .device
+                    .reset_command_buffer(render.cmd, vk::CommandBufferResetFlags::empty());
+                let begin = vk::CommandBufferBeginInfo::default();
+                self.device
+                    .begin_command_buffer(render.cmd, &begin)
+                    .map_err(|e| format!("recover begin: {e}"))?;
+                let barrier = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::empty())
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(self.images[index as usize])
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(1),
+                    );
+                self.device.cmd_pipeline_barrier(
+                    render.cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    std::slice::from_ref(&barrier),
                 );
-            self.device.cmd_pipeline_barrier(
-                render.cmd,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                std::slice::from_ref(&barrier),
-            );
-            self.device
-                .end_command_buffer(render.cmd)
-                .map_err(|e| format!("recover end: {e}"))?;
-            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-            let submit = vk::SubmitInfo::default()
-                .wait_semaphores(std::slice::from_ref(&self.image_available))
-                .wait_dst_stage_mask(&wait_stages)
-                .command_buffers(std::slice::from_ref(&render.cmd));
-            self.device
-                .reset_fences(std::slice::from_ref(&render.fence))
-                .map_err(|e| format!("recover fence reset: {e}"))?;
-            self.device
-                .queue_submit(
-                    self.graphics_queue,
-                    std::slice::from_ref(&submit),
-                    render.fence,
-                )
-                .map_err(|e| format!("recover submit: {e}"))?;
-            self.device
-                .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
-                .map_err(|e| format!("recover fence wait: {e}"))?;
-            // Return the image to the pool — no wait semaphore (the submit's
-            // fence wait already ordered everything), contents are garbage.
+                self.device
+                    .end_command_buffer(render.cmd)
+                    .map_err(|e| format!("recover end: {e}"))?;
+                let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+                let submit = vk::SubmitInfo::default()
+                    .wait_semaphores(std::slice::from_ref(&self.image_available))
+                    .wait_dst_stage_mask(&wait_stages)
+                    .command_buffers(std::slice::from_ref(&render.cmd));
+                self.device
+                    .reset_fences(std::slice::from_ref(&render.fence))
+                    .map_err(|e| format!("recover fence reset: {e}"))?;
+                self.device
+                    .queue_submit(
+                        self.graphics_queue,
+                        std::slice::from_ref(&submit),
+                        render.fence,
+                    )
+                    .map_err(|e| format!("recover submit: {e}"))?;
+                self.device
+                    .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
+                    .map_err(|e| format!("recover fence wait: {e}"))?;
+            }
+        }
+        // Return the image to the pool — no wait semaphore: for Open, the
+        // recovery submit's fence wait already ordered everything; for
+        // Flushed, the readback submission was fence-waited at flush time.
+        // Contents are garbage-or-stale, which recovery frames may be.
+        unsafe {
             let present_info = vk::PresentInfoKHR::default()
                 .swapchains(std::slice::from_ref(&self.swapchain))
                 .image_indices(std::slice::from_ref(&index));
@@ -1104,11 +1126,11 @@ impl<'a> VulkanBackend<'a> {
                     true,
                     u64::MAX,
                 );
-                // A stale Open frame holds an acquired image and a signaled
-                // acquire semaphore — return both (present-back + drain)
-                // before the teardown (review rounds 1+3, P1).
-                if let RenderPhase::Open(index) = render.phase {
-                    self.recover_stale_frame(&mut render, index).map_err(|e| {
+                // A stale frame (Open or Flushed) holds an acquired image —
+                // return it (plus any outstanding signal) before the
+                // teardown (review rounds 1, 3 and 4, P1).
+                {
+                    self.recover_stale_frame(&mut render).map_err(|e| {
                         GraphicsError::RecreateRefused {
                             message: format!("stale-frame recovery: {e}"),
                         }
@@ -1618,18 +1640,18 @@ impl<'a> VulkanBackend<'a> {
                 .map_err(|e| GraphicsError::AcquireFailed {
                     message: format!("fence wait: {e}"),
                 })?;
-            // A dropped Open frame holds an acquired image and a signaled
-            // acquire semaphore — return both (present-back + drain)
-            // before acquiring again (VUID-...-semaphore-01286 and image
-            // pool exhaustion; review rounds 1+3, P1 — the defect
-            // predates this PR, living here).
-            if let RenderPhase::Open(index) = render.phase {
-                self.recover_stale_frame(&mut render, index).map_err(|e| {
-                    GraphicsError::AcquireFailed {
-                        message: format!("stale-frame recovery: {e}"),
-                    }
+            // A stale frame (Open or Flushed) holds an acquired image —
+            // return it (plus any outstanding signal) before acquiring
+            // again, and COMMIT the phase to Idle before the fallible
+            // acquire: a failure there must not leave stale state that
+            // re-runs this recovery and blocks forever on an
+            // already-consumed semaphore (review rounds 1, 3 and 4, P1 —
+            // the Open case predates this PR, living here).
+            self.recover_stale_frame(&mut render)
+                .map_err(|e| GraphicsError::AcquireFailed {
+                    message: format!("stale-frame recovery: {e}"),
                 })?;
-            }
+            render.phase = RenderPhase::Idle;
         }
 
         let (index, _suboptimal) = unsafe {
@@ -2371,6 +2393,27 @@ mod tests {
         }
         let frame = backend.acquire_frame().expect("acquire after drops");
         backend.present(frame).expect("present after drops");
+    }
+
+    /// Dropped readback-FLUSHED frames also return their images: a frame
+    /// that was `read_pixels`-flushed (submission done, semaphore consumed)
+    /// but never presented still owns a swapchain image — dropping
+    /// `image_count()` of them must not exhaust the pool (review round 4,
+    /// P1).
+    #[test]
+    #[serial]
+    fn dropped_flushed_frames_return_to_pool() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let n = backend.image_count();
+        println!("swapchain has {n} images; flushing + dropping {}", n + 2);
+        for _ in 0..n + 2 {
+            let frame = backend.acquire_frame().expect("acquire within pool");
+            let _ = backend.read_pixels(&frame).expect("readback flush");
+            drop(frame); // Flushed, never presented
+        }
+        let frame = backend.acquire_frame().expect("acquire beyond image_count");
+        backend.present(frame).expect("present beyond image_count");
     }
 
     /// Dropping MORE frames than the swapchain has images must not exhaust
