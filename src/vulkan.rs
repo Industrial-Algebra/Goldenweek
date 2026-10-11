@@ -332,6 +332,11 @@ struct RenderState {
     fence: vk::Fence,
     /// Where the current frame's recording stands.
     phase: RenderPhase,
+    /// Set when a frame-recovery submission failed AFTER the fence was
+    /// reset: the unsignaled fence will never be signalled (nothing was
+    /// submitted), so every later fence wait would deadlock. Every entry
+    /// point checks this and fails fast instead (review round 5, P1).
+    broken: bool,
 }
 
 /// The frame-loop state machine (exhaustive — every transition is explicit).
@@ -923,6 +928,7 @@ impl<'a> VulkanBackend<'a> {
                 cmd,
                 fence,
                 phase: RenderPhase::Idle,
+                broken: false,
             }),
             graphics_queue,
             graphics_queue_family: graphics.family_index,
@@ -993,6 +999,21 @@ impl<'a> VulkanBackend<'a> {
     /// same submission consumes the semaphore), waits the fence, then
     /// presents with no wait semaphore — the image's contents are garbage,
     /// which a recovery frame is allowed to be.
+    /// Fast-fail check for a backend poisoned by a failed frame recovery —
+    /// the unsignaled fence makes every later fence wait a deadlock, so
+    /// entry points return this error instead of hanging (review round 5,
+    /// P1).
+    fn check_not_broken(render: &RenderState) -> Result<()> {
+        if render.broken {
+            return Err(GraphicsError::Internal(
+                "backend is in an unrecoverable state after a failed frame \
+                 recovery; drop it and construct a new one"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Recover whatever stale frame state exists — returning any acquired
     /// image to the pool and draining any outstanding acquire-semaphore
     /// signal — so the caller may safely acquire (or tear down) next.
@@ -1060,16 +1081,25 @@ impl<'a> VulkanBackend<'a> {
                 self.device
                     .reset_fences(std::slice::from_ref(&render.fence))
                     .map_err(|e| format!("recover fence reset: {e}"))?;
-                self.device
-                    .queue_submit(
-                        self.graphics_queue,
-                        std::slice::from_ref(&submit),
-                        render.fence,
-                    )
-                    .map_err(|e| format!("recover submit: {e}"))?;
-                self.device
-                    .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
-                    .map_err(|e| format!("recover fence wait: {e}"))?;
+                // From this point a submission failure leaves the fence
+                // UNSIGNALED with nothing that will ever signal it — any
+                // later fence wait deadlocks. Poison the backend so entry
+                // points fail fast instead (review round 5, P1).
+                if let Err(e) = self.device.queue_submit(
+                    self.graphics_queue,
+                    std::slice::from_ref(&submit),
+                    render.fence,
+                ) {
+                    render.broken = true;
+                    return Err(format!("recover submit: {e}"));
+                }
+                if let Err(e) =
+                    self.device
+                        .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
+                {
+                    render.broken = true;
+                    return Err(format!("recover fence wait: {e}"));
+                }
             }
         }
         // Return the image to the pool — no wait semaphore: for Open, the
@@ -1120,6 +1150,7 @@ impl<'a> VulkanBackend<'a> {
         // governs it.)
         {
             let mut render = self.render.lock().expect("render state lock");
+            Self::check_not_broken(&render)?;
             unsafe {
                 let _ = self.device.wait_for_fences(
                     std::slice::from_ref(&render.fence),
@@ -1626,6 +1657,7 @@ impl<'a> VulkanBackend<'a> {
     /// displayed).
     pub fn acquire_frame(&self) -> Result<Frame> {
         let mut render = self.render.lock().expect("render state lock");
+        Self::check_not_broken(&render)?;
 
         // Wait for the previous frame's command buffer to finish. The fence
         // is signalled whenever no frame is in flight (created signalled, and
@@ -1827,6 +1859,7 @@ impl<'a> VulkanBackend<'a> {
         let vertex_buffer = self.zunesha_device.raw_buffer(zunesha_buffer);
 
         let render = self.render.lock().expect("render state lock");
+        Self::check_not_broken(&render)?;
         if !matches!(render.phase, RenderPhase::Open(i) if i == frame_index) {
             return Err(GraphicsError::InvalidDraw {
                 message: format!(
@@ -1867,6 +1900,7 @@ impl<'a> VulkanBackend<'a> {
                 message: "frame has no acquired image (already presented?)".into(),
             })?;
         let mut render = self.render.lock().expect("render state lock");
+        Self::check_not_broken(&render)?;
         let flushed = match render.phase {
             RenderPhase::Open(i) if i == index => false,
             // A `read_pixels` flush already submitted the rendering and
@@ -1991,6 +2025,7 @@ impl<'a> VulkanBackend<'a> {
         }
         {
             let mut render = self.render.lock().expect("render state lock");
+            Self::check_not_broken(&render)?;
             match render.phase {
                 RenderPhase::Open(i) if i == index => {
                     // Flush the recording: end the pass, submit (consuming the
