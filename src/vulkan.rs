@@ -665,6 +665,14 @@ impl<'a> VulkanBackend<'a> {
         }
         let format = choose_surface_format(&formats);
         let extent = choose_extent(&caps);
+        if extent.width == 0 || extent.height == 0 {
+            // A zero extent (e.g. a minimized window's currentExtent) is
+            // invalid swapchain input (VUID-VkSwapchainCreateInfoKHR-
+            // imageExtent-01689).
+            return Err(GraphicsError::InitFailed(
+                "surface extent is zero (minimized window?)".into(),
+            ));
+        }
 
         // FIFO is universally supported and gives a well-defined blocking
         // present, matching the synchronous frame-loop contract.
@@ -971,9 +979,24 @@ impl<'a> VulkanBackend<'a> {
     /// (VUID-vkAcquireNextImageKHR-semaphore-01286). An empty submission —
     /// wait on the signal, signal the frame fence, wait the fence — drains
     /// it exactly like the readback flush does.
-    fn consume_outstanding_acquire_signal(
+    /// Recover a stale Open frame: drain the outstanding acquire-semaphore
+    /// signal AND return the acquired image to the swapchain pool.
+    ///
+    /// `vkAcquireNextImageKHR` both signals the binary `image_available`
+    /// semaphore and takes an image out of the pool; only a submission that
+    /// *waits* on the signal drains it (VUID-vkAcquireNextImageKHR-
+    /// semaphore-01286), and only a *present* recycles the image — without
+    /// the present, `image_count()` dropped frames exhaust the pool and the
+    /// next acquire times out (review round 3, P1). The recovery records a
+    /// layout-only transition of the image to `PRESENT_SRC` (the stale
+    /// recording that would have done this was discarded), submits it (the
+    /// same submission consumes the semaphore), waits the fence, then
+    /// presents with no wait semaphore — the image's contents are garbage,
+    /// which a recovery frame is allowed to be.
+    fn recover_stale_frame(
         &self,
         render: &mut RenderState,
+        index: u32,
     ) -> std::result::Result<(), String> {
         unsafe {
             // A stale Open frame left the command buffer mid-recording (begun,
@@ -985,10 +1008,33 @@ impl<'a> VulkanBackend<'a> {
             let begin = vk::CommandBufferBeginInfo::default();
             self.device
                 .begin_command_buffer(render.cmd, &begin)
-                .map_err(|e| format!("consume begin: {e}"))?;
+                .map_err(|e| format!("recover begin: {e}"))?;
+            let barrier = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::empty())
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(self.images[index as usize])
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+            self.device.cmd_pipeline_barrier(
+                render.cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&barrier),
+            );
             self.device
                 .end_command_buffer(render.cmd)
-                .map_err(|e| format!("consume end: {e}"))?;
+                .map_err(|e| format!("recover end: {e}"))?;
             let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
             let submit = vk::SubmitInfo::default()
                 .wait_semaphores(std::slice::from_ref(&self.image_available))
@@ -996,17 +1042,25 @@ impl<'a> VulkanBackend<'a> {
                 .command_buffers(std::slice::from_ref(&render.cmd));
             self.device
                 .reset_fences(std::slice::from_ref(&render.fence))
-                .map_err(|e| format!("consume fence reset: {e}"))?;
+                .map_err(|e| format!("recover fence reset: {e}"))?;
             self.device
                 .queue_submit(
                     self.graphics_queue,
                     std::slice::from_ref(&submit),
                     render.fence,
                 )
-                .map_err(|e| format!("consume submit: {e}"))?;
+                .map_err(|e| format!("recover submit: {e}"))?;
             self.device
                 .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
-                .map_err(|e| format!("consume fence wait: {e}"))?;
+                .map_err(|e| format!("recover fence wait: {e}"))?;
+            // Return the image to the pool — no wait semaphore (the submit's
+            // fence wait already ordered everything), contents are garbage.
+            let present_info = vk::PresentInfoKHR::default()
+                .swapchains(std::slice::from_ref(&self.swapchain))
+                .image_indices(std::slice::from_ref(&index));
+            let _ = self
+                .swapchain_fn
+                .queue_present(self.graphics_queue, &present_info);
         }
         Ok(())
     }
@@ -1050,13 +1104,15 @@ impl<'a> VulkanBackend<'a> {
                     true,
                     u64::MAX,
                 );
-                // A stale Open frame left the acquire semaphore signaled —
-                // drain it before the teardown (review round 1, P1).
-                if matches!(render.phase, RenderPhase::Open(_)) {
-                    self.consume_outstanding_acquire_signal(&mut render)
-                        .map_err(|e| GraphicsError::RecreateRefused {
-                            message: format!("acquire-signal recovery: {e}"),
-                        })?;
+                // A stale Open frame holds an acquired image and a signaled
+                // acquire semaphore — return both (present-back + drain)
+                // before the teardown (review rounds 1+3, P1).
+                if let RenderPhase::Open(index) = render.phase {
+                    self.recover_stale_frame(&mut render, index).map_err(|e| {
+                        GraphicsError::RecreateRefused {
+                            message: format!("stale-frame recovery: {e}"),
+                        }
+                    })?;
                 }
                 let _ = self
                     .device
@@ -1101,6 +1157,17 @@ impl<'a> VulkanBackend<'a> {
             });
         }
         let (width, height) = resolve_extent(&caps, requested);
+        // Zero extents (minimized windows report a zero currentExtent) are
+        // invalid swapchain input (VUID-...-imageExtent-01689) — reject
+        // BEFORE the oldSwapchain handoff, which would retire the old
+        // swapchain even on a failed creation (review round 3, P1).
+        if width == 0 || height == 0 {
+            return Err(GraphicsError::RecreateRefused {
+                message: "surface extent is zero (minimized window?); retry after \
+                         restore"
+                    .into(),
+            });
+        }
         let extent = vk::Extent2D { width, height };
 
         // Image count: same policy as construction (FIFO, >= 2, <= max).
@@ -1551,15 +1618,17 @@ impl<'a> VulkanBackend<'a> {
                 .map_err(|e| GraphicsError::AcquireFailed {
                     message: format!("fence wait: {e}"),
                 })?;
-            // A dropped Open frame left the acquire semaphore signaled —
-            // drain it before re-signaling it below
-            // (VUID-vkAcquireNextImageKHR-semaphore-01286; review round 1
-            // on the resize PR — the defect predates it, living here).
-            if matches!(render.phase, RenderPhase::Open(_)) {
-                self.consume_outstanding_acquire_signal(&mut render)
-                    .map_err(|e| GraphicsError::AcquireFailed {
-                        message: format!("acquire-signal recovery: {e}"),
-                    })?;
+            // A dropped Open frame holds an acquired image and a signaled
+            // acquire semaphore — return both (present-back + drain)
+            // before acquiring again (VUID-...-semaphore-01286 and image
+            // pool exhaustion; review rounds 1+3, P1 — the defect
+            // predates this PR, living here).
+            if let RenderPhase::Open(index) = render.phase {
+                self.recover_stale_frame(&mut render, index).map_err(|e| {
+                    GraphicsError::AcquireFailed {
+                        message: format!("stale-frame recovery: {e}"),
+                    }
+                })?;
             }
         }
 
@@ -1570,7 +1639,7 @@ impl<'a> VulkanBackend<'a> {
                 // progress (e.g. headless WSI) must not be handed
                 // UINT64_MAX (VUID-vkAcquireNextImageKHR-surface-07783).
                 // 10 minutes is far beyond any real FIFO acquire.
-                600_000_000_000,
+                5_000_000_000,
                 self.image_available,
                 vk::Fence::null(),
             )
@@ -2289,8 +2358,8 @@ mod tests {
     }
 
     /// Repeatedly dropping unpresented frames recovers each time — every
-    /// stale Open frame's acquire-semaphore signal is drained before the
-    /// next acquire re-signals it.
+    /// stale Open frame's acquire-semaphore signal is drained AND its image
+    /// is presented back to the pool.
     #[test]
     #[serial]
     fn repeated_dropped_frames_recover() {
@@ -2302,6 +2371,27 @@ mod tests {
         }
         let frame = backend.acquire_frame().expect("acquire after drops");
         backend.present(frame).expect("present after drops");
+    }
+
+    /// Dropping MORE frames than the swapchain has images must not exhaust
+    /// the pool — each recovery returns its image (review round 3, P1:
+    /// draining the semaphore alone left the fifth acquire on a four-image
+    /// swapchain timing out).
+    #[test]
+    #[serial]
+    fn dropped_images_return_to_pool() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let n = backend.image_count();
+        println!("swapchain has {n} images; dropping {}", n + 2);
+        for _ in 0..n + 2 {
+            let frame = backend.acquire_frame().expect("acquire within pool");
+            drop(frame);
+        }
+        // The pool must not be exhausted: this acquire times out (and the
+        // test errors) if any drop leaked its image.
+        let frame = backend.acquire_frame().expect("acquire beyond image_count");
+        backend.present(frame).expect("present beyond image_count");
     }
 
     /// The frame lifecycle: acquire → present, repeatedly.
