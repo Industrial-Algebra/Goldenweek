@@ -1109,10 +1109,16 @@ impl<'a> VulkanBackend<'a> {
             unsafe {
                 // A stale Open frame left the command buffer mid-recording (begun,
                 // render pass open, never ended) — reset before re-beginning
-                // (VUID-vkBeginCommandBuffer-commandBuffer-00049).
-                let _ = self
+                // (VUID-vkBeginCommandBuffer-commandBuffer-00049). A failed
+                // reset must NOT be followed by a begin (00049/07889/00060
+                // on the stale recording) — propagate while the state is
+                // still retryable (the fence is untouched) (round 9, P1).
+                if let Err(e) = self
                     .device
-                    .reset_command_buffer(render.cmd, vk::CommandBufferResetFlags::empty());
+                    .reset_command_buffer(render.cmd, vk::CommandBufferResetFlags::empty())
+                {
+                    return Err(format!("recover reset: {e}"));
+                }
                 let begin = vk::CommandBufferBeginInfo::default();
                 self.device
                     .begin_command_buffer(render.cmd, &begin)
@@ -1192,15 +1198,19 @@ impl<'a> VulkanBackend<'a> {
                 .swapchain_fn
                 .queue_present(self.graphics_queue, &present_info);
             if let Err(e) = pres {
-                if e == vk::Result::ERROR_OUT_OF_DATE_KHR {
-                    // OUT_OF_DATE means the swapchain must be recreated and
-                    // the engine has released the image: re-presenting it is
-                    // a duplicate present (VUID 01430) and keeps the native
-                    // window in use, refusing later recreation (round 8,
-                    // P1). No image is owned anymore.
+                if matches!(
+                    e,
+                    vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::ERROR_SURFACE_LOST_KHR
+                ) {
+                    // OUT_OF_DATE / SURFACE_LOST mean the swapchain or
+                    // surface is gone and the engine has released the image:
+                    // re-presenting it is a duplicate present (VUID 01430)
+                    // and keeps the native window in use, refusing later
+                    // recreation (rounds 8–9, P1). No image is owned
+                    // anymore.
                     render.phase = RenderPhase::Idle;
                     return Err(format!(
-                        "recover present-back: {e} (swapchain out of date — recreate required)"
+                        "recover present-back: {e} (swapchain/surface lost — recreate required)"
                     ));
                 }
                 // An allocation-class failure was NOT enqueued: the image is
@@ -2117,16 +2127,62 @@ impl<'a> VulkanBackend<'a> {
                 })?;
         }
 
-        // OUT_OF_DATE releases the image (the engine consumes it despite
-        // the error) — Idle is correct and the caller must recreate. Any
-        // other present error was NOT enqueued: the image is still ours, so
-        // commit Flushed (submit done, present pending) — the next acquire's
-        // recovery presents it back instead of silently losing it from the
-        // pool (round 8, P1).
+        // OUT_OF_DATE and SURFACE_LOST release the image (the engine
+        // consumes it despite the error) — Idle is correct and the caller
+        // must recreate. Any other present error was NOT enqueued: the image
+        // is still ours, so commit Flushed (submit done, present pending)
+        // after draining the stranded render_finished signal — the next
+        // acquire's recovery presents it back instead of silently losing it
+        // from the pool (rounds 8–9, P1).
         match present_result {
             Ok(_) => render.phase = RenderPhase::Idle,
-            Err(e) if e == vk::Result::ERROR_OUT_OF_DATE_KHR => render.phase = RenderPhase::Idle,
-            Err(_) => render.phase = RenderPhase::Flushed(index),
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::ERROR_SURFACE_LOST_KHR) => {
+                render.phase = RenderPhase::Idle
+            }
+            Err(e) => {
+                // The submit that would have waited render_finished already
+                // ran and signaled it; the failed present never consumes it.
+                // A later present would signal the STILL-signaled semaphore
+                // — VUID 00067 as a permanent strand, not the documented
+                // back-to-back latency race (round 9, P1). The fence has
+                // been waited, so the signal is complete: an empty
+                // submission waiting on it drains deterministically.
+                unsafe {
+                    let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+                    let drain = vk::SubmitInfo::default()
+                        .wait_semaphores(std::slice::from_ref(&self.render_finished))
+                        .wait_dst_stage_mask(&wait_stages);
+                    let drained = self
+                        .device
+                        .reset_fences(std::slice::from_ref(&render.fence))
+                        .and_then(|()| {
+                            self.device.queue_submit(
+                                self.graphics_queue,
+                                std::slice::from_ref(&drain),
+                                render.fence,
+                            )
+                        })
+                        .and_then(|()| {
+                            self.device.wait_for_fences(
+                                std::slice::from_ref(&render.fence),
+                                true,
+                                u64::MAX,
+                            )
+                        });
+                    if let Err(drain_err) = drained {
+                        // The fence may be stranded (reset without a
+                        // completing submit) — poison per the round-6
+                        // discipline and surface both errors.
+                        render.broken = true;
+                        return Err(GraphicsError::PresentFailed {
+                            message: format!(
+                                "vkQueuePresentKHR: {e}; render_finished drain: {drain_err}"
+                            ),
+                        });
+                    }
+                }
+                render.phase = RenderPhase::Flushed(index);
+            }
         }
         present_result
             .map(|_| ())
