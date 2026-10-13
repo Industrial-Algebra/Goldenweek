@@ -340,7 +340,7 @@ struct RenderState {
 }
 
 /// How much work `present` still owes before queueing the presentation.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum NeedsSubmit {
     /// Recording active — end, submit, then present.
     Record,
@@ -2034,6 +2034,11 @@ impl<'a> VulkanBackend<'a> {
             }
         };
 
+        // Whether THIS invocation submitted (and therefore signaled
+        // render_finished): only then can a failed present strand the
+        // signal and only then may the drain wait on it (round 10, P1).
+        let submitted = !matches!(flush_state, NeedsSubmit::No);
+
         let present_result = match flush_state {
             NeedsSubmit::No => {
                 let swapchains = [self.swapchain];
@@ -2140,47 +2145,54 @@ impl<'a> VulkanBackend<'a> {
                 render.phase = RenderPhase::Idle
             }
             Err(e) => {
-                // The submit that would have waited render_finished already
-                // ran and signaled it; the failed present never consumes it.
-                // A later present would signal the STILL-signaled semaphore
-                // — VUID 00067 as a permanent strand, not the documented
-                // back-to-back latency race (round 9, P1). The fence has
-                // been waited, so the signal is complete: an empty
-                // submission waiting on it drains deterministically.
-                unsafe {
-                    let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-                    let drain = vk::SubmitInfo::default()
-                        .wait_semaphores(std::slice::from_ref(&self.render_finished))
-                        .wait_dst_stage_mask(&wait_stages);
-                    let drained = self
-                        .device
-                        .reset_fences(std::slice::from_ref(&render.fence))
-                        .and_then(|()| {
-                            self.device.queue_submit(
-                                self.graphics_queue,
-                                std::slice::from_ref(&drain),
-                                render.fence,
-                            )
-                        })
-                        .and_then(|()| {
-                            self.device.wait_for_fences(
-                                std::slice::from_ref(&render.fence),
-                                true,
-                                u64::MAX,
-                            )
-                        });
-                    if let Err(drain_err) = drained {
-                        // The fence may be stranded (reset without a
-                        // completing submit) — poison per the round-6
-                        // discipline and surface both errors.
-                        render.broken = true;
-                        return Err(GraphicsError::PresentFailed {
-                            message: format!(
-                                "vkQueuePresentKHR: {e}; render_finished drain: {drain_err}"
-                            ),
-                        });
+                // Drain ONLY when this invocation signaled render_finished
+                // (Record/Ended paths): a Flushed-entry present (readback
+                // flush already ran) never signaled it — waiting there is
+                // an unsignaled-semaphore wait (VUID 03238) that hangs
+                // forever (round 10, P1).
+                if submitted {
+                    // The submit that would have waited render_finished already
+                    // ran and signaled it; the failed present never consumes it.
+                    // A later present would signal the STILL-signaled semaphore
+                    // — VUID 00067 as a permanent strand, not the documented
+                    // back-to-back latency race (round 9, P1). The fence has
+                    // been waited, so the signal is complete: an empty
+                    // submission waiting on it drains deterministically.
+                    unsafe {
+                        let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+                        let drain = vk::SubmitInfo::default()
+                            .wait_semaphores(std::slice::from_ref(&self.render_finished))
+                            .wait_dst_stage_mask(&wait_stages);
+                        let drained = self
+                            .device
+                            .reset_fences(std::slice::from_ref(&render.fence))
+                            .and_then(|()| {
+                                self.device.queue_submit(
+                                    self.graphics_queue,
+                                    std::slice::from_ref(&drain),
+                                    render.fence,
+                                )
+                            })
+                            .and_then(|()| {
+                                self.device.wait_for_fences(
+                                    std::slice::from_ref(&render.fence),
+                                    true,
+                                    u64::MAX,
+                                )
+                            });
+                        if let Err(drain_err) = drained {
+                            // The fence may be stranded (reset without a
+                            // completing submit) — poison per the round-6
+                            // discipline and surface both errors.
+                            render.broken = true;
+                            return Err(GraphicsError::PresentFailed {
+                                message: format!(
+                                    "vkQueuePresentKHR: {e}; render_finished drain: {drain_err}"
+                                ),
+                            });
+                        }
                     }
-                }
+                } // submitted
                 render.phase = RenderPhase::Flushed(index);
             }
         }
