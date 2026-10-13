@@ -233,21 +233,92 @@ fn choose_surface_format(formats: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatK
 
 /// Choose the swap extent: the surface's current extent when it is defined,
 /// otherwise a fixed headless default.
-fn choose_extent(caps: &vk::SurfaceCapabilitiesKHR) -> vk::Extent2D {
-    if caps.current_extent.width != u32::MAX {
-        caps.current_extent
+/// Image usage for swapchain images: `COLOR_ATTACHMENT | TRANSFER_SRC`
+/// when the surface supports it — `read_pixels` transitions the image to
+/// `TRANSFER_SRC_OPTIMAL` and copies it, which requires the usage bit
+/// (VUID-VkImageMemoryBarrier-oldLayout-01212 /
+/// VUID-vkCmdCopyImageToBuffer-srcImage-00186). Surfaces without
+/// `TRANSFER_SRC` support get the bare flag set so construction still
+/// succeeds; `read_pixels` tracks the capability and REFUSES with an error
+/// there rather than issuing invalid transfers (review round 2, P1).
+fn swapchain_usage_flags(caps: &vk::SurfaceCapabilitiesKHR) -> vk::ImageUsageFlags {
+    if caps
+        .supported_usage_flags
+        .contains(vk::ImageUsageFlags::TRANSFER_SRC)
+    {
+        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC
     } else {
-        // Undefined extent (headless surfaces typically report this): pick a
-        // sane test default clamped to the surface's limits.
-        let width = 256u32.clamp(
-            caps.min_image_extent.width,
-            caps.max_image_extent.width.max(1),
-        );
-        let height = 256u32.clamp(
-            caps.min_image_extent.height,
-            caps.max_image_extent.height.max(1),
-        );
-        vk::Extent2D { width, height }
+        vk::ImageUsageFlags::COLOR_ATTACHMENT
+    }
+}
+
+/// Resolve the swapchain extent for a (re)creation: a defined current
+/// extent (real windows) always wins; otherwise an explicit request is
+/// clamped to the surface's limits, falling back to the 256 test default.
+fn resolve_extent(caps: &vk::SurfaceCapabilitiesKHR, requested: Option<(u32, u32)>) -> (u32, u32) {
+    if caps.current_extent.width != u32::MAX {
+        return (caps.current_extent.width, caps.current_extent.height);
+    }
+    let (dw, dh) = requested.unwrap_or((256, 256));
+    let width = dw.clamp(
+        caps.min_image_extent.width,
+        caps.max_image_extent.width.max(1),
+    );
+    let height = dh.clamp(
+        caps.min_image_extent.height,
+        caps.max_image_extent.height.max(1),
+    );
+    (width, height)
+}
+
+fn choose_extent(caps: &vk::SurfaceCapabilitiesKHR) -> vk::Extent2D {
+    // Undefined extent (headless surfaces typically report this): pick a
+    // sane test default clamped to the surface's limits.
+    let (width, height) = resolve_extent(caps, None);
+    vk::Extent2D { width, height }
+}
+
+#[cfg(test)]
+mod extent_tests {
+    use super::*;
+
+    fn caps(current: u32, min: u32, max: u32) -> vk::SurfaceCapabilitiesKHR {
+        vk::SurfaceCapabilitiesKHR::default()
+            .current_extent(vk::Extent2D {
+                width: current,
+                height: current,
+            })
+            .min_image_extent(vk::Extent2D {
+                width: min,
+                height: min,
+            })
+            .max_image_extent(vk::Extent2D {
+                width: max,
+                height: max,
+            })
+    }
+
+    /// A defined current extent wins over any request (real windows).
+    #[test]
+    fn defined_current_extent_wins() {
+        let got = choose_extent(&caps(800, 64, 2048));
+        assert_eq!((got.width, got.height), (800, 800));
+    }
+
+    /// Undefined extent + no request → the 256 default.
+    #[test]
+    fn undefined_extent_defaults_to_256() {
+        let got = choose_extent(&caps(u32::MAX, 4, 4096));
+        assert_eq!((got.width, got.height), (256, 256));
+    }
+
+    /// Requests clamp to the surface's limits.
+    #[test]
+    fn requested_extent_clamps_to_caps() {
+        let caps = caps(u32::MAX, 64, 1024);
+        assert_eq!(resolve_extent(&caps, Some((8, 8))), (64, 64));
+        assert_eq!(resolve_extent(&caps, Some((2048, 2048))), (1024, 1024));
+        assert_eq!(resolve_extent(&caps, Some((300, 200))), (300, 200));
     }
 }
 
@@ -261,15 +332,41 @@ struct RenderState {
     fence: vk::Fence,
     /// Where the current frame's recording stands.
     phase: RenderPhase,
+    /// Set when a frame-recovery submission failed AFTER the fence was
+    /// reset: the unsignaled fence will never be signalled (nothing was
+    /// submitted), so every later fence wait would deadlock. Every entry
+    /// point checks this and fails fast instead (review round 5, P1).
+    broken: bool,
+}
+
+/// How much work `present` still owes before queueing the presentation.
+#[derive(Debug, Clone, Copy)]
+enum NeedsSubmit {
+    /// Recording active — end, submit, then present.
+    Record,
+    /// Recording already ended — submit without ending (interrupted flush).
+    Ended,
+    /// Submission complete (flush or recovery) — present only.
+    No,
 }
 
 /// The frame-loop state machine (exhaustive — every transition is explicit).
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum RenderPhase {
+    /// Image `u32` acquired (owned, semaphore unconsumed) but recording
+    /// preparation has not completed — only reachable when preparation
+    /// failed part-way; recovery presents the image back (round 7, P1).
+    Acquired(u32),
     /// Image `u32` acquired; render pass open, commands recording.
     Open(u32),
-    /// Recording submitted and fence-waited (a `read_pixels` flush);
-    /// contents stable, not yet presented.
+    /// Recording for image `u32` ENDED; submission pending (a flush was
+    /// interrupted between `end_command_buffer` and the submit — retrying
+    /// resumes at the submit, it must not end twice) (round 7, P1).
+    Flushing(u32),
+    /// Recording submitted and fence-waited (a `read_pixels` flush, or a
+    /// recovery whose submit completed); contents stable, present pending.
+    /// Also the state after a recovery present-BACK failed to enqueue —
+    /// retrying presents again without re-consuming anything (round 7, P1).
     Flushed(u32),
     /// No frame in flight.
     Idle,
@@ -430,6 +527,11 @@ pub struct VulkanBackend<'a> {
     swapchain_fn: khr::swapchain::Device,
     surface: vk::SurfaceKHR,
     swapchain: vk::SwapchainKHR,
+    /// Whether the current swapchain's images carry `TRANSFER_SRC` usage
+    /// (required by [`Self::read_pixels`]). False on surfaces that do not
+    /// support it — readback is refused there instead of issuing invalid
+    /// transfers (review round 2, P1).
+    readback_supported: bool,
     /// The swapchain images (indexed by acquire index).
     images: Vec<vk::Image>,
     /// Chosen swap extent.
@@ -463,6 +565,13 @@ pub struct VulkanBackend<'a> {
     /// Signalled when a swapchain image is acquired.
     image_available: vk::Semaphore,
     /// Signalled when the frame's rendering is complete (present waits on it).
+    ///
+    /// Known limitation (validation-confirmed): back-to-back presents can
+    /// re-signal this binary semaphore before the presentation engine
+    /// consumed the previous signal (VUID-vkQueueSubmit-pSignalSemaphores-
+    /// 00067) — a narrow race pre-dating this backend. The proper fix is a
+    /// timeline-semaphore refactor of the acquire/submit/present chain;
+    /// tracked as a follow-up increment (see ROADMAP sequencing notes).
     render_finished: vk::Semaphore,
 }
 
@@ -493,7 +602,11 @@ impl Drop for VulkanBackend<'_> {
             self.device.destroy_semaphore(self.image_available, None);
             self.device.destroy_semaphore(self.render_finished, None);
             self.device.destroy_command_pool(self.command_pool, None);
-            self.swapchain_fn.destroy_swapchain(self.swapchain, None);
+            // Null after a failed recreate destroyed the retired swapchain
+            // (round 2, P1) — never double-destroy.
+            if self.swapchain != vk::SwapchainKHR::null() {
+                self.swapchain_fn.destroy_swapchain(self.swapchain, None);
+            }
         }
     }
 }
@@ -577,6 +690,14 @@ impl<'a> VulkanBackend<'a> {
         }
         let format = choose_surface_format(&formats);
         let extent = choose_extent(&caps);
+        if extent.width == 0 || extent.height == 0 {
+            // A zero extent (e.g. a minimized window's currentExtent) is
+            // invalid swapchain input (VUID-VkSwapchainCreateInfoKHR-
+            // imageExtent-01689).
+            return Err(GraphicsError::InitFailed(
+                "surface extent is zero (minimized window?)".into(),
+            ));
+        }
 
         // FIFO is universally supported and gives a well-defined blocking
         // present, matching the synchronous frame-loop contract.
@@ -595,7 +716,7 @@ impl<'a> VulkanBackend<'a> {
             .image_color_space(format.color_space)
             .image_extent(extent)
             .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_usage(swapchain_usage_flags(&caps))
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(caps.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
@@ -604,6 +725,11 @@ impl<'a> VulkanBackend<'a> {
             .old_swapchain(vk::SwapchainKHR::null());
         let swapchain = unsafe { swapchain_fn.create_swapchain(&create_info, None) }
             .map_err(|e| GraphicsError::InitFailed(format!("vkCreateSwapchainKHR: {e}")))?;
+        // Whether readback will be possible on these images (see
+        // `swapchain_usage_flags`).
+        let readback_supported = caps
+            .supported_usage_flags
+            .contains(vk::ImageUsageFlags::TRANSFER_SRC);
 
         // Everything created from here on is owned by `scratch`, which
         // destroys whatever exists if construction fails part-way (P2
@@ -806,6 +932,7 @@ impl<'a> VulkanBackend<'a> {
             swapchain_fn,
             surface,
             swapchain,
+            readback_supported,
             images,
             extent,
             format: format.format,
@@ -821,6 +948,7 @@ impl<'a> VulkanBackend<'a> {
                 cmd,
                 fence,
                 phase: RenderPhase::Idle,
+                broken: false,
             }),
             graphics_queue,
             graphics_queue_family: graphics.family_index,
@@ -865,6 +993,558 @@ impl<'a> VulkanBackend<'a> {
     #[must_use]
     pub fn depth_format(&self) -> vk::Format {
         self.depth_format
+    }
+
+    /// Consume an outstanding acquire-semaphore signal left by a dropped
+    /// Open frame.
+    ///
+    /// `vkAcquireNextImageKHR` signals the binary `image_available`
+    /// semaphore; only a submission that *waits* on it drains it. Dropping a
+    /// frame without presenting (or flushing) leaves it signaled, and the
+    /// next acquire may not reuse a signaled semaphore
+    /// (VUID-vkAcquireNextImageKHR-semaphore-01286). An empty submission —
+    /// wait on the signal, signal the frame fence, wait the fence — drains
+    /// it exactly like the readback flush does.
+    /// Recover a stale Open frame: drain the outstanding acquire-semaphore
+    /// signal AND return the acquired image to the swapchain pool.
+    ///
+    /// `vkAcquireNextImageKHR` both signals the binary `image_available`
+    /// semaphore and takes an image out of the pool; only a submission that
+    /// *waits* on the signal drains it (VUID-vkAcquireNextImageKHR-
+    /// semaphore-01286), and only a *present* recycles the image — without
+    /// the present, `image_count()` dropped frames exhaust the pool and the
+    /// next acquire times out (review round 3, P1). The recovery records a
+    /// layout-only transition of the image to `PRESENT_SRC` (the stale
+    /// recording that would have done this was discarded), submits it (the
+    /// same submission consumes the semaphore), waits the fence, then
+    /// presents with no wait semaphore — the image's contents are garbage,
+    /// which a recovery frame is allowed to be.
+    /// Submit an ENDED recording (phase `Flushing`), applying the poison
+    /// discipline, and commit `Flushed` on success. Shared by the readback
+    /// flush and its interrupted-retry path — the recording must already be
+    /// ended when this runs (round 7, P1).
+    fn finish_flush(&self, render: &mut RenderState) -> Result<()> {
+        let RenderPhase::Flushing(index) = render.phase else {
+            return Err(GraphicsError::Internal(
+                "finish_flush called outside Flushing".into(),
+            ));
+        };
+        unsafe {
+            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+            let submit = vk::SubmitInfo::default()
+                .wait_semaphores(std::slice::from_ref(&self.image_available))
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(std::slice::from_ref(&render.cmd));
+            self.device
+                .reset_fences(std::slice::from_ref(&render.fence))
+                .map_err(|e| GraphicsError::Internal(format!("fence reset: {e}")))?;
+            // A submission failure here strands the unsignaled fence exactly
+            // as in frame recovery — poison so entry points fail fast instead
+            // of deadlocking (review round 6, P1).
+            if let Err(e) = self.device.queue_submit(
+                self.graphics_queue,
+                std::slice::from_ref(&submit),
+                render.fence,
+            ) {
+                render.broken = true;
+                return Err(GraphicsError::Internal(format!("readback submit: {e}")));
+            }
+            if let Err(e) =
+                self.device
+                    .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
+            {
+                render.broken = true;
+                return Err(GraphicsError::Internal(format!("readback wait: {e}")));
+            }
+        }
+        render.phase = RenderPhase::Flushed(index);
+        Ok(())
+    }
+
+    /// Fast-fail check for a backend poisoned by a failed frame recovery —
+    /// the unsignaled fence makes every later fence wait a deadlock, so
+    /// entry points return this error instead of hanging (review round 5,
+    /// P1).
+    fn check_not_broken(render: &RenderState) -> Result<()> {
+        if render.broken {
+            return Err(GraphicsError::Internal(
+                "backend is in an unrecoverable state after a failed frame \
+                 recovery; drop it and construct a new one"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Recover whatever stale frame state exists — returning any acquired
+    /// image to the pool and draining any outstanding acquire-semaphore
+    /// signal — so the caller may safely acquire (or tear down) next.
+    ///
+    /// - **Open(index)**: the recording was discarded, so a layout-only
+    ///   `UNDEFINED → PRESENT_SRC` barrier is submitted (the same submission
+    ///   drains the semaphore), fence-waited, then presented back.
+    /// - **Flushed(index)**: a `read_pixels` flush already submitted the
+    ///   render pass (consuming the semaphore and carrying the final
+    ///   `PRESENT_SRC` transition) — only the image needs presenting back.
+    /// - **Idle**: nothing to do.
+    ///
+    /// Callers MUST commit the phase to `Idle` on success BEFORE any
+    /// subsequent fallible operation — a stale phase surviving a failed
+    /// acquire would re-run this recovery and block forever on the
+    /// already-consumed semaphore (review round 4, P1).
+    fn recover_stale_frame(&self, render: &mut RenderState) -> std::result::Result<(), String> {
+        let index = match render.phase {
+            RenderPhase::Idle => return Ok(()),
+            RenderPhase::Acquired(i)
+            | RenderPhase::Open(i)
+            | RenderPhase::Flushing(i)
+            | RenderPhase::Flushed(i) => i,
+        };
+        // Acquired/Open/Flushing all have an unconsumed acquire semaphore
+        // and no submitted work for the image: barrier-submit (drain +
+        // layout) then present-back. Flushing's ended recording is simply
+        // reset away (the pool's RESET_COMMAND_BUFFER flag permits it).
+        if !matches!(render.phase, RenderPhase::Flushed(_)) {
+            unsafe {
+                // A stale Open frame left the command buffer mid-recording (begun,
+                // render pass open, never ended) — reset before re-beginning
+                // (VUID-vkBeginCommandBuffer-commandBuffer-00049). A failed
+                // reset must NOT be followed by a begin (00049/07889/00060
+                // on the stale recording) — propagate while the state is
+                // still retryable (the fence is untouched) (round 9, P1).
+                if let Err(e) = self
+                    .device
+                    .reset_command_buffer(render.cmd, vk::CommandBufferResetFlags::empty())
+                {
+                    return Err(format!("recover reset: {e}"));
+                }
+                let begin = vk::CommandBufferBeginInfo::default();
+                self.device
+                    .begin_command_buffer(render.cmd, &begin)
+                    .map_err(|e| format!("recover begin: {e}"))?;
+                let barrier = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::empty())
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(self.images[index as usize])
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(1),
+                    );
+                self.device.cmd_pipeline_barrier(
+                    render.cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    std::slice::from_ref(&barrier),
+                );
+                self.device
+                    .end_command_buffer(render.cmd)
+                    .map_err(|e| format!("recover end: {e}"))?;
+                let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+                let submit = vk::SubmitInfo::default()
+                    .wait_semaphores(std::slice::from_ref(&self.image_available))
+                    .wait_dst_stage_mask(&wait_stages)
+                    .command_buffers(std::slice::from_ref(&render.cmd));
+                self.device
+                    .reset_fences(std::slice::from_ref(&render.fence))
+                    .map_err(|e| format!("recover fence reset: {e}"))?;
+                // From this point a submission failure leaves the fence
+                // UNSIGNALED with nothing that will ever signal it — any
+                // later fence wait deadlocks. Poison the backend so entry
+                // points fail fast instead (review round 5, P1).
+                if let Err(e) = self.device.queue_submit(
+                    self.graphics_queue,
+                    std::slice::from_ref(&submit),
+                    render.fence,
+                ) {
+                    render.broken = true;
+                    return Err(format!("recover submit: {e}"));
+                }
+                if let Err(e) =
+                    self.device
+                        .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
+                {
+                    render.broken = true;
+                    return Err(format!("recover fence wait: {e}"));
+                }
+            }
+        }
+        // Return the image to the pool — no wait semaphore: for Open, the
+        // recovery submit's fence wait already ordered everything; for
+        // Flushed, the readback submission was fence-waited at flush time.
+        // Contents are garbage-or-stale, which recovery frames may be.
+        //
+        // A present that FAILED TO ENQUEUE leaves the image still ours:
+        // commit Flushed (submit done, present pending — the retry presents
+        // again without re-consuming anything) and propagate the error
+        // instead of reporting success with a retained image (round 7, P1).
+        // Per spec an error return means the present was not enqueued; the
+        // retry failing repeatedly (e.g. OUT_OF_DATE) is fast, never a
+        // deadlock — the fence is signalled.
+        unsafe {
+            let present_info = vk::PresentInfoKHR::default()
+                .swapchains(std::slice::from_ref(&self.swapchain))
+                .image_indices(std::slice::from_ref(&index));
+            let pres = self
+                .swapchain_fn
+                .queue_present(self.graphics_queue, &present_info);
+            if let Err(e) = pres {
+                if matches!(
+                    e,
+                    vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::ERROR_SURFACE_LOST_KHR
+                ) {
+                    // OUT_OF_DATE / SURFACE_LOST mean the swapchain or
+                    // surface is gone and the engine has released the image:
+                    // re-presenting it is a duplicate present (VUID 01430)
+                    // and keeps the native window in use, refusing later
+                    // recreation (rounds 8–9, P1). No image is owned
+                    // anymore.
+                    render.phase = RenderPhase::Idle;
+                    return Err(format!(
+                        "recover present-back: {e} (swapchain/surface lost — recreate required)"
+                    ));
+                }
+                // An allocation-class failure was NOT enqueued: the image is
+                // still ours. Commit Flushed (submit done, present pending —
+                // the retry presents again without re-consuming anything)
+                // and propagate the error instead of reporting success with
+                // a retained image (round 7, P1). A retry failing repeatedly
+                // is fast, never a deadlock — the fence is signalled.
+                render.phase = RenderPhase::Flushed(index);
+                return Err(format!("recover present-back: {e}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Tear down and rebuild the swapchain (and the extent-sized depth
+    /// buffer) at a new size, reusing the render pass so previously compiled
+    /// pipelines stay valid.
+    ///
+    /// `requested` is the desired extent; on surfaces with a defined current
+    /// extent (real windows) the surface's extent always wins, otherwise the
+    /// request is clamped to the surface's limits (`None` → the 256 default).
+    ///
+    /// # Contract
+    ///
+    /// - **No live [`Frame`] may outlive this call** — a frame
+    ///   acquired before the recreate refers to a destroyed swapchain and
+    ///   must not be drawn into or presented afterwards (present it or drop
+    ///   it first; a *dropped* unpresented frame is fully supported — the
+    ///   stale recording is discarded exactly as the next acquire would).
+    /// - **Refused** with [`GraphicsError::RecreateRefused`] if the surface's
+    ///   format changed: the render pass and every compiled pipeline are
+    ///   bound to the old format. Drop the pipelines, recreate, recompile.
+    /// - **Failure semantics** (two windows, boundary = the `oldSwapchain`
+    ///   handoff CALL): a failure *before* the handoff (caps/format/
+    ///   extent) leaves the old swapchain intact and usable. The handoff is
+    ///   required (a native window cannot be re-associated without it) and
+    ///   *retires the old swapchain whether or not the creation succeeds*
+    ///   (WSI spec) — so a failure *at or after* the handoff leaves the
+    ///   backend without a usable swapchain (the retired handle is
+    ///   destroyed and cleared): drop the backend and construct a new one.
+    pub fn recreate_swapchain(&mut self, requested: Option<(u32, u32)>) -> Result<()> {
+        // Recover exactly like the next acquire would from a dropped frame:
+        // wait for any in-flight execution, then discard any stale recording.
+        // (A live Frame cannot be detected — the documented contract above
+        // governs it.)
+        {
+            let mut render = self.render.lock().expect("render state lock");
+            Self::check_not_broken(&render)?;
+            unsafe {
+                let _ = self.device.wait_for_fences(
+                    std::slice::from_ref(&render.fence),
+                    true,
+                    u64::MAX,
+                );
+                // A stale frame (Open or Flushed) holds an acquired image —
+                // return it (plus any outstanding signal) before the
+                // teardown (review rounds 1, 3 and 4, P1).
+                {
+                    self.recover_stale_frame(&mut render).map_err(|e| {
+                        GraphicsError::RecreateRefused {
+                            message: format!("stale-frame recovery: {e}"),
+                        }
+                    })?;
+                }
+                let _ = self
+                    .device
+                    .reset_command_buffer(render.cmd, vk::CommandBufferResetFlags::empty());
+            }
+            render.phase = RenderPhase::Idle;
+        }
+        // Safety: no submission may reference the objects being destroyed.
+        unsafe {
+            let _ = self.device.device_wait_idle();
+        }
+
+        let instance = self.zunesha_device.raw_instance();
+        let surface_fn = khr::surface::Instance::new(self.zunesha_device.entry(), &instance);
+        let caps = unsafe {
+            surface_fn
+                .get_physical_device_surface_capabilities(self.physical_device, self.surface)
+                .map_err(|e| GraphicsError::SurfaceUnavailable {
+                    message: format!("vkGetPhysicalDeviceSurfaceCapabilitiesKHR: {e}"),
+                })?
+        };
+        let formats = unsafe {
+            surface_fn
+                .get_physical_device_surface_formats(self.physical_device, self.surface)
+                .map_err(|e| GraphicsError::SurfaceUnavailable {
+                    message: format!("vkGetPhysicalDeviceSurfaceFormatsKHR: {e}"),
+                })?
+        };
+        if formats.is_empty() {
+            return Err(GraphicsError::SurfaceUnavailable {
+                message: "surface offers no formats".into(),
+            });
+        }
+        let chosen = choose_surface_format(&formats);
+        if chosen.format != self.format {
+            return Err(GraphicsError::RecreateRefused {
+                message: format!(
+                    "surface format changed ({:?} -> {:?}); pipelines bound to the old \
+                     render pass must be recompiled after recreating",
+                    self.format, chosen.format
+                ),
+            });
+        }
+        let (width, height) = resolve_extent(&caps, requested);
+        // Zero extents (minimized windows report a zero currentExtent) are
+        // invalid swapchain input (VUID-...-imageExtent-01689) — reject
+        // BEFORE the oldSwapchain handoff, which would retire the old
+        // swapchain even on a failed creation (review round 3, P1).
+        if width == 0 || height == 0 {
+            return Err(GraphicsError::RecreateRefused {
+                message: "surface extent is zero (minimized window?); retry after \
+                         restore"
+                    .into(),
+            });
+        }
+        let extent = vk::Extent2D { width, height };
+
+        // Image count: same policy as construction (FIFO, >= 2, <= max).
+        let min_count = caps.min_image_count.max(2);
+        let image_count = if caps.max_image_count > 0 {
+            min_count.min(caps.max_image_count)
+        } else {
+            min_count
+        };
+
+        // Build the replacement under the same RAII guard discipline as
+        // `new`: any failure destroys the partial new state and leaves the
+        // old swapchain untouched. The new swapchain is created WITHOUT the
+        // oldSwapchain handoff — passing it would retire the old one, making
+        // it unusable if a later step here fails.
+        let mut scratch = InitScratch {
+            device: &self.device,
+            swapchain_fn: &self.swapchain_fn,
+            swapchain: vk::SwapchainKHR::null(),
+            image_views: Vec::new(),
+            depth_image: None,
+            depth_memory: None,
+            depth_view: None,
+            render_pass: None,
+            framebuffers: Vec::new(),
+            command_pool: None,
+            fence: None,
+            image_available: None,
+            render_finished: None,
+        };
+
+        let create_info = vk::SwapchainCreateInfoKHR::default()
+            .surface(self.surface)
+            .min_image_count(image_count)
+            .image_format(chosen.format)
+            .image_color_space(chosen.color_space)
+            .image_extent(extent)
+            .image_array_layers(1)
+            .image_usage(swapchain_usage_flags(&caps))
+            .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .pre_transform(caps.current_transform)
+            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+            .present_mode(vk::PresentModeKHR::FIFO)
+            .clipped(false)
+            // The handoff is REQUIRED on native windows: creating a
+            // replacement for a surface whose native window is already
+            // associated with a live swapchain, with oldSwapchain = null,
+            // returns VK_ERROR_NATIVE_WINDOW_IN_USE_KHR (WSI spec).
+            .old_swapchain(self.swapchain);
+        // The handoff retires the old swapchain REGARDLESS of whether this
+        // call succeeds (WSI spec; review round 2, P2) — so both outcomes
+        // must destroy the retired handle and clear the field (Drop would
+        // otherwise double-destroy it).
+        let new_swapchain = match unsafe { self.swapchain_fn.create_swapchain(&create_info, None) }
+        {
+            Ok(s) => s,
+            Err(e) => {
+                unsafe {
+                    self.swapchain_fn.destroy_swapchain(self.swapchain, None);
+                }
+                self.swapchain = vk::SwapchainKHR::null();
+                return Err(GraphicsError::InitFailed(format!(
+                    "vkCreateSwapchainKHR (recreate): {e}"
+                )));
+            }
+        };
+        // Registered before the next fallible call — a later failure must
+        // not leak the replacement (review round 1, P1).
+        scratch.swapchain = new_swapchain;
+        // The retired old swapchain: no outstanding presents, no
+        // acquireable images — destroy it NOW and clear the field so the
+        // backend Drop (which a later failure reaches) cannot
+        // double-destroy it (review round 2, P1). From the handoff onward
+        // a failure of any later step leaves the backend WITHOUT a usable
+        // swapchain (old retired+destroyed, partial replacement cleaned by
+        // the scratch guard): drop the backend and construct a new one.
+        unsafe {
+            self.swapchain_fn.destroy_swapchain(self.swapchain, None);
+        }
+        self.swapchain = vk::SwapchainKHR::null();
+        let images = unsafe { self.swapchain_fn.get_swapchain_images(new_swapchain) }
+            .map_err(|e| GraphicsError::InitFailed(format!("swapchain images (recreate): {e}")))?;
+
+        let subresource = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
+        let mut new_views: Vec<vk::ImageView> = Vec::new();
+        for &image in &images {
+            let ci = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(self.format)
+                .subresource_range(subresource);
+            let view = unsafe { self.device.create_image_view(&ci, None) }.map_err(|e| {
+                GraphicsError::InitFailed(format!("vkCreateImageView (recreate): {e}"))
+            })?;
+            scratch.image_views.push(view);
+            new_views.push(view);
+        }
+
+        // Depth buffer at the new extent (format re-picked; same device →
+        // same result).
+        let depth_format = pick_depth_format(&instance, self.physical_device).ok_or_else(|| {
+            GraphicsError::InitFailed("no supported depth format (D32/D24S8/D16)".into())
+        })?;
+        let depth_ci = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(depth_format)
+            .extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let new_depth_image =
+            unsafe { self.device.create_image(&depth_ci, None) }.map_err(|e| {
+                GraphicsError::InitFailed(format!("vkCreateImage (depth, recreate): {e}"))
+            })?;
+        scratch.depth_image = Some(new_depth_image);
+        let depth_req = unsafe { self.device.get_image_memory_requirements(new_depth_image) };
+        let memory_props =
+            unsafe { instance.get_physical_device_memory_properties(self.physical_device) };
+        let memory_type = (0..memory_props.memory_type_count)
+            .find(|&i| {
+                depth_req.memory_type_bits & (1 << i) != 0
+                    && memory_props.memory_types[i as usize]
+                        .property_flags
+                        .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            })
+            .ok_or_else(|| {
+                GraphicsError::InitFailed("no device-local memory type for depth image".into())
+            })?;
+        let depth_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(depth_req.size)
+            .memory_type_index(memory_type);
+        let new_depth_memory =
+            unsafe { self.device.allocate_memory(&depth_alloc, None) }.map_err(|e| {
+                GraphicsError::InitFailed(format!("vkAllocateMemory (depth, recreate): {e}"))
+            })?;
+        scratch.depth_memory = Some(new_depth_memory);
+        unsafe {
+            self.device
+                .bind_image_memory(new_depth_image, new_depth_memory, 0)
+        }
+        .map_err(|e| {
+            GraphicsError::InitFailed(format!("vkBindImageMemory (depth, recreate): {e}"))
+        })?;
+        let depth_view_ci = vk::ImageViewCreateInfo::default()
+            .image(new_depth_image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(depth_format)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                    .level_count(1)
+                    .layer_count(1),
+            );
+        let new_depth_view = unsafe { self.device.create_image_view(&depth_view_ci, None) }
+            .map_err(|e| {
+                GraphicsError::InitFailed(format!("vkCreateImageView (depth, recreate): {e}"))
+            })?;
+        scratch.depth_view = Some(new_depth_view);
+
+        // Render pass is REUSED: same formats → every compiled pipeline
+        // stays subpass-compatible.
+        let mut new_framebuffers: Vec<vk::Framebuffer> = Vec::new();
+        for &view in &new_views {
+            let fb_attachments = [view, new_depth_view];
+            let ci = vk::FramebufferCreateInfo::default()
+                .render_pass(self.render_pass)
+                .attachments(&fb_attachments)
+                .width(extent.width)
+                .height(extent.height)
+                .layers(1);
+            let fb = unsafe { self.device.create_framebuffer(&ci, None) }.map_err(|e| {
+                GraphicsError::InitFailed(format!("vkCreateFramebuffer (recreate): {e}"))
+            })?;
+            scratch.framebuffers.push(fb);
+            new_framebuffers.push(fb);
+        }
+
+        // All steps succeeded — the scratch guard is disarmed, the old
+        // extent-sized objects are destroyed, and the new state lands.
+        scratch.disarm();
+        drop(scratch);
+        unsafe {
+            for &fb in &self.framebuffers {
+                self.device.destroy_framebuffer(fb, None);
+            }
+            for &view in &self.image_views {
+                self.device.destroy_image_view(view, None);
+            }
+            self.device.destroy_image_view(self.depth_view, None);
+            self.device.destroy_image(self.depth_image, None);
+            self.device.free_memory(self.depth_memory, None);
+            // (the old swapchain was already destroyed right after the
+            // handoff retired it)
+        }
+        self.swapchain = new_swapchain;
+        self.readback_supported = caps
+            .supported_usage_flags
+            .contains(vk::ImageUsageFlags::TRANSFER_SRC);
+        self.images = images;
+        self.extent = extent;
+        self.image_views = new_views;
+        self.depth_image = new_depth_image;
+        self.depth_memory = new_depth_memory;
+        self.depth_view = new_depth_view;
+        self.framebuffers = new_framebuffers;
+        Ok(())
     }
 
     /// Compile a WGSL vertex + fragment pair into a render pipeline.
@@ -1085,6 +1765,7 @@ impl<'a> VulkanBackend<'a> {
     /// displayed).
     pub fn acquire_frame(&self) -> Result<Frame> {
         let mut render = self.render.lock().expect("render state lock");
+        Self::check_not_broken(&render)?;
 
         // Wait for the previous frame's command buffer to finish. The fence
         // is signalled whenever no frame is in flight (created signalled, and
@@ -1099,12 +1780,28 @@ impl<'a> VulkanBackend<'a> {
                 .map_err(|e| GraphicsError::AcquireFailed {
                     message: format!("fence wait: {e}"),
                 })?;
+            // A stale frame (Open or Flushed) holds an acquired image —
+            // return it (plus any outstanding signal) before acquiring
+            // again, and COMMIT the phase to Idle before the fallible
+            // acquire: a failure there must not leave stale state that
+            // re-runs this recovery and blocks forever on an
+            // already-consumed semaphore (review rounds 1, 3 and 4, P1 —
+            // the Open case predates this PR, living here).
+            self.recover_stale_frame(&mut render)
+                .map_err(|e| GraphicsError::AcquireFailed {
+                    message: format!("stale-frame recovery: {e}"),
+                })?;
+            render.phase = RenderPhase::Idle;
         }
 
         let (index, _suboptimal) = unsafe {
             self.swapchain_fn.acquire_next_image(
                 self.swapchain,
-                u64::MAX,
+                // Finite timeout: a surface that cannot guarantee forward
+                // progress (e.g. headless WSI) must not be handed
+                // UINT64_MAX (VUID-vkAcquireNextImageKHR-surface-07783).
+                // 10 minutes is far beyond any real FIFO acquire.
+                5_000_000_000,
                 self.image_available,
                 vk::Fence::null(),
             )
@@ -1112,6 +1809,13 @@ impl<'a> VulkanBackend<'a> {
         .map_err(|e| GraphicsError::AcquireFailed {
             message: format!("vkAcquireNextImageKHR: {e}"),
         })?;
+
+        // Commit image ownership BEFORE any fallible preparation: a failure
+        // below (reset/begin/render-pass begin) must leave a phase the
+        // recovery path handles — otherwise the retry would re-signal the
+        // already-signaled semaphore (VUID-01286) and take a second image
+        // (round 7, P1).
+        render.phase = RenderPhase::Acquired(index);
 
         // Reset the command buffer explicitly: a dropped frame leaves it
         // mid-recording (begun, never ended), which vkBeginCommandBuffer alone
@@ -1270,6 +1974,7 @@ impl<'a> VulkanBackend<'a> {
         let vertex_buffer = self.zunesha_device.raw_buffer(zunesha_buffer);
 
         let render = self.render.lock().expect("render state lock");
+        Self::check_not_broken(&render)?;
         if !matches!(render.phase, RenderPhase::Open(i) if i == frame_index) {
             return Err(GraphicsError::InvalidDraw {
                 message: format!(
@@ -1310,12 +2015,17 @@ impl<'a> VulkanBackend<'a> {
                 message: "frame has no acquired image (already presented?)".into(),
             })?;
         let mut render = self.render.lock().expect("render state lock");
-        let flushed = match render.phase {
-            RenderPhase::Open(i) if i == index => false,
+        Self::check_not_broken(&render)?;
+        let flush_state = match render.phase {
+            // Recording active — end it, submit, present.
+            RenderPhase::Open(i) if i == index => NeedsSubmit::Record,
+            // Recording already ENDED (a `read_pixels` flush was interrupted
+            // between end and submit) — submit without ending (round 7, P1).
+            RenderPhase::Flushing(i) if i == index => NeedsSubmit::Ended,
             // A `read_pixels` flush already submitted the rendering and
             // fence-waited it; present without semaphore waits (the image is
             // idle from the host's perspective).
-            RenderPhase::Flushed(i) if i == index => true,
+            RenderPhase::Flushed(i) if i == index => NeedsSubmit::No,
             ref other => {
                 return Err(GraphicsError::InvalidDraw {
                     message: format!("frame {index} is not the frame being recorded ({other:?})"),
@@ -1323,58 +2033,86 @@ impl<'a> VulkanBackend<'a> {
             }
         };
 
-        let present_result = if flushed {
-            let swapchains = [self.swapchain];
-            let indices = [index];
-            let present_info = vk::PresentInfoKHR::default()
-                .swapchains(&swapchains)
-                .image_indices(&indices);
-            // Safety: queue and image are idle (flush fence-waited).
-            unsafe {
-                self.swapchain_fn
-                    .queue_present(self.graphics_queue, &present_info)
-            }
-        } else {
-            unsafe {
-                self.device.cmd_end_render_pass(render.cmd);
-                self.device.end_command_buffer(render.cmd).map_err(|e| {
-                    GraphicsError::PresentFailed {
-                        message: format!("end command buffer: {e}"),
-                    }
-                })?;
+        // Whether THIS invocation submitted (and therefore signaled
+        // render_finished): only then can a failed present strand the
+        // signal and only then may the drain wait on it (round 10, P1).
+        let submitted = !matches!(flush_state, NeedsSubmit::No);
 
-                let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-                let submit = vk::SubmitInfo::default()
-                    .wait_semaphores(std::slice::from_ref(&self.image_available))
-                    .wait_dst_stage_mask(&wait_stages)
-                    .command_buffers(std::slice::from_ref(&render.cmd))
-                    .signal_semaphores(std::slice::from_ref(&self.render_finished));
-                // Reset the fence only now — immediately before the submit that
-                // will signal it — so it is unsignalled for the shortest possible
-                // window (unobservable in the synchronous loop).
-                self.device
-                    .reset_fences(std::slice::from_ref(&render.fence))
-                    .map_err(|e| GraphicsError::PresentFailed {
-                        message: format!("fence reset: {e}"),
-                    })?;
-                self.device
-                    .queue_submit(
-                        self.graphics_queue,
-                        std::slice::from_ref(&submit),
-                        render.fence,
-                    )
-                    .map_err(|e| GraphicsError::PresentFailed {
-                        message: format!("vkQueueSubmit: {e}"),
-                    })?;
-
+        let present_result = match flush_state {
+            NeedsSubmit::No => {
                 let swapchains = [self.swapchain];
                 let indices = [index];
                 let present_info = vk::PresentInfoKHR::default()
-                    .wait_semaphores(std::slice::from_ref(&self.render_finished))
                     .swapchains(&swapchains)
                     .image_indices(&indices);
-                self.swapchain_fn
-                    .queue_present(self.graphics_queue, &present_info)
+                // Safety: queue and image are idle (flush fence-waited).
+                unsafe {
+                    self.swapchain_fn
+                        .queue_present(self.graphics_queue, &present_info)
+                }
+            }
+            needs_submit => {
+                unsafe {
+                    if matches!(needs_submit, NeedsSubmit::Record) {
+                        self.device.cmd_end_render_pass(render.cmd);
+                        let end = self.device.end_command_buffer(render.cmd);
+                        if let Err(e) = end {
+                            // Same boundary as the readback flush: the
+                            // recording is invalid, reset it away and commit
+                            // Acquired so recovery presents the image back
+                            // (round 8, P1).
+                            let _ = self.device.reset_command_buffer(
+                                render.cmd,
+                                vk::CommandBufferResetFlags::empty(),
+                            );
+                            render.phase = RenderPhase::Acquired(index);
+                            return Err(GraphicsError::PresentFailed {
+                                message: format!("end command buffer: {e}"),
+                            });
+                        }
+                        // Commit the ended state before the fallible fence
+                        // reset (round 7, P1): an interruption here resumes
+                        // without ending twice.
+                        render.phase = RenderPhase::Flushing(index);
+                    }
+
+                    let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+                    let submit = vk::SubmitInfo::default()
+                        .wait_semaphores(std::slice::from_ref(&self.image_available))
+                        .wait_dst_stage_mask(&wait_stages)
+                        .command_buffers(std::slice::from_ref(&render.cmd))
+                        .signal_semaphores(std::slice::from_ref(&self.render_finished));
+                    // Reset the fence only now — immediately before the submit that
+                    // will signal it — so it is unsignalled for the shortest possible
+                    // window (unobservable in the synchronous loop).
+                    self.device
+                        .reset_fences(std::slice::from_ref(&render.fence))
+                        .map_err(|e| GraphicsError::PresentFailed {
+                            message: format!("fence reset: {e}"),
+                        })?;
+                    // A submission failure here strands the unsignaled fence
+                    // exactly as in frame recovery — poison so entry points fail
+                    // fast instead of deadlocking (review round 6, P1).
+                    if let Err(e) = self.device.queue_submit(
+                        self.graphics_queue,
+                        std::slice::from_ref(&submit),
+                        render.fence,
+                    ) {
+                        render.broken = true;
+                        return Err(GraphicsError::PresentFailed {
+                            message: format!("vkQueueSubmit: {e}"),
+                        });
+                    }
+
+                    let swapchains = [self.swapchain];
+                    let indices = [index];
+                    let present_info = vk::PresentInfoKHR::default()
+                        .wait_semaphores(std::slice::from_ref(&self.render_finished))
+                        .swapchains(&swapchains)
+                        .image_indices(&indices);
+                    self.swapchain_fn
+                        .queue_present(self.graphics_queue, &present_info)
+                }
             }
         };
         // Block until the frame's work is complete, so the next acquire can
@@ -1385,12 +2123,78 @@ impl<'a> VulkanBackend<'a> {
         unsafe {
             self.device
                 .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
-                .map_err(|e| GraphicsError::PresentFailed {
-                    message: format!("fence wait: {e}"),
+                .map_err(|e| {
+                    render.broken = true;
+                    GraphicsError::PresentFailed {
+                        message: format!("fence wait: {e}"),
+                    }
                 })?;
         }
 
-        render.phase = RenderPhase::Idle;
+        // OUT_OF_DATE and SURFACE_LOST release the image (the engine
+        // consumes it despite the error) — Idle is correct and the caller
+        // must recreate. Any other present error was NOT enqueued: the image
+        // is still ours, so commit Flushed (submit done, present pending)
+        // after draining the stranded render_finished signal — the next
+        // acquire's recovery presents it back instead of silently losing it
+        // from the pool (rounds 8–9, P1).
+        match present_result {
+            Ok(_) => render.phase = RenderPhase::Idle,
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::ERROR_SURFACE_LOST_KHR) => {
+                render.phase = RenderPhase::Idle
+            }
+            Err(e) => {
+                // Drain ONLY when this invocation signaled render_finished
+                // (Record/Ended paths): a Flushed-entry present (readback
+                // flush already ran) never signaled it — waiting there is
+                // an unsignaled-semaphore wait (VUID 03238) that hangs
+                // forever (round 10, P1).
+                if submitted {
+                    // The submit that would have waited render_finished already
+                    // ran and signaled it; the failed present never consumes it.
+                    // A later present would signal the STILL-signaled semaphore
+                    // — VUID 00067 as a permanent strand, not the documented
+                    // back-to-back latency race (round 9, P1). The fence has
+                    // been waited, so the signal is complete: an empty
+                    // submission waiting on it drains deterministically.
+                    unsafe {
+                        let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+                        let drain = vk::SubmitInfo::default()
+                            .wait_semaphores(std::slice::from_ref(&self.render_finished))
+                            .wait_dst_stage_mask(&wait_stages);
+                        let drained = self
+                            .device
+                            .reset_fences(std::slice::from_ref(&render.fence))
+                            .and_then(|()| {
+                                self.device.queue_submit(
+                                    self.graphics_queue,
+                                    std::slice::from_ref(&drain),
+                                    render.fence,
+                                )
+                            })
+                            .and_then(|()| {
+                                self.device.wait_for_fences(
+                                    std::slice::from_ref(&render.fence),
+                                    true,
+                                    u64::MAX,
+                                )
+                            });
+                        if let Err(drain_err) = drained {
+                            // The fence may be stranded (reset without a
+                            // completing submit) — poison per the round-6
+                            // discipline and surface both errors.
+                            render.broken = true;
+                            return Err(GraphicsError::PresentFailed {
+                                message: format!(
+                                    "vkQueuePresentKHR: {e}; render_finished drain: {drain_err}"
+                                ),
+                            });
+                        }
+                    }
+                } // submitted
+                render.phase = RenderPhase::Flushed(index);
+            }
+        }
         present_result
             .map(|_| ())
             .map_err(|e| GraphicsError::PresentFailed {
@@ -1422,8 +2226,19 @@ impl<'a> VulkanBackend<'a> {
                 message: "frame has no acquired image (already presented?)".into(),
             });
         };
+        // Surfaces without TRANSFER_SRC support got COLOR_ATTACHMENT-only
+        // swapchain images — the transfer below would be invalid usage.
+        // Refuse instead (review round 2, P1).
+        if !self.readback_supported {
+            return Err(GraphicsError::Internal(
+                "surface does not support TRANSFER_SRC usage on swapchain images; \
+                 readback unavailable"
+                    .into(),
+            ));
+        }
         {
             let mut render = self.render.lock().expect("render state lock");
+            Self::check_not_broken(&render)?;
             match render.phase {
                 RenderPhase::Open(i) if i == index => {
                     // Flush the recording: end the pass, submit (consuming the
@@ -1434,31 +2249,34 @@ impl<'a> VulkanBackend<'a> {
                     // signals it).
                     unsafe {
                         self.device.cmd_end_render_pass(render.cmd);
-                        self.device
-                            .end_command_buffer(render.cmd)
-                            .map_err(|e| GraphicsError::Internal(format!("readback end: {e}")))?;
-                        let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-                        let submit = vk::SubmitInfo::default()
-                            .wait_semaphores(std::slice::from_ref(&self.image_available))
-                            .wait_dst_stage_mask(&wait_stages)
-                            .command_buffers(std::slice::from_ref(&render.cmd));
-                        self.device
-                            .reset_fences(std::slice::from_ref(&render.fence))
-                            .map_err(|e| GraphicsError::Internal(format!("fence reset: {e}")))?;
-                        self.device
-                            .queue_submit(
-                                self.graphics_queue,
-                                std::slice::from_ref(&submit),
-                                render.fence,
-                            )
-                            .map_err(|e| {
-                                GraphicsError::Internal(format!("readback submit: {e}"))
-                            })?;
-                        self.device
-                            .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
-                            .map_err(|e| GraphicsError::Internal(format!("readback wait: {e}")))?;
+                        let end = self.device.end_command_buffer(render.cmd);
+                        if let Err(e) = end {
+                            // The recording is INVALID — it cannot be ended,
+                            // submitted, or extended. Reset it away and
+                            // commit Acquired (image owned, semaphore
+                            // unconsumed): a same-frame retry is rejected,
+                            // and recovery presents the image back (round 8,
+                            // P1).
+                            let _ = self.device.reset_command_buffer(
+                                render.cmd,
+                                vk::CommandBufferResetFlags::empty(),
+                            );
+                            render.phase = RenderPhase::Acquired(index);
+                            return Err(GraphicsError::Internal(format!("readback end: {e}")));
+                        }
                     }
-                    render.phase = RenderPhase::Flushed(index);
+                    // Commit the ended-recording state BEFORE the fallible
+                    // fence reset: a failure there must leave a phase the
+                    // retry can resume from — re-ending an ended buffer is
+                    // invalid usage (round 7, P1).
+                    render.phase = RenderPhase::Flushing(index);
+                    self.finish_flush(&mut render)?;
+                }
+                // A flush was interrupted after the recording ended — resume
+                // at the submission; the buffer must not be ended twice
+                // (round 7, P1).
+                RenderPhase::Flushing(i) if i == index => {
+                    self.finish_flush(&mut render)?;
                 }
                 // Already flushed (repeat verification read) — contents stable.
                 RenderPhase::Flushed(i) if i == index => {}
@@ -1727,6 +2545,146 @@ mod tests {
             backend.extent().width,
             backend.extent().height
         );
+    }
+
+    // ── Swapchain resize/recreate fixtures (increment 7) ────────────────
+
+    /// Recreating the swapchain at a new extent keeps the render pass and
+    /// previously compiled pipelines valid, and the frame loop renders +
+    /// reads back at the new size.
+    #[test]
+    #[serial]
+    fn recreate_swapchain_renders_at_new_extent() {
+        let Some(ctx) = rig() else { return };
+        let mut backend = ctx.backend();
+        let before = backend.extent();
+        let format_before = backend.format();
+
+        // Compile a pipeline BEFORE the resize — it must survive it.
+        let pipeline = backend
+            .compile_render_pipeline(
+                "vs_main",
+                DEPTH_VERT,
+                "fs_main",
+                GREEN_FRAG,
+                &depth_config(None),
+            )
+            .expect("pipeline before recreate");
+        // One full frame cycle first.
+        let frame = backend.acquire_frame().expect("acquire pre-recreate");
+        backend.present(frame).expect("present pre-recreate");
+
+        backend
+            .recreate_swapchain(Some((128, 128)))
+            .expect("recreate_swapchain");
+        let after = backend.extent();
+        assert_eq!(
+            (after.width, after.height),
+            (128, 128),
+            "new extent honoured"
+        );
+        assert_eq!(backend.format(), format_before, "format preserved");
+        assert!(backend.image_count() >= 2, "swapchain still multi-image");
+        println!(
+            "recreated swapchain: {}x{} -> {}x{}",
+            before.width, before.height, after.width, after.height
+        );
+
+        // Draw + verify with the PRE-recreate pipeline at the new extent.
+        let vb = backend
+            .create_buffer(&[-1.0f32, -1.0, 0.0, 3.0, -1.0, 0.0, -1.0, 3.0, 0.0])
+            .expect("vb");
+        let mut frame = backend.acquire_frame().expect("acquire post-recreate");
+        backend
+            .draw(&mut frame, &pipeline, &vb, 3)
+            .expect("draw post-recreate");
+        let pixels = backend.read_pixels(&frame).expect("read post-recreate");
+        backend.present(frame).expect("present post-recreate");
+        let w = after.width as usize;
+        let h = after.height as usize;
+        assert_eq!(pixels.len(), w * h * 4, "readback sized to the NEW extent");
+        let o = (h / 2 * w + w / 2) * 4;
+        let centre = [pixels[o], pixels[o + 1], pixels[o + 2], pixels[o + 3]];
+        assert!(
+            centre[1] == 255 && centre[0] == 0 && centre[2] == 0,
+            "pre-recreate pipeline must render green at the new extent, got {centre:?}"
+        );
+    }
+
+    /// Recreating after a dropped (unpresented) frame is safe — the stale
+    /// recording is discarded exactly like the next acquire would, and the
+    /// outstanding acquire-semaphore signal is drained.
+    #[test]
+    #[serial]
+    fn recreate_after_dropped_frame_is_safe() {
+        let Some(ctx) = rig() else { return };
+        let mut backend = ctx.backend();
+        let frame = backend.acquire_frame().expect("acquire");
+        drop(frame); // unpresented
+        backend
+            .recreate_swapchain(Some((96, 96)))
+            .expect("recreate after dropped frame");
+        assert_eq!((backend.extent().width, backend.extent().height), (96, 96));
+        let frame = backend.acquire_frame().expect("acquire after recreate");
+        backend.present(frame).expect("present after recreate");
+    }
+
+    /// Repeatedly dropping unpresented frames recovers each time — every
+    /// stale Open frame's acquire-semaphore signal is drained AND its image
+    /// is presented back to the pool.
+    #[test]
+    #[serial]
+    fn repeated_dropped_frames_recover() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        for _ in 0..3 {
+            let frame = backend.acquire_frame().expect("acquire");
+            drop(frame);
+        }
+        let frame = backend.acquire_frame().expect("acquire after drops");
+        backend.present(frame).expect("present after drops");
+    }
+
+    /// Dropped readback-FLUSHED frames also return their images: a frame
+    /// that was `read_pixels`-flushed (submission done, semaphore consumed)
+    /// but never presented still owns a swapchain image — dropping
+    /// `image_count()` of them must not exhaust the pool (review round 4,
+    /// P1).
+    #[test]
+    #[serial]
+    fn dropped_flushed_frames_return_to_pool() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let n = backend.image_count();
+        println!("swapchain has {n} images; flushing + dropping {}", n + 2);
+        for _ in 0..n + 2 {
+            let frame = backend.acquire_frame().expect("acquire within pool");
+            let _ = backend.read_pixels(&frame).expect("readback flush");
+            drop(frame); // Flushed, never presented
+        }
+        let frame = backend.acquire_frame().expect("acquire beyond image_count");
+        backend.present(frame).expect("present beyond image_count");
+    }
+
+    /// Dropping MORE frames than the swapchain has images must not exhaust
+    /// the pool — each recovery returns its image (review round 3, P1:
+    /// draining the semaphore alone left the fifth acquire on a four-image
+    /// swapchain timing out).
+    #[test]
+    #[serial]
+    fn dropped_images_return_to_pool() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let n = backend.image_count();
+        println!("swapchain has {n} images; dropping {}", n + 2);
+        for _ in 0..n + 2 {
+            let frame = backend.acquire_frame().expect("acquire within pool");
+            drop(frame);
+        }
+        // The pool must not be exhausted: this acquire times out (and the
+        // test errors) if any drop leaked its image.
+        let frame = backend.acquire_frame().expect("acquire beyond image_count");
+        backend.present(frame).expect("present beyond image_count");
     }
 
     /// The frame lifecycle: acquire → present, repeatedly.
