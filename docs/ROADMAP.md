@@ -12,7 +12,7 @@ Vulkan backend complete through increment 7 on develop (trait surface,
 Zunesha device borrow, swapchain + frame lifecycle, WGSL→SPIR-V pipelines
 (naga), verified draw + `read_pixels`, depth testing + blending, and
 swapchain resize/recreate — the latter merged after an eleven-round
-converged review, 24 findings fixed). Metal is staged behind
+converged review, 23 findings fixed). Metal is staged behind
 Zunesha-Metal (substrate-first sequencing).
 
 ## Miriami alignment
