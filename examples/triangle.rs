@@ -56,7 +56,6 @@ fn main() -> ExitCode {
     };
 
     let handle = SurfaceHandle::VulkanSurface {
-        instance: std::ptr::null_mut(),
         surface: surface.handle().as_raw() as usize as *mut std::ffi::c_void,
     };
     let backend = match VulkanBackend::new(&device, handle) {

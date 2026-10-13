@@ -71,9 +71,12 @@ use std::ffi::c_void;
 /// Backends interpret the handle natively:
 ///
 /// - **Metal:** a `CAMetalLayer` pointer.
-/// - **Vulkan:** a `VkSurfaceKHR` plus the `VkInstance` that created it. The
-///   instance must be the one that owns the Zunesha device the backend is
-///   constructed over (the surface and device must share an instance).
+/// - **Vulkan:** a `VkSurfaceKHR`. It must belong to the same
+///   `VkInstance` as the Zunesha device the backend is constructed over
+///   (the surface and device must share an instance); the backend always
+///   derives the instance from the device, which is why the handle carries
+///   no instance of its own (the field was removed 2026-10-12 — it was
+///   documented-but-never-read surface area).
 ///
 /// # Safety
 ///
@@ -85,11 +88,9 @@ pub enum SurfaceHandle {
     /// macOS: a `CAMetalLayer` pointer.
     #[cfg(target_os = "macos")]
     MetalLayer(*mut c_void),
-    /// Linux / Windows: a Vulkan `VkSurfaceKHR` and its owning `VkInstance`.
+    /// Linux / Windows: a Vulkan `VkSurfaceKHR`.
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     VulkanSurface {
-        /// The `VkInstance` that created the surface.
-        instance: *mut c_void,
         /// The `VkSurfaceKHR` handle.
         surface: *mut c_void,
     },

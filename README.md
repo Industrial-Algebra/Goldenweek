@@ -68,12 +68,14 @@ gpu.present(frame)?;
 | **Surface** | n/a (no presentation) | `SurfaceHandle` (caller-owned) |
 | **Backends** | Metal (`objc` FFI), Vulkan (`ash`) | Metal (`objc` FFI), Vulkan (`ash`) |
 | **Translation** | WGSL → MSL / SPIR-V via naga | WGSL → MSL / SPIR-V via naga |
-| **Device model (v0.1)** | owns its own compute device | owns its own graphics+present device |
+| **Device model** | borrows the shared Zunesha device | borrows the shared Zunesha device |
 | **Default** | synchronous dispatch | synchronous frame loop |
 
-The two are **parallel** device libraries, not layered. Compute→render
-interop (particle systems, compute-then-draw) is a documented future concern
-— see [Architecture](#architecture).
+The two are **parallel** render/compute libraries over the **same shared
+substrate** — compute→render interop (a buffer Borsalino filled bound as a
+Goldenweek vertex buffer, zero-copy) falls out of the shared device, not
+out of a bridge — see [Architecture](#architecture) and
+[Zunesha ADR 0001](https://github.com/Industrial-Algebra/Zunesha/blob/develop/docs/adr/0001-shared-device-substrate.md).
 
 ## Backends
 

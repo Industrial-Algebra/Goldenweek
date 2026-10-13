@@ -60,9 +60,12 @@ feature gates additive only, every public item documented.
 - **Structural correctness, not numerical exactness.** Verification effort
   targets valid surfaces/pipelines/frames. Numerical exactness is Borsalino's
   concern (and Miriami's design doc says so explicitly).
-- **Device model (v0.1).** Goldenweek owns its own graphics+present device,
-  independent of Borsalino's compute device. Compute→render interop is a
-  documented future ADR — do not silently couple the two libraries without one.
+- **Device model.** Goldenweek borrows the shared Zunesha device
+  (`VulkanBackend<'a>` over a borrowed `zunesha::vulkan::VulkanDevice`,
+  Zunesha ADR 0001) — the same device Borsalino computes on, which is what
+  makes compute→render buffer interop zero-copy. It never owns a device.
+  The historical "independent device, future interop ADR" wording was a
+  pre-Step-C fossil (corrected 2026-10-12 per the rabbit-hole report).
 
 ## License
 
