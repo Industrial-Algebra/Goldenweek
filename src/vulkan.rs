@@ -339,13 +339,34 @@ struct RenderState {
     broken: bool,
 }
 
-/// The frame-loop state machine (exhaustive — every transition is explicit).
+/// How much work `present` still owes before queueing the presentation.
 #[derive(Debug)]
+enum NeedsSubmit {
+    /// Recording active — end, submit, then present.
+    Record,
+    /// Recording already ended — submit without ending (interrupted flush).
+    Ended,
+    /// Submission complete (flush or recovery) — present only.
+    No,
+}
+
+/// The frame-loop state machine (exhaustive — every transition is explicit).
+#[derive(Debug, Clone, Copy)]
 enum RenderPhase {
+    /// Image `u32` acquired (owned, semaphore unconsumed) but recording
+    /// preparation has not completed — only reachable when preparation
+    /// failed part-way; recovery presents the image back (round 7, P1).
+    Acquired(u32),
     /// Image `u32` acquired; render pass open, commands recording.
     Open(u32),
-    /// Recording submitted and fence-waited (a `read_pixels` flush);
-    /// contents stable, not yet presented.
+    /// Recording for image `u32` ENDED; submission pending (a flush was
+    /// interrupted between `end_command_buffer` and the submit — retrying
+    /// resumes at the submit, it must not end twice) (round 7, P1).
+    Flushing(u32),
+    /// Recording submitted and fence-waited (a `read_pixels` flush, or a
+    /// recovery whose submit completed); contents stable, present pending.
+    /// Also the state after a recovery present-BACK failed to enqueue —
+    /// retrying presents again without re-consuming anything (round 7, P1).
     Flushed(u32),
     /// No frame in flight.
     Idle,
@@ -999,6 +1020,48 @@ impl<'a> VulkanBackend<'a> {
     /// same submission consumes the semaphore), waits the fence, then
     /// presents with no wait semaphore — the image's contents are garbage,
     /// which a recovery frame is allowed to be.
+    /// Submit an ENDED recording (phase `Flushing`), applying the poison
+    /// discipline, and commit `Flushed` on success. Shared by the readback
+    /// flush and its interrupted-retry path — the recording must already be
+    /// ended when this runs (round 7, P1).
+    fn finish_flush(&self, render: &mut RenderState) -> Result<()> {
+        let RenderPhase::Flushing(index) = render.phase else {
+            return Err(GraphicsError::Internal(
+                "finish_flush called outside Flushing".into(),
+            ));
+        };
+        unsafe {
+            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+            let submit = vk::SubmitInfo::default()
+                .wait_semaphores(std::slice::from_ref(&self.image_available))
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(std::slice::from_ref(&render.cmd));
+            self.device
+                .reset_fences(std::slice::from_ref(&render.fence))
+                .map_err(|e| GraphicsError::Internal(format!("fence reset: {e}")))?;
+            // A submission failure here strands the unsignaled fence exactly
+            // as in frame recovery — poison so entry points fail fast instead
+            // of deadlocking (review round 6, P1).
+            if let Err(e) = self.device.queue_submit(
+                self.graphics_queue,
+                std::slice::from_ref(&submit),
+                render.fence,
+            ) {
+                render.broken = true;
+                return Err(GraphicsError::Internal(format!("readback submit: {e}")));
+            }
+            if let Err(e) =
+                self.device
+                    .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
+            {
+                render.broken = true;
+                return Err(GraphicsError::Internal(format!("readback wait: {e}")));
+            }
+        }
+        render.phase = RenderPhase::Flushed(index);
+        Ok(())
+    }
+
     /// Fast-fail check for a backend poisoned by a failed frame recovery —
     /// the unsignaled fence makes every later fence wait a deadlock, so
     /// entry points return this error instead of hanging (review round 5,
@@ -1033,9 +1096,16 @@ impl<'a> VulkanBackend<'a> {
     fn recover_stale_frame(&self, render: &mut RenderState) -> std::result::Result<(), String> {
         let index = match render.phase {
             RenderPhase::Idle => return Ok(()),
-            RenderPhase::Open(i) | RenderPhase::Flushed(i) => i,
+            RenderPhase::Acquired(i)
+            | RenderPhase::Open(i)
+            | RenderPhase::Flushing(i)
+            | RenderPhase::Flushed(i) => i,
         };
-        if matches!(render.phase, RenderPhase::Open(_)) {
+        // Acquired/Open/Flushing all have an unconsumed acquire semaphore
+        // and no submitted work for the image: barrier-submit (drain +
+        // layout) then present-back. Flushing's ended recording is simply
+        // reset away (the pool's RESET_COMMAND_BUFFER flag permits it).
+        if !matches!(render.phase, RenderPhase::Flushed(_)) {
             unsafe {
                 // A stale Open frame left the command buffer mid-recording (begun,
                 // render pass open, never ended) — reset before re-beginning
@@ -1106,13 +1176,25 @@ impl<'a> VulkanBackend<'a> {
         // recovery submit's fence wait already ordered everything; for
         // Flushed, the readback submission was fence-waited at flush time.
         // Contents are garbage-or-stale, which recovery frames may be.
+        //
+        // A present that FAILED TO ENQUEUE leaves the image still ours:
+        // commit Flushed (submit done, present pending — the retry presents
+        // again without re-consuming anything) and propagate the error
+        // instead of reporting success with a retained image (round 7, P1).
+        // Per spec an error return means the present was not enqueued; the
+        // retry failing repeatedly (e.g. OUT_OF_DATE) is fast, never a
+        // deadlock — the fence is signalled.
         unsafe {
             let present_info = vk::PresentInfoKHR::default()
                 .swapchains(std::slice::from_ref(&self.swapchain))
                 .image_indices(std::slice::from_ref(&index));
-            let _ = self
+            if let Err(e) = self
                 .swapchain_fn
-                .queue_present(self.graphics_queue, &present_info);
+                .queue_present(self.graphics_queue, &present_info)
+            {
+                render.phase = RenderPhase::Flushed(index);
+                return Err(format!("recover present-back: {e}"));
+            }
         }
         Ok(())
     }
@@ -1702,6 +1784,13 @@ impl<'a> VulkanBackend<'a> {
             message: format!("vkAcquireNextImageKHR: {e}"),
         })?;
 
+        // Commit image ownership BEFORE any fallible preparation: a failure
+        // below (reset/begin/render-pass begin) must leave a phase the
+        // recovery path handles — otherwise the retry would re-signal the
+        // already-signaled semaphore (VUID-01286) and take a second image
+        // (round 7, P1).
+        render.phase = RenderPhase::Acquired(index);
+
         // Reset the command buffer explicitly: a dropped frame leaves it
         // mid-recording (begun, never ended), which vkBeginCommandBuffer alone
         // cannot recover from. The pool's RESET_COMMAND_BUFFER flag permits
@@ -1901,12 +1990,16 @@ impl<'a> VulkanBackend<'a> {
             })?;
         let mut render = self.render.lock().expect("render state lock");
         Self::check_not_broken(&render)?;
-        let flushed = match render.phase {
-            RenderPhase::Open(i) if i == index => false,
+        let flush_state = match render.phase {
+            // Recording active — end it, submit, present.
+            RenderPhase::Open(i) if i == index => NeedsSubmit::Record,
+            // Recording already ENDED (a `read_pixels` flush was interrupted
+            // between end and submit) — submit without ending (round 7, P1).
+            RenderPhase::Flushing(i) if i == index => NeedsSubmit::Ended,
             // A `read_pixels` flush already submitted the rendering and
             // fence-waited it; present without semaphore waits (the image is
             // idle from the host's perspective).
-            RenderPhase::Flushed(i) if i == index => true,
+            RenderPhase::Flushed(i) if i == index => NeedsSubmit::No,
             ref other => {
                 return Err(GraphicsError::InvalidDraw {
                     message: format!("frame {index} is not the frame being recorded ({other:?})"),
@@ -1914,62 +2007,71 @@ impl<'a> VulkanBackend<'a> {
             }
         };
 
-        let present_result = if flushed {
-            let swapchains = [self.swapchain];
-            let indices = [index];
-            let present_info = vk::PresentInfoKHR::default()
-                .swapchains(&swapchains)
-                .image_indices(&indices);
-            // Safety: queue and image are idle (flush fence-waited).
-            unsafe {
-                self.swapchain_fn
-                    .queue_present(self.graphics_queue, &present_info)
-            }
-        } else {
-            unsafe {
-                self.device.cmd_end_render_pass(render.cmd);
-                self.device.end_command_buffer(render.cmd).map_err(|e| {
-                    GraphicsError::PresentFailed {
-                        message: format!("end command buffer: {e}"),
-                    }
-                })?;
-
-                let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-                let submit = vk::SubmitInfo::default()
-                    .wait_semaphores(std::slice::from_ref(&self.image_available))
-                    .wait_dst_stage_mask(&wait_stages)
-                    .command_buffers(std::slice::from_ref(&render.cmd))
-                    .signal_semaphores(std::slice::from_ref(&self.render_finished));
-                // Reset the fence only now — immediately before the submit that
-                // will signal it — so it is unsignalled for the shortest possible
-                // window (unobservable in the synchronous loop).
-                self.device
-                    .reset_fences(std::slice::from_ref(&render.fence))
-                    .map_err(|e| GraphicsError::PresentFailed {
-                        message: format!("fence reset: {e}"),
-                    })?;
-                // A submission failure here strands the unsignaled fence
-                // exactly as in frame recovery — poison so entry points fail
-                // fast instead of deadlocking (review round 6, P1).
-                if let Err(e) = self.device.queue_submit(
-                    self.graphics_queue,
-                    std::slice::from_ref(&submit),
-                    render.fence,
-                ) {
-                    render.broken = true;
-                    return Err(GraphicsError::PresentFailed {
-                        message: format!("vkQueueSubmit: {e}"),
-                    });
-                }
-
+        let present_result = match flush_state {
+            NeedsSubmit::No => {
                 let swapchains = [self.swapchain];
                 let indices = [index];
                 let present_info = vk::PresentInfoKHR::default()
-                    .wait_semaphores(std::slice::from_ref(&self.render_finished))
                     .swapchains(&swapchains)
                     .image_indices(&indices);
-                self.swapchain_fn
-                    .queue_present(self.graphics_queue, &present_info)
+                // Safety: queue and image are idle (flush fence-waited).
+                unsafe {
+                    self.swapchain_fn
+                        .queue_present(self.graphics_queue, &present_info)
+                }
+            }
+            needs_submit => {
+                unsafe {
+                    if matches!(needs_submit, NeedsSubmit::Record) {
+                        self.device.cmd_end_render_pass(render.cmd);
+                        self.device.end_command_buffer(render.cmd).map_err(|e| {
+                            GraphicsError::PresentFailed {
+                                message: format!("end command buffer: {e}"),
+                            }
+                        })?;
+                        // Commit the ended state before the fallible fence
+                        // reset (round 7, P1): an interruption here resumes
+                        // without ending twice.
+                        render.phase = RenderPhase::Flushing(index);
+                    }
+
+                    let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+                    let submit = vk::SubmitInfo::default()
+                        .wait_semaphores(std::slice::from_ref(&self.image_available))
+                        .wait_dst_stage_mask(&wait_stages)
+                        .command_buffers(std::slice::from_ref(&render.cmd))
+                        .signal_semaphores(std::slice::from_ref(&self.render_finished));
+                    // Reset the fence only now — immediately before the submit that
+                    // will signal it — so it is unsignalled for the shortest possible
+                    // window (unobservable in the synchronous loop).
+                    self.device
+                        .reset_fences(std::slice::from_ref(&render.fence))
+                        .map_err(|e| GraphicsError::PresentFailed {
+                            message: format!("fence reset: {e}"),
+                        })?;
+                    // A submission failure here strands the unsignaled fence
+                    // exactly as in frame recovery — poison so entry points fail
+                    // fast instead of deadlocking (review round 6, P1).
+                    if let Err(e) = self.device.queue_submit(
+                        self.graphics_queue,
+                        std::slice::from_ref(&submit),
+                        render.fence,
+                    ) {
+                        render.broken = true;
+                        return Err(GraphicsError::PresentFailed {
+                            message: format!("vkQueueSubmit: {e}"),
+                        });
+                    }
+
+                    let swapchains = [self.swapchain];
+                    let indices = [index];
+                    let present_info = vk::PresentInfoKHR::default()
+                        .wait_semaphores(std::slice::from_ref(&self.render_finished))
+                        .swapchains(&swapchains)
+                        .image_indices(&indices);
+                    self.swapchain_fn
+                        .queue_present(self.graphics_queue, &present_info)
+                }
             }
         };
         // Block until the frame's work is complete, so the next acquire can
@@ -2046,36 +2148,19 @@ impl<'a> VulkanBackend<'a> {
                         self.device
                             .end_command_buffer(render.cmd)
                             .map_err(|e| GraphicsError::Internal(format!("readback end: {e}")))?;
-                        let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-                        let submit = vk::SubmitInfo::default()
-                            .wait_semaphores(std::slice::from_ref(&self.image_available))
-                            .wait_dst_stage_mask(&wait_stages)
-                            .command_buffers(std::slice::from_ref(&render.cmd));
-                        self.device
-                            .reset_fences(std::slice::from_ref(&render.fence))
-                            .map_err(|e| GraphicsError::Internal(format!("fence reset: {e}")))?;
-                        // A submission failure here strands the unsignaled
-                        // fence exactly as in frame recovery — poison so
-                        // entry points fail fast instead of deadlocking
-                        // (review round 6, P1).
-                        if let Err(e) = self.device.queue_submit(
-                            self.graphics_queue,
-                            std::slice::from_ref(&submit),
-                            render.fence,
-                        ) {
-                            render.broken = true;
-                            return Err(GraphicsError::Internal(format!("readback submit: {e}")));
-                        }
-                        if let Err(e) = self.device.wait_for_fences(
-                            std::slice::from_ref(&render.fence),
-                            true,
-                            u64::MAX,
-                        ) {
-                            render.broken = true;
-                            return Err(GraphicsError::Internal(format!("readback wait: {e}")));
-                        }
                     }
-                    render.phase = RenderPhase::Flushed(index);
+                    // Commit the ended-recording state BEFORE the fallible
+                    // fence reset: a failure there must leave a phase the
+                    // retry can resume from — re-ending an ended buffer is
+                    // invalid usage (round 7, P1).
+                    render.phase = RenderPhase::Flushing(index);
+                    self.finish_flush(&mut render)?;
+                }
+                // A flush was interrupted after the recording ended — resume
+                // at the submission; the buffer must not be ended twice
+                // (round 7, P1).
+                RenderPhase::Flushing(i) if i == index => {
+                    self.finish_flush(&mut render)?;
                 }
                 // Already flushed (repeat verification read) — contents stable.
                 RenderPhase::Flushed(i) if i == index => {}
