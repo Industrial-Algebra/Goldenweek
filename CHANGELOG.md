@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0] — Unreleased
 
+### Added — Swapchain Resize/Recreate (Increment 7)
+- **`VulkanBackend::recreate_swapchain(&mut self, requested)`** — tears
+  down and rebuilds the swapchain + extent-sized depth buffer at a new
+  size. The render pass is reused, so previously compiled pipelines stay
+  valid across a resize (hardware-verified: pipeline compiled at 256×256
+  renders green at 128×128).
+- `requested` clamps to the surface limits on undefined-extent surfaces
+  (headless); a defined current extent (real windows) always wins.
+  `resolve_extent` unit-tested for all three behaviours.
+- Recreating after a **dropped unpresented frame** is safe — the stale
+  recording is discarded exactly as the next acquire would (mirrors the
+  increment-5 dropped-frame guarantee).
+- Refused with a new `GraphicsError::RecreateRefused` when the surface
+  **format** changed (render pass + pipelines are format-bound; caller
+  drops pipelines and recompiles). Failure semantics are two-windowed
+  with the boundary at the `oldSwapchain` handoff CALL: failures before
+  it (caps/format/extent) leave the old swapchain usable; the handoff is
+  required for native windows and retires the old swapchain *whether or
+  not creation succeeds* (WSI spec), so failures at or after it leave
+  the backend swapchain-less (retired handle destroyed + cleared;
+  replacement built under the `InitScratch` discipline) — drop the
+  backend and construct a new one.
+- Readback capability is tracked: surfaces without `TRANSFER_SRC`
+  support get COLOR_ATTACHMENT-only swapchain images and
+  `read_pixels` returns an error instead of issuing invalid transfers.
+- Documented contract: no live `Frame` may outlive a recreate.
+
 ### Added — Depth Testing & Blending (Increment 6)
 - **`DepthState`** (`PipelineConfig::depth`): fixed-function depth test —
   `CompareOp` (Never/Less/Equal/LessEqual/Greater/NotEqual/GreaterEqual/
