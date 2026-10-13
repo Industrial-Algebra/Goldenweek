@@ -6,12 +6,13 @@
   the alignment target is **Miriami** (graphics-framework sibling, currently
   no-code ideation) and the Borsalino↔Miriami compute→render seam.
 
-## Current state (2026-10-10)
+## Current state (2026-10-12)
 
-Vulkan backend complete through increment 7: trait surface, Zunesha device
-borrow, swapchain + frame lifecycle, WGSL→SPIR-V pipelines (naga), verified
-draw + `read_pixels`, depth testing + blending (increment 6), swapchain
-resize/recreate (increment 7). Metal is staged behind Zunesha-Metal
+Vulkan backend complete through increment 6 on develop (trait surface,
+Zunesha device borrow, swapchain + frame lifecycle, WGSL→SPIR-V pipelines
+(naga), verified draw + `read_pixels`, depth testing + blending); increment
+7 (swapchain resize/recreate) is merged-pending review closure on
+`feat/swapchain-resize`. Metal is staged behind Zunesha-Metal
 (substrate-first sequencing).
 
 ## Miriami alignment
@@ -80,7 +81,16 @@ latter. Goldenweek never learns about DrawOps, scenes, or styles.
 - The ladder is dependency-ordered (M1 → M2/M3 → M4), not date-ordered.
 - M2's coupling to Zunesha ADR 0004 is deliberate: the cross-queue question
   is load-bearing for the whole compute→render interop story and belongs to
-  the substrate, not to Goldenweek working around it.
+  the substrate, not to Goldenweek working around it. That ADR is also where
+  the **numerical contract at the compute→render boundary** gets pinned
+  (exact compute outputs sampled by approximately-verified rendering —
+  whose tolerance, quarantined where; raised by the 2026-10-12 rabbit-hole
+  report as the document to watch).
+- **Sync-hardening follow-up (pre-M1):** the back-to-back present
+  binary-semaphore race (VUID-vkQueueSubmit-pSignalSemaphores-00067,
+  documented on `render_finished`) is fixed by a timeline-semaphore
+  refactor of the acquire/submit/present chain — tracked HERE (resolving
+  the dangling source-comment pointer noted by the 2026-10-12 report).
 - Miriami is ideation; if its `GraphicsBackend` trait shape changes before
   code exists, only the adapter note above is affected — the device-level
   surface Goldenweek exposes is independent of DrawOp representation.

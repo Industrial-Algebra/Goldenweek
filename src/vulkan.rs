@@ -518,7 +518,6 @@ impl<'a> VulkanBackend<'a> {
         // `VulkanSurface`, so this binding is irrefutable.
         let SurfaceHandle::VulkanSurface {
             surface: raw_surface,
-            ..
         } = surface;
         let surface = vk::SurfaceKHR::from_raw(raw_surface as usize as u64);
 
@@ -1686,7 +1685,6 @@ mod tests {
         /// checker verifies it.
         fn backend(&self) -> VulkanBackend<'_> {
             let surface = SurfaceHandle::VulkanSurface {
-                instance: std::ptr::null_mut(),
                 surface: self.headless.handle().as_raw() as usize as *mut c_void,
             };
             VulkanBackend::new(&self.device, surface).expect("VulkanBackend::new")
