@@ -1188,10 +1188,27 @@ impl<'a> VulkanBackend<'a> {
             let present_info = vk::PresentInfoKHR::default()
                 .swapchains(std::slice::from_ref(&self.swapchain))
                 .image_indices(std::slice::from_ref(&index));
-            if let Err(e) = self
+            let pres = self
                 .swapchain_fn
-                .queue_present(self.graphics_queue, &present_info)
-            {
+                .queue_present(self.graphics_queue, &present_info);
+            if let Err(e) = pres {
+                if e == vk::Result::ERROR_OUT_OF_DATE_KHR {
+                    // OUT_OF_DATE means the swapchain must be recreated and
+                    // the engine has released the image: re-presenting it is
+                    // a duplicate present (VUID 01430) and keeps the native
+                    // window in use, refusing later recreation (round 8,
+                    // P1). No image is owned anymore.
+                    render.phase = RenderPhase::Idle;
+                    return Err(format!(
+                        "recover present-back: {e} (swapchain out of date — recreate required)"
+                    ));
+                }
+                // An allocation-class failure was NOT enqueued: the image is
+                // still ours. Commit Flushed (submit done, present pending —
+                // the retry presents again without re-consuming anything)
+                // and propagate the error instead of reporting success with
+                // a retained image (round 7, P1). A retry failing repeatedly
+                // is fast, never a deadlock — the fence is signalled.
                 render.phase = RenderPhase::Flushed(index);
                 return Err(format!("recover present-back: {e}"));
             }
@@ -2024,11 +2041,21 @@ impl<'a> VulkanBackend<'a> {
                 unsafe {
                     if matches!(needs_submit, NeedsSubmit::Record) {
                         self.device.cmd_end_render_pass(render.cmd);
-                        self.device.end_command_buffer(render.cmd).map_err(|e| {
-                            GraphicsError::PresentFailed {
+                        let end = self.device.end_command_buffer(render.cmd);
+                        if let Err(e) = end {
+                            // Same boundary as the readback flush: the
+                            // recording is invalid, reset it away and commit
+                            // Acquired so recovery presents the image back
+                            // (round 8, P1).
+                            let _ = self.device.reset_command_buffer(
+                                render.cmd,
+                                vk::CommandBufferResetFlags::empty(),
+                            );
+                            render.phase = RenderPhase::Acquired(index);
+                            return Err(GraphicsError::PresentFailed {
                                 message: format!("end command buffer: {e}"),
-                            }
-                        })?;
+                            });
+                        }
                         // Commit the ended state before the fallible fence
                         // reset (round 7, P1): an interruption here resumes
                         // without ending twice.
@@ -2090,7 +2117,17 @@ impl<'a> VulkanBackend<'a> {
                 })?;
         }
 
-        render.phase = RenderPhase::Idle;
+        // OUT_OF_DATE releases the image (the engine consumes it despite
+        // the error) — Idle is correct and the caller must recreate. Any
+        // other present error was NOT enqueued: the image is still ours, so
+        // commit Flushed (submit done, present pending) — the next acquire's
+        // recovery presents it back instead of silently losing it from the
+        // pool (round 8, P1).
+        match present_result {
+            Ok(_) => render.phase = RenderPhase::Idle,
+            Err(e) if e == vk::Result::ERROR_OUT_OF_DATE_KHR => render.phase = RenderPhase::Idle,
+            Err(_) => render.phase = RenderPhase::Flushed(index),
+        }
         present_result
             .map(|_| ())
             .map_err(|e| GraphicsError::PresentFailed {
@@ -2145,9 +2182,21 @@ impl<'a> VulkanBackend<'a> {
                     // signals it).
                     unsafe {
                         self.device.cmd_end_render_pass(render.cmd);
-                        self.device
-                            .end_command_buffer(render.cmd)
-                            .map_err(|e| GraphicsError::Internal(format!("readback end: {e}")))?;
+                        let end = self.device.end_command_buffer(render.cmd);
+                        if let Err(e) = end {
+                            // The recording is INVALID — it cannot be ended,
+                            // submitted, or extended. Reset it away and
+                            // commit Acquired (image owned, semaphore
+                            // unconsumed): a same-frame retry is rejected,
+                            // and recovery presents the image back (round 8,
+                            // P1).
+                            let _ = self.device.reset_command_buffer(
+                                render.cmd,
+                                vk::CommandBufferResetFlags::empty(),
+                            );
+                            render.phase = RenderPhase::Acquired(index);
+                            return Err(GraphicsError::Internal(format!("readback end: {e}")));
+                        }
                     }
                     // Commit the ended-recording state BEFORE the fallible
                     // fence reset: a failure there must leave a phase the
