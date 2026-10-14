@@ -60,7 +60,7 @@ latter. Goldenweek never learns about DrawOps, scenes, or styles.
   glyph atlases, image DrawOps, and is the prerequisite for M2.
 - **M2 — Compute-written textures (image-side zero-copy)**
   Borsalino-dispatched writes sampled directly by Goldenweek. **Depends on
-  Zunesha cross-queue synchronization (candidate ADR 0004)** — compute-family
+  Zunesha cross-queue synchronization (ADR 0005 Phase 2)** — compute-family
   writes and graphics-family samples of an EXCLUSIVE resource require
   ownership release/acquire. Until then, uploads (M1) are the only path.
 - **M3 — Instanced & dynamic vertex batches**
@@ -79,7 +79,7 @@ latter. Goldenweek never learns about DrawOps, scenes, or styles.
 ## Sequencing notes
 
 - The ladder is dependency-ordered (M1 → M2/M3 → M4), not date-ordered.
-- M2's coupling to Zunesha ADR 0004 is deliberate: the cross-queue question
+- M2's coupling to Zunesha ADR 0005 Phase 2 is deliberate: the cross-queue question
   is load-bearing for the whole compute→render interop story and belongs to
   the substrate, not to Goldenweek working around it. That ADR is also where
   the **numerical contract at the compute→render boundary** gets pinned
