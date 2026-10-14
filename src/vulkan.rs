@@ -3165,14 +3165,22 @@ impl<'a> VulkanBackend<'a> {
         let height = self.extent.height;
         let size = (width as usize) * (height as usize) * 4;
 
-        // Staging via Zunesha (host-visible path), read via Zunesha.
-        let staging = self
-            .zunesha_device
-            .create_buffer(&vec![0u8; size])
-            .map_err(|e| GraphicsError::BufferCreationFailed {
-                message: format!("staging: {e}"),
-            })?;
-        let staging_vk = self.zunesha_device.raw_buffer(&staging);
+        // Staging via Zunesha (host-visible path), read via Zunesha. BOTH
+        // zunesha calls submit to the shared queue — the ALLOCATION
+        // too (device-local staging upload), which round 7 caught racing
+        // concurrent uploads — so both run under the QUEUE_LOCK
+        // (create_buffer's own internal lock covers only its own path).
+        let (staging, staging_vk) = {
+            let _queue = queue_guard();
+            let staging = self
+                .zunesha_device
+                .create_buffer(&vec![0u8; size])
+                .map_err(|e| GraphicsError::BufferCreationFailed {
+                    message: format!("staging: {e}"),
+                })?;
+            let staging_vk = self.zunesha_device.raw_buffer(&staging);
+            (staging, staging_vk)
+        };
 
         // One-shot copy command buffer from the same pool.
         let cb_ci = vk::CommandBufferAllocateInfo::default()
