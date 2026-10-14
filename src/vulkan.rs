@@ -1905,7 +1905,13 @@ impl<'a> VulkanBackend<'a> {
                     render.phase = RenderPhase::Idle;
                     // The stale recording that may have bound textures is
                     // discarded with this frame — drain (review round 2,
-                    // P2; recovery runs under the render lock).
+                    // P2; recovery runs under the render lock). Release
+                    // the queue guard FIRST (round 11, P1): the drains
+                    // take it themselves, and re-locking on this thread
+                    // would deadlock (std's Mutex is non-reentrant). This
+                    // arm returns immediately, so the guard is never
+                    // needed again here.
+                    drop(_queue);
                     self.drain_texture_bindings();
                     self.drain_buffer_retention();
                     return Err(format!(
