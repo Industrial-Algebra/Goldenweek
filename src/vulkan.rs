@@ -811,13 +811,18 @@ impl Drop for VulkanBackend<'_> {
             for &view in &self.image_views {
                 self.device.destroy_image_view(view, None);
             }
-            // Tombstone + graveyard teardown, under the bindings lock
-            // (the SAME lock `vulkan_texture_drop` holds across its
-            // check-and-destroy — the ordering that closes the teardown
-            // race, review round 2 P1): a texture drop racing this either
-            // completed while the device was alive, or will observe
-            // `alive == false` and leak. The device is still very much
-            // alive HERE, so retired graveyard inners are destroyed — not
+            // Tombstone + graveyard teardown. The tombstone is set INSIDE
+            // the bindings-lock critical section (the same lock
+            // `vulkan_texture_drop` holds across its check-and-destroy —
+            // the ordering that closes the teardown race, review round 2
+            // P1): a racing drop either completed while the device was
+            // alive, or will observe `alive == false` and leak. The
+            // retired destroys below run OUTSIDE the guard — deliberately
+            // and safely (review round 4, P3): every inner was REMOVED
+            // from the registry under the guard, and any later public
+            // drop sees the tombstone and leaks rather than destroying,
+            // so nothing races these destroys. The device is still very
+            // much alive HERE, so retired inners are destroyed — not
             // leaked (review round 2, P2).
             let retired: Vec<VulkanTextureInner> = {
                 let mut bindings = self.texture_bindings.lock().expect("texture bindings lock");
@@ -1333,6 +1338,15 @@ impl<'a> VulkanBackend<'a> {
     ///
     /// Lock order: render lock (held by caller) → bindings lock. Never
     /// the reverse (`vulkan_texture_drop` takes only the bindings lock).
+    ///
+    /// PROTOCOL NOTE (review round 4, P3): these destroys run OUTSIDE the
+    /// bindings guard — deliberately, and safely: this path is
+    /// backend-owned and runs under the render lock, and the inners it
+    /// destroys were REMOVED from the registry under the guard, so a
+    /// concurrent public drop targets a different inner or queues on the
+    /// lock. The guard-through-destroy discipline applies to the public
+    /// drop path, whose races are arbitrary users; backend-owned paths
+    /// are ordered by construction.
     fn drain_texture_bindings(&self) {
         let drained: Vec<VulkanTextureInner> = {
             let mut bindings = self.texture_bindings.lock().expect("texture bindings lock");
@@ -2747,6 +2761,17 @@ impl<'a> VulkanBackend<'a> {
         // Safety: `raw` was produced by `Box::into_raw::<VulkanTextureInner>`
         // in `create_texture` and is still valid.
         let texture_inner = unsafe { &*(texture.raw as *const VulkanTextureInner) };
+        // Foreign textures are rejected (review round 4, P1): a texture
+        // created by ANOTHER backend on the same device was never valid
+        // here — its descriptor set was allocated against that backend's
+        // set-layout object (binding a mismatched set is invalid Vulkan),
+        // and its drop retention belongs to the owner's registry, so a
+        // drop after this draw would destroy the recorded view.
+        if !Arc::ptr_eq(&texture_inner.bindings, &self.texture_bindings) {
+            return Err(GraphicsError::InvalidDraw {
+                message: "texture was created by a different backend — \ncross-backend texture use is not supported; create the texture with the backend that draws it".into(),
+            });
+        }
 
         let render = self.render.lock().expect("render state lock");
         Self::check_not_broken(&render)?;
