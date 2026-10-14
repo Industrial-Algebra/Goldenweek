@@ -1056,6 +1056,10 @@ impl<'a> VulkanBackend<'a> {
     /// (std's Mutex is non-reentrant). Early `return`s are GraphicsError,
     /// same as present's; the `Ok` payload carries the queue_present result
     /// plus whether THIS invocation submitted (the signal-drain condition).
+    /// CALLER-LOCKS CONTRACT (round 13 consolidation): `present` holds the
+    /// QUEUE_LOCK across this entire section AND the post-present arms —
+    /// this function takes NO guard itself (self-locking helpers are
+    /// forbidden; rounds 11–12 were both born from that pattern).
     fn present_locked(
         &self,
         render: &mut RenderState,
@@ -1716,13 +1720,15 @@ impl<'a> VulkanBackend<'a> {
     /// fence-confirmed, so the graveyard can be destroyed (under the
     /// QUEUE_LOCK — zunesha teardown quiesces the device) and the bound
     /// set clears. Lock order: render (held) → retention → queue.
+    /// CALLER-LOCKS CONTRACT (round 13 consolidation): every queue
+    /// operation — submit, present, wait, and quiescing teardown — runs
+    /// under an explicit `queue_guard()` acquired in the SAME function;
+    /// self-locking helpers are forbidden (they deadlock under a caller's
+    /// held guard, review rounds 11–12, and invite bare call sites,
+    /// round 12). The zunesha teardown below quiesces the device, so the
+    /// CALLER must hold QUEUE_LOCK across this call; the retention lock is
+    /// then taken inside (queue→retention — never inverted).
     fn drain_buffer_retention(&self) {
-        // QUEUE→RETENTION order (round 10, P1 — the public drops and every
-        // poison site establish queue→retention; never invert). Callers
-        // must NOT already hold the QUEUE_LOCK (std's Mutex is
-        // non-reentrant — present scopes its guard to its submit section
-        // for exactly this reason).
-        let _queue = queue_guard();
         let mut guard = self.buffer_retention.lock().expect("buffer retention lock");
         guard.bound.clear();
         guard.bound_pipelines.clear();
@@ -1738,6 +1744,10 @@ impl<'a> VulkanBackend<'a> {
         }
     }
 
+    /// CALLER-LOCKS CONTRACT (round 13 consolidation): the caller must
+    /// hold QUEUE_LOCK across this call — uniform with
+    /// [`drain_buffer_retention`], even though the texture destroys here
+    /// are direct ash calls; one rule, no exceptions.
     fn drain_texture_bindings(&self) {
         let drained: Vec<VulkanTextureInner> = {
             let mut bindings = self.texture_bindings.lock().expect("texture bindings lock");
@@ -1905,13 +1915,11 @@ impl<'a> VulkanBackend<'a> {
                     render.phase = RenderPhase::Idle;
                     // The stale recording that may have bound textures is
                     // discarded with this frame — drain (review round 2,
-                    // P2; recovery runs under the render lock). Release
-                    // the queue guard FIRST (round 11, P1): the drains
-                    // take it themselves, and re-locking on this thread
-                    // would deadlock (std's Mutex is non-reentrant). This
-                    // arm returns immediately, so the guard is never
-                    // needed again here.
-                    drop(_queue);
+                    // P2; recovery runs under the render lock). The
+                    // CALLER-LOCKS CONTRACT (round 13 consolidation)
+                    // makes this safe under the still-held guard: the
+                    // drains take no queue lock themselves — round 11's
+                    // deadlock was born from them doing so.
                     self.drain_texture_bindings();
                     self.drain_buffer_retention();
                     return Err(format!(
@@ -1989,8 +1997,13 @@ impl<'a> VulkanBackend<'a> {
             // The discarded recording may have bound textures — drain
             // BEFORE the teardown destroys anything they reference (review
             // round 3, P2; recovery ran under the render lock).
-            self.drain_texture_bindings();
-            self.drain_buffer_retention();
+            // CALLER-LOCKS CONTRACT: this section takes the queue guard
+            // itself (round 13 consolidation).
+            {
+                let _queue = queue_guard();
+                self.drain_texture_bindings();
+                self.drain_buffer_retention();
+            }
         }
         // Safety: no submission may reference the objects being destroyed.
         unsafe {
@@ -2946,8 +2959,13 @@ impl<'a> VulkanBackend<'a> {
                     message: format!("stale-frame recovery: {e}"),
                 })?;
             render.phase = RenderPhase::Idle;
-            self.drain_texture_bindings();
-            self.drain_buffer_retention();
+            // CALLER-LOCKS CONTRACT: recovery released its guard on
+            // return; this drain section takes its own (round 13).
+            {
+                let _queue = queue_guard();
+                self.drain_texture_bindings();
+                self.drain_buffer_retention();
+            }
         }
 
         let (index, _suboptimal) = unsafe {
@@ -3331,10 +3349,12 @@ impl<'a> VulkanBackend<'a> {
         // SECTION (round 10, P1): the post-present arms call the drains,
         // which take the queue themselves — holding it across them would
         // re-lock on this thread.
-        let (present_result, submitted) = {
-            let _queue = queue_guard();
-            self.present_locked(&mut render, index)?
-        };
+        // CALLER-LOCKS CONTRACT: ONE whole-body guard covers the
+        // submit/present/wait section, the post-present arms, AND the
+        // error arm's semaphore-drain submission (round 13 consolidation —
+        // rounds 10–12's narrowing/self-locking alternation is gone).
+        let _queue = queue_guard();
+        let (present_result, submitted) = self.present_locked(&mut render, index)?;
 
         // OUT_OF_DATE and SURFACE_LOST release the image (the engine
         // consumes it despite the error) — Idle is correct and the caller
@@ -3368,14 +3388,12 @@ impl<'a> VulkanBackend<'a> {
                     // back-to-back latency race (round 9, P1). The fence has
                     // been waited, so the signal is complete: an empty
                     // submission waiting on it drains deterministically.
-                    // The drain SUBMITS — take the QUEUE_LOCK for the
-                    // whole sequence (round 12, P1): present_locked's guard
-                    // released when it returned, and this submission ran
-                    // bare, racing concurrent queue users. The poison call
-                    // in the error arm below runs under this guard —
+                    // The drain SUBMITS — covered by present's whole-body
+                    // guard (round 13 consolidation; the round-12 site was
+                    // bare after round 10's narrowing). The poison call in
+                    // the error path below runs under the same guard —
                     // queue→retention, the established order.
                     unsafe {
-                        let _queue = queue_guard();
                         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
                         let drain = vk::SubmitInfo::default()
                             .wait_semaphores(std::slice::from_ref(&self.render_finished))
