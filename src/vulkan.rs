@@ -399,48 +399,142 @@ enum RenderPhase {
 /// Internal state for a compiled Vulkan pipeline, stored behind the opaque
 /// [`RenderPipeline`] handle. Self-contained (clones the device) so it can
 /// destroy itself on drop.
-struct VulkanPipelineInner {
+pub(crate) struct VulkanPipelineInner {
     pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
     vs_module: vk::ShaderModule,
     fs_module: vk::ShaderModule,
     device: ash::Device,
+    /// Retention (round 9, P1): a pipeline bound into a recording whose
+    /// completion is unconfirmed must not be destroyed — same discipline
+    /// as vertex buffers.
+    retention: Option<Arc<Mutex<BufferRetention>>>,
+    /// The backend's liveness tombstone.
+    alive: Option<Arc<AtomicBool>>,
 }
 
-/// Drop function stored in [`RenderPipeline`] — drops the boxed inner and its
-/// Vulkan objects.
+/// Destroy a pipeline inner's Vulkan objects (device alive, no pending
+/// submission references it).
+unsafe fn destroy_pipeline_inner(inner: VulkanPipelineInner) {
+    unsafe {
+        inner.device.destroy_pipeline(inner.pipeline, None);
+        inner.device.destroy_pipeline_layout(inner.layout, None);
+        inner.device.destroy_shader_module(inner.vs_module, None);
+        inner.device.destroy_shader_module(inner.fs_module, None);
+    }
+}
+
+/// Drop function stored in [`RenderPipeline`] — retention-aware (round 9,
+/// P1): bound-into-pending → graveyard (drained at Idle, completion
+/// confirmed); poisoned → leak; else destroy now.
 pub(super) fn drop_vulkan_pipeline(raw: *mut c_void) {
     if !raw.is_null() {
         // Safety: `raw` was produced by `Box::into_raw` in
         // `compile_render_pipeline`.
-        unsafe {
-            let inner = Box::from_raw(raw as *mut VulkanPipelineInner);
-            inner.device.destroy_pipeline(inner.pipeline, None);
-            inner.device.destroy_pipeline_layout(inner.layout, None);
-            inner.device.destroy_shader_module(inner.vs_module, None);
-            inner.device.destroy_shader_module(inner.fs_module, None);
+        let inner = unsafe { Box::from_raw(raw as *mut VulkanPipelineInner) };
+        let (Some(retention), Some(alive)) = (&inner.retention, &inner.alive) else {
+            // Safety: no retention metadata — destroy directly.
+            unsafe { destroy_pipeline_inner(*inner) };
+            return;
+        };
+        if !alive.load(AtomicOrdering::Acquire) {
+            eprintln!(
+                "goldenweek: a RenderPipeline outlived its backend; leaking its GPU resources (documented contract violation)"
+            );
+            std::mem::forget(inner);
+            return;
         }
+        let key = raw as usize;
+        let retention = Arc::clone(retention);
+        let mut guard = retention.lock().expect("buffer retention lock");
+        if guard.poisoned {
+            guard.leaked_pipelines.push(*inner);
+            return;
+        }
+        if guard.bound_pipelines.contains(&key) {
+            guard.graveyard_pipelines.push(*inner);
+            return;
+        }
+        drop(guard);
+        // Safety: no pending submission references it.
+        unsafe { destroy_pipeline_inner(*inner) };
     }
 }
 
-/// Drop function stored in [`GpuBuffer`] — drops the boxed `zunesha::Buffer`,
-/// whose own drop destroys the Vulkan buffer + memory. The teardown may
-/// quiesce the device (`vkDeviceWaitIdle`) — a queue operation — so it
-/// joins the QUEUE_LOCK protocol (review round 8, P1: the public drop
-/// raced concurrent uploads).
+/// What is boxed inside a [`GpuBuffer`]'s `raw` (vulkan backend): the
+/// zunesha buffer plus the retention state that keeps it alive while a
+/// submission whose completion is unconfirmed still references it
+/// (review round 9, P1).
+pub(crate) struct GpuBufferInner {
+    pub buffer: zunesha::Buffer,
+    /// The backend's liveness tombstone (shared with textures).
+    pub alive: Arc<AtomicBool>,
+    /// The backend's buffer-retention registry.
+    pub retention: Arc<Mutex<BufferRetention>>,
+}
+
+/// Backend-side retention for vertex buffers (mirrors the texture
+/// bindings registry): buffers bound into the pending recording, and
+/// deferred destructions. Buffers whose frame completion could not be
+/// confirmed (poisoned backend) move to `leaked` and are never destroyed
+/// — the Zunesha 0.1.2 unconfirmed_submission discipline.
+#[derive(Default)]
+pub(crate) struct BufferRetention {
+    /// Boxed-`GpuBufferInner` pointers bound into the CURRENT recording.
+    pub bound: std::collections::HashSet<usize>,
+    /// Inners whose public handle dropped while bound — destroyed at the
+    /// frame's Idle drain (completion confirmed by the fence wait).
+    pub graveyard: Vec<GpuBufferInner>,
+    /// Inners with unconfirmable completion (poison) — LEAKED, never
+    /// destroyed.
+    pub leaked: Vec<GpuBufferInner>,
+    /// Set when the backend is poisoned with GPU work outstanding: every
+    /// later buffer drop leaks too — its submission's completion can
+    /// never be confirmed (round 9, P1).
+    pub poisoned: bool,
+    /// Pipelines bound into the CURRENT recording (round 9, P1 — the
+    /// same class as buffers: 00765 destroy-while-pending).
+    pub bound_pipelines: std::collections::HashSet<usize>,
+    /// Retired pipelines — destroyed at the Idle drain.
+    pub graveyard_pipelines: Vec<VulkanPipelineInner>,
+    /// Leaked pipelines (poison) — never destroyed.
+    pub leaked_pipelines: Vec<VulkanPipelineInner>,
+}
+
+/// Drop function stored in [`GpuBuffer`] — retention-aware (round 9, P1).
 ///
-/// RECURSION RULE: never let a `zunesha::Buffer` drop (this function, or
-/// [`QueueLockedStaging`]) unwind or run while the QUEUE_LOCK is already
-/// held on this thread — std's Mutex is non-reentrant. Goldenweek's call
-/// sites guarantee this by capturing results inside queue-guard scopes
-/// and handling errors after release.
+/// RECURSION RULE: destruction takes the QUEUE_LOCK — never run this
+/// while that lock is held on this thread.
 pub(super) fn drop_zunesha_buffer_box(raw: *mut c_void) {
     if !raw.is_null() {
-        let _queue = queue_guard();
         // Safety: `raw` was produced by `Box::into_raw` in `create_buffer`.
-        unsafe {
-            drop(Box::from_raw(raw as *mut zunesha::Buffer));
+        let inner = unsafe { Box::from_raw(raw as *mut GpuBufferInner) };
+        if !inner.alive.load(std::sync::atomic::Ordering::Acquire) {
+            eprintln!(
+                "goldenweek: a GpuBuffer outlived its backend; leaking its GPU resources (documented contract violation)"
+            );
+            std::mem::forget(inner);
+            return;
         }
+        let key = raw as usize;
+        let retention = Arc::clone(&inner.retention);
+        let mut guard = retention.lock().expect("buffer retention lock");
+        if guard.poisoned {
+            // This buffer was bound into (or retired behind) a recording
+            // whose completion could not be confirmed — leak rather than
+            // destroy unconfirmed GPU work (round 9, P1).
+            guard.leaked.push(*inner);
+            return;
+        }
+        if guard.bound.contains(&key) {
+            // Still referenced by the pending recording — retire; the Idle
+            // drain destroys it once completion is fence-confirmed.
+            guard.graveyard.push(*inner);
+            return;
+        }
+        drop(guard);
+        let _queue = queue_guard();
+        drop(inner);
     }
 }
 
@@ -790,6 +884,9 @@ pub struct VulkanBackend<'a> {
     /// (see [`TextureBindings`]) — drained when a frame completes (phase
     /// commits Idle).
     texture_bindings: Arc<Mutex<TextureBindings>>,
+    /// Vertex-buffer retention (see [`BufferRetention`]) — bound into the
+    /// pending recording, drained at Idle, leaked on poison (round 9 P1).
+    buffer_retention: Arc<Mutex<BufferRetention>>,
     swapchain: vk::SwapchainKHR,
     /// Whether the current swapchain's images carry `TRANSFER_SRC` usage
     /// (required by [`Self::read_pixels`]). False on surfaces that do not
@@ -847,10 +944,10 @@ impl Drop for VulkanBackend<'_> {
         // by the caller (documented invariant). The device/instance/surface
         // belong to their owners and are NOT destroyed here.
         unsafe {
-            {
+            let idle_ok = {
                 let _queue = queue_guard();
-                let _ = self.device.device_wait_idle();
-            }
+                self.device.device_wait_idle().is_ok()
+            };
             let render = self.render.lock().expect("render state lock");
             self.device.destroy_fence(render.fence, None);
             self.device
@@ -887,6 +984,44 @@ impl Drop for VulkanBackend<'_> {
                 // on the lock and will see the tombstone).
                 destroy_texture_inner(Box::new(inner));
             }
+            // Buffer retention teardown (round 9, P1): destruction requires
+            // CONFIRMED completion. If device_wait_idle succeeded, the GPU
+            // is quiescent and the graveyard may be destroyed; if it failed
+            // (or the backend was poisoned), leak with a note — never
+            // destroy unconfirmed GPU work. `leaked` is never touched
+            // again on purpose.
+            let (retired_buffers, leaked_buffers, retired_pipelines, leaked_pipelines) = {
+                let mut retention = self.buffer_retention.lock().expect("buffer retention lock");
+                retention.bound.clear();
+                retention.bound_pipelines.clear();
+                (
+                    std::mem::take(&mut retention.graveyard),
+                    std::mem::take(&mut retention.leaked),
+                    std::mem::take(&mut retention.graveyard_pipelines),
+                    std::mem::take(&mut retention.leaked_pipelines),
+                )
+            };
+            if idle_ok {
+                // Completion confirmed (device_wait_idle succeeded).
+                let _queue = queue_guard();
+                for inner in retired_buffers {
+                    drop(inner);
+                }
+                // Safety: GPU quiescent.
+                for inner in retired_pipelines {
+                    destroy_pipeline_inner(inner);
+                }
+            } else {
+                eprintln!(
+                    "goldenweek: backend teardown could not confirm GPU quiescence; leaking {} buffer(s) and {} pipeline(s) rather than destroying unconfirmed GPU work",
+                    retired_buffers.len() + leaked_buffers.len(),
+                    retired_pipelines.len() + leaked_pipelines.len()
+                );
+                std::mem::forget(retired_buffers);
+                std::mem::forget(retired_pipelines);
+            }
+            std::mem::forget(leaked_buffers);
+            std::mem::forget(leaked_pipelines);
             self.device.destroy_render_pass(self.render_pass, None);
             self.device.destroy_image_view(self.depth_view, None);
             self.device.destroy_image(self.depth_image, None);
@@ -1275,6 +1410,7 @@ impl<'a> VulkanBackend<'a> {
             texture_set_layout,
             alive: Arc::new(AtomicBool::new(true)),
             texture_bindings: Arc::new(Mutex::new(TextureBindings::default())),
+            buffer_retention: Arc::new(Mutex::new(BufferRetention::default())),
         })
     }
 
@@ -1369,6 +1505,7 @@ impl<'a> VulkanBackend<'a> {
                 render.fence,
             ) {
                 render.broken = true;
+                self.poison_buffer_retention();
                 return Err(GraphicsError::Internal(format!("readback submit: {e}")));
             }
             if let Err(e) =
@@ -1376,6 +1513,7 @@ impl<'a> VulkanBackend<'a> {
                     .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
             {
                 render.broken = true;
+                self.poison_buffer_retention();
                 return Err(GraphicsError::Internal(format!("readback wait: {e}")));
             }
         }
@@ -1399,6 +1537,68 @@ impl<'a> VulkanBackend<'a> {
     /// lock. The guard-through-destroy discipline applies to the public
     /// drop path, whose races are arbitrary users; backend-owned paths
     /// are ordered by construction.
+    /// Poison buffer retention (called wherever `broken` is set): the
+    /// pending recording's completion can no longer be confirmed, so every
+    /// bound or retired buffer moves to the leak list — never destroyed
+    /// (round 9, P1). Lock order: render (held by callers) → retention.
+    fn poison_buffer_retention(&self) {
+        let mut guard = self.buffer_retention.lock().expect("buffer retention lock");
+        if guard.poisoned {
+            return; // already poisoned — idempotent
+        }
+        guard.poisoned = true;
+        let bound = std::mem::take(&mut guard.bound);
+        let graveyard = std::mem::take(&mut guard.graveyard);
+        let bound_p = std::mem::take(&mut guard.bound_pipelines);
+        let graveyard_p = std::mem::take(&mut guard.graveyard_pipelines);
+        if !bound.is_empty() || !graveyard.is_empty() {
+            eprintln!(
+                "goldenweek: backend broken with in-flight vertex buffers; leaking {} GPU buffer(s) rather than destroying unconfirmed GPU work",
+                bound.len() + graveyard.len()
+            );
+        }
+        if !bound_p.is_empty() || !graveyard_p.is_empty() {
+            eprintln!(
+                "goldenweek: backend broken with in-flight pipelines; leaking {} pipeline(s) rather than destroying unconfirmed GPU work",
+                bound_p.len() + graveyard_p.len()
+            );
+        }
+        guard.leaked.extend(graveyard);
+        guard.leaked_pipelines.extend(graveyard_p);
+        let _ = (bound, bound_p);
+        // `bound` holds only pointers; the boxes they point at are the
+        // public handles' — nothing to move for still-live ones here.
+        // The still-live handles will find `alive`/poison state on drop.
+        let _ = bound;
+    }
+
+    /// Drain buffer retention at a frame's Idle commit: completion was
+    /// fence-confirmed, so the graveyard can be destroyed (under the
+    /// QUEUE_LOCK — zunesha teardown quiesces the device) and the bound
+    /// set clears. Lock order: render (held) → retention → queue.
+    fn drain_buffer_retention(&self) {
+        let (graveyard, guard_p) = {
+            let mut guard = self.buffer_retention.lock().expect("buffer retention lock");
+            guard.bound.clear();
+            guard.bound_pipelines.clear();
+            (
+                std::mem::take(&mut guard.graveyard),
+                std::mem::take(&mut guard.graveyard_pipelines),
+            )
+        };
+        let graveyard_pipelines = guard_p;
+        if !graveyard.is_empty() || !graveyard_pipelines.is_empty() {
+            let _queue = queue_guard();
+            for inner in graveyard {
+                drop(inner);
+            }
+            // Safety: completion fence-confirmed at the Idle commit.
+            for inner in graveyard_pipelines {
+                unsafe { destroy_pipeline_inner(inner) };
+            }
+        }
+    }
+
     fn drain_texture_bindings(&self) {
         let drained: Vec<VulkanTextureInner> = {
             let mut bindings = self.texture_bindings.lock().expect("texture bindings lock");
@@ -1520,6 +1720,7 @@ impl<'a> VulkanBackend<'a> {
                     render.fence,
                 ) {
                     render.broken = true;
+                    self.poison_buffer_retention();
                     return Err(format!("recover submit: {e}"));
                 }
                 if let Err(e) =
@@ -1527,6 +1728,7 @@ impl<'a> VulkanBackend<'a> {
                         .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
                 {
                     render.broken = true;
+                    self.poison_buffer_retention();
                     return Err(format!("recover fence wait: {e}"));
                 }
             }
@@ -1566,6 +1768,7 @@ impl<'a> VulkanBackend<'a> {
                     // discarded with this frame — drain (review round 2,
                     // P2; recovery runs under the render lock).
                     self.drain_texture_bindings();
+                    self.drain_buffer_retention();
                     return Err(format!(
                         "recover present-back: {e} (swapchain/surface lost — recreate required)"
                     ));
@@ -1642,6 +1845,7 @@ impl<'a> VulkanBackend<'a> {
             // BEFORE the teardown destroys anything they reference (review
             // round 3, P2; recovery ran under the render lock).
             self.drain_texture_bindings();
+            self.drain_buffer_retention();
         }
         // Safety: no submission may reference the objects being destroyed.
         unsafe {
@@ -2096,6 +2300,8 @@ impl<'a> VulkanBackend<'a> {
             vs_module,
             fs_module,
             device: self.device.clone(),
+            retention: Some(Arc::clone(&self.buffer_retention)),
+            alive: Some(Arc::clone(&self.alive)),
         });
         Ok(RenderPipeline {
             raw: Box::into_raw(inner) as *mut c_void,
@@ -2123,8 +2329,13 @@ impl<'a> VulkanBackend<'a> {
             }
         })?;
         let len = std::mem::size_of_val(data);
+        let inner = GpuBufferInner {
+            buffer,
+            alive: Arc::clone(&self.alive),
+            retention: Arc::clone(&self.buffer_retention),
+        };
         Ok(GpuBuffer {
-            raw: Box::into_raw(Box::new(buffer)) as *mut c_void,
+            raw: Box::into_raw(Box::new(inner)) as *mut c_void,
             len,
             drop_fn: drop_zunesha_buffer_box,
         })
@@ -2591,6 +2802,7 @@ impl<'a> VulkanBackend<'a> {
                 })?;
             render.phase = RenderPhase::Idle;
             self.drain_texture_bindings();
+            self.drain_buffer_retention();
         }
 
         let (index, _suboptimal) = unsafe {
@@ -2769,7 +2981,24 @@ impl<'a> VulkanBackend<'a> {
             unsafe { &*(pipeline.raw as *const VulkanPipelineInner) };
         // Safety: `raw` was produced by `Box::into_raw::<zunesha::Buffer>` in
         // `create_buffer` and is still valid.
-        let zunesha_buffer = unsafe { &*(vertices.raw as *const zunesha::Buffer) };
+        // Safety: `raw` was produced by `Box::into_raw<GpuBufferInner>` in
+        // `create_buffer` and is still valid.
+        let buffer_inner = unsafe { &*(vertices.raw as *const GpuBufferInner) };
+        let zunesha_buffer = &buffer_inner.buffer;
+        // Retain: the pending recording references this buffer — a public
+        // drop before completion must retire into the graveyard, and a
+        // poisoned (unconfirmable) frame must LEAK it (round 9, P1).
+        // Lock order: render (held) → retention — never reversed.
+        self.buffer_retention
+            .lock()
+            .expect("buffer retention lock")
+            .bound
+            .insert(vertices.raw as usize);
+        self.buffer_retention
+            .lock()
+            .expect("buffer retention lock")
+            .bound_pipelines
+            .insert(pipeline.raw as usize);
         let vertex_buffer = self.zunesha_device.raw_buffer(zunesha_buffer);
 
         let render = self.render.lock().expect("render state lock");
@@ -2822,7 +3051,24 @@ impl<'a> VulkanBackend<'a> {
             unsafe { &*(pipeline.raw as *const VulkanPipelineInner) };
         // Safety: `raw` was produced by `Box::into_raw::<zunesha::Buffer>` in
         // `create_buffer` and is still valid.
-        let zunesha_buffer = unsafe { &*(vertices.raw as *const zunesha::Buffer) };
+        // Safety: `raw` was produced by `Box::into_raw<GpuBufferInner>` in
+        // `create_buffer` and is still valid.
+        let buffer_inner = unsafe { &*(vertices.raw as *const GpuBufferInner) };
+        let zunesha_buffer = &buffer_inner.buffer;
+        // Retain: the pending recording references this buffer — a public
+        // drop before completion must retire into the graveyard, and a
+        // poisoned (unconfirmable) frame must LEAK it (round 9, P1).
+        // Lock order: render (held) → retention — never reversed.
+        self.buffer_retention
+            .lock()
+            .expect("buffer retention lock")
+            .bound
+            .insert(vertices.raw as usize);
+        self.buffer_retention
+            .lock()
+            .expect("buffer retention lock")
+            .bound_pipelines
+            .insert(pipeline.raw as usize);
         let vertex_buffer = self.zunesha_device.raw_buffer(zunesha_buffer);
         // Safety: `raw` was produced by `Box::into_raw::<VulkanTextureInner>`
         // in `create_texture` and is still valid.
@@ -2988,6 +3234,7 @@ impl<'a> VulkanBackend<'a> {
                         render.fence,
                     ) {
                         render.broken = true;
+                        self.poison_buffer_retention();
                         return Err(GraphicsError::PresentFailed {
                             message: format!("vkQueueSubmit: {e}"),
                         });
@@ -3014,6 +3261,7 @@ impl<'a> VulkanBackend<'a> {
                 .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
                 .map_err(|e| {
                     render.broken = true;
+                    self.poison_buffer_retention();
                     GraphicsError::PresentFailed {
                         message: format!("fence wait: {e}"),
                     }
@@ -3031,10 +3279,12 @@ impl<'a> VulkanBackend<'a> {
             Ok(_) => {
                 render.phase = RenderPhase::Idle;
                 self.drain_texture_bindings();
+                self.drain_buffer_retention();
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::ERROR_SURFACE_LOST_KHR) => {
                 render.phase = RenderPhase::Idle;
                 self.drain_texture_bindings();
+                self.drain_buffer_retention();
             }
             Err(e) => {
                 // Drain ONLY when this invocation signaled render_finished
@@ -3077,6 +3327,7 @@ impl<'a> VulkanBackend<'a> {
                             // completing submit) — poison per the round-6
                             // discipline and surface both errors.
                             render.broken = true;
+                            self.poison_buffer_retention();
                             return Err(GraphicsError::PresentFailed {
                                 message: format!(
                                     "vkQueuePresentKHR: {e}; render_finished drain: {drain_err}"
