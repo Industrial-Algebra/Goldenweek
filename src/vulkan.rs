@@ -493,7 +493,11 @@ pub(crate) fn vulkan_texture_drop(raw: *mut c_void) {
                 bindings.graveyard.push(*inner);
                 return;
             }
-            drop(bindings);
+            // Destroy WHILE STILL HOLDING the guard (review round 3, P1):
+            // releasing first re-opened the teardown race — backend Drop
+            // could invalidate the device between the release and these
+            // destroys. `destroy_texture_inner` takes no locks, so holding
+            // the guard across it cannot deadlock.
             destroy_texture_inner(inner);
         }
     }
@@ -1565,6 +1569,10 @@ impl<'a> VulkanBackend<'a> {
                     .reset_command_buffer(render.cmd, vk::CommandBufferResetFlags::empty());
             }
             render.phase = RenderPhase::Idle;
+            // The discarded recording may have bound textures — drain
+            // BEFORE the teardown destroys anything they reference (review
+            // round 3, P2; recovery ran under the render lock).
+            self.drain_texture_bindings();
         }
         // Safety: no submission may reference the objects being destroyed.
         unsafe {
