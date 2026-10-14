@@ -380,6 +380,100 @@ impl Drop for GpuBuffer {
     }
 }
 
+
+// ── Textures (M1) ─────────────────────────────────────────────────
+
+/// Description of an immutable texture to create (M1).
+///
+/// Textures are created and uploaded in one call — [`GraphicsBackend::
+/// create_texture`] — and cannot be mutated afterwards. Glyph atlases
+/// rebuild rather than update (Miriami's model); in-place updates belong
+/// to the M2 compute-written-texture conversation (Zunesha ADR 0005
+/// Phase 2's ownership ledger).
+///
+/// `data` is tightly-packed `RGBA8`, row-major, top-left origin,
+/// `len == width * height * 4`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextureDesc {
+    /// Extent in texels. Both dimensions must be non-zero.
+    pub width: u32,
+    pub height: u32,
+}
+
+impl TextureDesc {
+    /// Validate the descriptor against an upload payload.
+    ///
+    /// Returns the expected byte length (`w * h * 4`) on success, or
+    /// `InvalidArgument` for a zero extent or a payload whose length is
+    /// not exactly the tightly-packed RGBA8 stride.
+    pub fn validate(&self, data: &[u8]) -> Result<usize> {
+        if self.width == 0 || self.height == 0 {
+            return Err(GraphicsError::InvalidArgument {
+                message: format!(
+                    "texture extent must be non-zero (got {}x{})",
+                    self.width, self.height
+                ),
+            });
+        }
+        let expected = self.width as usize * self.height as usize * 4;
+        if data.len() != expected {
+            return Err(GraphicsError::InvalidArgument {
+                message: format!(
+                    "RGBA8 texture data must be exactly w*h*4 bytes ({}x{} expects {expected}, got {})",
+                    self.width,
+                    self.height,
+                    data.len()
+                ),
+            });
+        }
+        Ok(expected)
+    }
+}
+
+/// Texel filtering for a [`Texture`](crate::Texture)'s sampler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FilterMode {
+    /// Nearest-neighbour — exact texel reads (verification images,
+    /// pixel-art atlases).
+    Nearest,
+    /// Linear interpolation between the four nearest texels.
+    #[default]
+    Linear,
+}
+
+/// An immutable, uploaded, sampleable image (M1).
+///
+/// Opaque handle — the backend owns the GPU resources and destroys them
+/// on drop. Sampled as a combined image sampler bound at set 0, binding 0
+/// by [`GraphicsBackend::draw_textured`]. Must not outlive the backend;
+/// in-flight frames sampling it must complete first — the synchronous
+/// `present` guarantees this.
+pub struct Texture {
+    pub(crate) raw: *mut c_void,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) drop_fn: fn(*mut c_void),
+}
+
+impl std::fmt::Debug for Texture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Texture")
+            .field("raw", &self.raw)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish()
+    }
+}
+
+unsafe impl Send for Texture {}
+unsafe impl Sync for Texture {}
+
+impl Drop for Texture {
+    fn drop(&mut self) {
+        (self.drop_fn)(self.raw);
+    }
+}
+
 // (`Frame` lives in `src/frame.rs` — see `pub use frame::Frame`.)
 
 // ── Trait ─────────────────────────────────────────────────────────
@@ -424,6 +518,35 @@ pub trait GraphicsBackend: Sized {
     /// interpretation at draw time is fixed by the pipeline's
     /// [`VertexLayout`].
     fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<GpuBuffer>;
+
+    /// Create an immutable texture and upload `data` (M1).
+    ///
+    /// `desc.validate` fixes the contract: tightly-packed RGBA8,
+    /// `len == w * h * 4`, non-zero extent. The upload is complete when
+    /// this returns (synchronous submit-and-wait) — the texture is
+    /// immediately sampleable by [`draw_textured`](Self::draw_textured).
+    fn create_texture(
+        &self,
+        desc: &TextureDesc,
+        data: &[u8],
+        filter: FilterMode,
+    ) -> Result<Texture>;
+
+    /// Record a textured draw call into `frame` (M1).
+    ///
+    /// Identical to [`draw`](Self::draw) except `texture` is bound as a
+    /// combined image sampler at set 0, binding 0 — the pipeline's
+    /// fragment shader may sample it (`texture_2d<f32>` + `sampler` in
+    /// WGSL). A shader that does not reference the binding simply does
+    /// not sample it (the binding is declared on every pipeline layout).
+    fn draw_textured(
+        &self,
+        frame: &mut Frame,
+        pipeline: &RenderPipeline,
+        vertices: &GpuBuffer,
+        vertex_count: u32,
+        texture: &Texture,
+    ) -> Result<()>;
 
     /// Acquire the next frame for rendering.
     ///
@@ -474,6 +597,24 @@ impl GraphicsBackend for NoBackendStub {
         Err(GraphicsError::NoBackend)
     }
     fn create_buffer<T: bytemuck::Pod>(&self, _data: &[T]) -> Result<GpuBuffer> {
+        Err(GraphicsError::NoBackend)
+    }
+    fn create_texture(
+        &self,
+        _desc: &TextureDesc,
+        _data: &[u8],
+        _filter: FilterMode,
+    ) -> Result<Texture> {
+        Err(GraphicsError::NoBackend)
+    }
+    fn draw_textured(
+        &self,
+        _frame: &mut Frame,
+        _pipeline: &RenderPipeline,
+        _vertices: &GpuBuffer,
+        _vertex_count: u32,
+        _texture: &Texture,
+    ) -> Result<()> {
         Err(GraphicsError::NoBackend)
     }
     fn acquire_frame(&self) -> Result<Frame> {
@@ -601,5 +742,21 @@ mod tests {
 
         let buffer = stub.create_buffer(&[0.0f32; 3]);
         assert!(matches!(buffer, Err(GraphicsError::NoBackend)));
+    }
+
+    // ---- M1: textures & sampled images ----
+
+    #[test]
+    fn texture_desc_rejects_zero_extent() {
+        assert!(TextureDesc { width: 0, height: 2 }.validate(&[0u8; 8]).is_err());
+        assert!(TextureDesc { width: 2, height: 0 }.validate(&[0u8; 8]).is_err());
+    }
+
+    #[test]
+    fn texture_desc_rejects_bad_stride() {
+        // RGBA8: len must be exactly w * h * 4.
+        assert!(TextureDesc { width: 2, height: 2 }.validate(&[0u8; 15]).is_err());
+        assert!(TextureDesc { width: 2, height: 2 }.validate(&[0u8; 17]).is_err());
+        assert!(TextureDesc { width: 2, height: 2 }.validate(&[0u8; 16]).is_ok());
     }
 }
