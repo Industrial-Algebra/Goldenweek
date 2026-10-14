@@ -415,7 +415,19 @@ impl TextureDesc {
                 ),
             });
         }
-        let expected = self.width as usize * self.height as usize * 4;
+        // Checked arithmetic: u32::MAX extents must error, not panic
+        // (review round 1, P1).
+        let Some(expected) = (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|texels| texels.checked_mul(4))
+        else {
+            return Err(GraphicsError::InvalidArgument {
+                message: format!(
+                    "texture extent overflows the address space ({}x{})",
+                    self.width, self.height
+                ),
+            });
+        };
         if data.len() != expected {
             return Err(GraphicsError::InvalidArgument {
                 message: format!(
@@ -444,10 +456,14 @@ pub enum FilterMode {
 /// An immutable, uploaded, sampleable image (M1).
 ///
 /// Opaque handle — the backend owns the GPU resources and destroys them
-/// on drop. Sampled as a combined image sampler bound at set 0, binding 0
-/// by [`GraphicsBackend::draw_textured`]. Must not outlive the backend;
-/// in-flight frames sampling it must complete first — the synchronous
-/// `present` guarantees this.
+/// on drop. Bound by [`GraphicsBackend::draw_textured`] as **set 0**:
+/// the sampled image at **binding 0** and its sampler at **binding 1**
+/// (WGSL: `texture_2d<f32>` `@group(0) @binding(0)` + `sampler`
+/// `@group(0) @binding(1)` — WGSL/naga cannot express Vulkan's
+/// combined-image-sampler; this split is the expressible form). Must not
+/// outlive the backend; textures bound into a frame that is still being
+/// recorded are retired at that frame's completion, not destroyed
+/// out from under it.
 pub struct Texture {
     pub(crate) raw: *mut c_void,
     pub(crate) width: u32,
@@ -534,11 +550,12 @@ pub trait GraphicsBackend: Sized {
 
     /// Record a textured draw call into `frame` (M1).
     ///
-    /// Identical to [`draw`](Self::draw) except `texture` is bound as a
-    /// combined image sampler at set 0, binding 0 — the pipeline's
-    /// fragment shader may sample it (`texture_2d<f32>` + `sampler` in
-    /// WGSL). A shader that does not reference the binding simply does
-    /// not sample it (the binding is declared on every pipeline layout).
+    /// Identical to [`draw`](Self::draw) except `texture` is bound as
+    /// **set 0** — sampled image at binding 0, sampler at binding 1 (the
+    /// WGSL/naga-expressible form of a combined sampler). The pipeline's
+    /// fragment shader may sample it; a shader that does not reference
+    /// the bindings simply does not sample them (set 0 is declared on
+    /// every pipeline layout).
     fn draw_textured(
         &self,
         frame: &mut Frame,
@@ -793,5 +810,16 @@ mod tests {
             .validate(&[0u8; 16])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn texture_desc_overflow_returns_error_not_panic() {
+        // RED probe (review r1 P1): u32::MAX dims must not panic.
+        let r = TextureDesc {
+            width: u32::MAX,
+            height: u32::MAX,
+        }
+        .validate(&[]);
+        assert!(r.is_err());
     }
 }

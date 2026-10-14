@@ -22,7 +22,8 @@
 //! the `VkBuffer` for binding.
 
 use std::ffi::{CString, c_void};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 
 use ash::vk::Handle;
 use ash::{Entry, ext, khr, vk};
@@ -428,6 +429,29 @@ pub(crate) struct VulkanTextureInner {
     /// (an `ash::Device` is an Arc'd handle; cloning is the established
     /// idiom in this file).
     pub device: ash::Device,
+    /// Tombstone set by the backend's `Drop` before it destroys the
+    /// device — a texture dropped after its backend must NOT issue
+    /// destroys on a dead device (review round 1, P1); it leaks with a
+    /// stderr note instead, mirroring the Zunesha 0.1.2 discipline.
+    pub alive: Arc<AtomicBool>,
+    /// Backend-side registry of textures bound into the frame still being
+    /// recorded: a texture dropped while its recording is pending is
+    /// retired into the graveyard at that frame's completion instead of
+    /// destroyed out from under it (review round 1, P1).
+    pub bindings: Arc<Mutex<TextureBindings>>,
+}
+
+/// Textures with outstanding recordings, and deferred destructions.
+///
+/// `bound` collects the raw inner pointers bound by `draw_textured` into
+/// the CURRENT recording; the graveyard holds inners whose public handle
+/// dropped while still bound. Both are cleared/drained when a frame
+/// completes (phase commits to Idle) — that is the first moment no
+/// pending recording can reference a texture.
+#[derive(Default)]
+pub(crate) struct TextureBindings {
+    pub bound: std::collections::HashSet<usize>,
+    pub graveyard: Vec<VulkanTextureInner>,
 }
 
 /// Drop function stored in [`Texture`](crate::Texture) — drops the boxed inner
@@ -435,23 +459,63 @@ pub(crate) struct VulkanTextureInner {
 pub(crate) fn vulkan_texture_drop(raw: *mut c_void) {
     if !raw.is_null() {
         // Safety: `raw` was produced by `Box::into_raw::<VulkanTextureInner>`
-        // in `create_texture` and the backend (device) is still alive — the
-        // handle type documents the outlive contract.
+        // in `create_texture`.
+        //
+        // Two lifetime hazards are handled before any destroy
+        // (review round 1, P1s):
+        // 1. The backend may already be destroyed — the `alive` tombstone
+        //    is checked first and the texture LEAKS with a stderr note
+        //    rather than issuing destroys on a dead device.
+        // 2. The texture may still be bound into a pending recording —
+        //    its inner is moved into the backend's graveyard and
+        //    destroyed when the frame completes.
         unsafe {
             let inner = Box::from_raw(raw as *mut VulkanTextureInner);
-            debug_assert!(
-                inner.width > 0 && inner.height > 0,
-                "a created texture always has a non-zero extent",
-            );
-            // leak-safe: no DeviceWaitIdle here — the synchronous present
-            // contract guarantees in-flight frames completed (same argument
-            // as the pipeline and buffer drops).
-            inner.device.destroy_image_view(inner.view, None);
-            inner.device.destroy_sampler(inner.sampler, None);
-            inner.device.destroy_image(inner.image, None);
-            inner.device.free_memory(inner.memory, None);
-            inner.device.destroy_descriptor_pool(inner.pool, None);
+            if !inner.alive.load(std::sync::atomic::Ordering::Acquire) {
+                eprintln!(
+                    "goldenweek: a Texture outlived its backend; leaking its GPU resources (documented contract violation — see the Texture docs)"
+                );
+                std::mem::forget(inner);
+                return;
+            }
+            let key = raw as usize;
+            let bindings_arc = Arc::clone(&inner.bindings);
+            let in_flight = bindings_arc
+                .lock()
+                .expect("texture bindings lock")
+                .bound
+                .contains(&key);
+            if in_flight {
+                bindings_arc
+                    .lock()
+                    .expect("texture bindings lock")
+                    .graveyard
+                    .push(*inner);
+                return;
+            }
+            destroy_texture_inner(inner);
         }
+    }
+}
+
+/// Destroy a texture's resources — caller has verified the backend is
+/// alive and no recording references it.
+///
+/// Safety: `inner`'s device is alive and `inner.set`'s pool is `inner.pool`.
+unsafe fn destroy_texture_inner(inner: Box<VulkanTextureInner>) {
+    debug_assert!(
+        inner.width > 0 && inner.height > 0,
+        "a created texture always has a non-zero extent",
+    );
+    // leak-safe: no DeviceWaitIdle here — the caller has verified no
+    // pending recording references this texture (bound-set check at
+    // drop, drain at frame completion).
+    unsafe {
+        inner.device.destroy_image_view(inner.view, None);
+        inner.device.destroy_sampler(inner.sampler, None);
+        inner.device.destroy_image(inner.image, None);
+        inner.device.free_memory(inner.memory, None);
+        inner.device.destroy_descriptor_pool(inner.pool, None);
     }
 }
 
@@ -486,10 +550,24 @@ struct TextureScratch {
     sampler: Option<vk::Sampler>,
     command_pool: Option<vk::CommandPool>,
     descriptor_pool: Option<vk::DescriptorPool>,
+    /// Set when a SUBMITTED upload's fence wait failed: the submission is
+    /// still pending on the queue, so destroying anything it touches is
+    /// use-after-free. The guard then LEAKS deliberately (with a stderr
+    /// note) instead of destroying in-flight resources — the Zunesha
+    /// 0.1.2 `unconfirmed_submission` discipline (review round 1, P1).
+    leak: bool,
 }
 
 impl Drop for TextureScratch {
     fn drop(&mut self) {
+        // Leaked mode (upload wait failure with the submission pending):
+        // destroy NOTHING — the fence, command buffers, staging, and image
+        // are all in flight; the guard's whole purpose is to keep them
+        // alive by dropping the handles without destroying them (the
+        // stderr note at the failure site explains the leak).
+        if self.leak {
+            return;
+        }
         // Safety: every handle was created on `self.device` in
         // `create_texture` and, while still `Some`, is owned exclusively by
         // this guard — nothing else references it.
@@ -651,6 +729,14 @@ pub struct VulkanBackend<'a> {
     /// binding 0 is not expressible through naga's WGSL to SPIR-V path (see
     /// the M1 report).
     texture_set_layout: vk::DescriptorSetLayout,
+    /// Tombstone: false once the backend's `Drop` begins — a `Texture`
+    /// dropped after that leaks (with a stderr note) instead of destroying
+    /// on a dead device (review round 1, P1).
+    alive: Arc<AtomicBool>,
+    /// Textures bound into the current recording + deferred destructions
+    /// (see [`TextureBindings`]) — drained when a frame completes (phase
+    /// commits Idle).
+    texture_bindings: Arc<Mutex<TextureBindings>>,
     swapchain: vk::SwapchainKHR,
     /// Whether the current swapchain's images carry `TRANSFER_SRC` usage
     /// (required by [`Self::read_pixels`]). False on surfaces that do not
@@ -719,6 +805,16 @@ impl Drop for VulkanBackend<'_> {
             }
             for &view in &self.image_views {
                 self.device.destroy_image_view(view, None);
+            }
+            // Tombstone FIRST: any texture still alive at backend death
+            // must leak (noted) instead of destroying on the dying device
+            // (review round 1, P1). The graveyard's deferred inners are
+            // gone with the device too — their handles are device children
+            // the driver reclaims; only the Rust-side boxes are dropped.
+            self.alive.store(false, AtomicOrdering::Release);
+            if let Ok(mut bindings) = self.texture_bindings.lock() {
+                bindings.bound.clear();
+                bindings.graveyard.clear();
             }
             self.device.destroy_render_pass(self.render_pass, None);
             self.device.destroy_image_view(self.depth_view, None);
@@ -1106,6 +1202,8 @@ impl<'a> VulkanBackend<'a> {
             image_available,
             render_finished,
             texture_set_layout,
+            alive: Arc::new(AtomicBool::new(true)),
+            texture_bindings: Arc::new(Mutex::new(TextureBindings::default())),
         })
     }
 
@@ -1211,6 +1309,26 @@ impl<'a> VulkanBackend<'a> {
         }
         render.phase = RenderPhase::Flushed(index);
         Ok(())
+    }
+
+    /// Drain textures bound into the completed recording: clear the
+    /// bound set and destroy graveyard inners. Called at every Idle
+    /// commit — the first moment no pending recording can reference a
+    /// texture (review round 1, P1).
+    ///
+    /// Lock order: render lock (held by caller) → bindings lock. Never
+    /// the reverse (`vulkan_texture_drop` takes only the bindings lock).
+    fn drain_texture_bindings(&self) {
+        let drained: Vec<VulkanTextureInner> = {
+            let mut bindings = self.texture_bindings.lock().expect("texture bindings lock");
+            bindings.bound.clear();
+            std::mem::take(&mut bindings.graveyard)
+        };
+        for inner in drained {
+            // Safety: backend alive (caller holds render lock), no
+            // recording references these (drain point).
+            unsafe { destroy_texture_inner(Box::new(inner)) };
+        }
     }
 
     /// Fast-fail check for a backend poisoned by a failed frame recovery —
@@ -1946,6 +2064,7 @@ impl<'a> VulkanBackend<'a> {
             sampler: None,
             command_pool: None,
             descriptor_pool: None,
+            leak: false,
         };
 
         // 1. Staging: host-visible, HOST_COHERENT, TRANSFER_SRC. Hand-rolled
@@ -2019,8 +2138,12 @@ impl<'a> VulkanBackend<'a> {
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
-            .sharing_mode(vk::SharingMode::CONCURRENT)
-            .queue_family_indices(std::slice::from_ref(&self.graphics_queue_family))
+            // EXCLUSIVE: M1 images are touched only by the graphics
+            // family; CONCURRENT with a single family index is flagged by
+            // validation (00942) and gains nothing until cross-queue
+            // ownership lands (Zunesha ADR 0005 Phase 2's ledger) —
+            // review round 1, P1.
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         let image = unsafe { self.device.create_image(&image_ci, None) }.map_err(|e| {
             GraphicsError::TextureCreate {
@@ -2190,19 +2313,50 @@ impl<'a> VulkanBackend<'a> {
                 }
             })?;
             let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
-            let result = self
-                .device
-                .queue_submit(self.graphics_queue, std::slice::from_ref(&submit), fence)
-                .and_then(|()| {
+            // Serialize with all other graphics-queue users (the render
+            // state lock): Vulkan queues require external synchronization,
+            // and concurrent `create_texture` calls raced submissions
+            // (review round 1, P1). Uploads are init-time — blocking a
+            // concurrent frame briefly is the v0.1 contract.
+            let _render_guard = self.render.lock().expect("render state lock");
+            let submitted =
+                self.device
+                    .queue_submit(self.graphics_queue, std::slice::from_ref(&submit), fence);
+            match submitted {
+                Err(e) => {
+                    // The submission was not enqueued — the fence and
+                    // command buffer are idle and safe to release.
+                    self.device.destroy_fence(fence, None);
                     self.device
-                        .wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)
-                });
+                        .free_command_buffers(upload_pool, std::slice::from_ref(&cmd));
+                    return Err(GraphicsError::TextureUpload {
+                        message: format!("upload submit: {e}"),
+                    });
+                }
+                Ok(()) => {
+                    if let Err(e) =
+                        self.device
+                            .wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)
+                    {
+                        // The submission IS pending on the queue: destroying
+                        // the fence, the command buffer, the staging buffer,
+                        // or the image now is use-after-free. LEAK
+                        // everything deliberately (stderr note) — the Zunesha
+                        // 0.1.2 `unconfirmed_submission` discipline (review
+                        // round 1, P1).
+                        eprintln!(
+                            "goldenweek: texture upload fence wait failed ({e}); \nleaking upload resources (fence, command pool, staging, image) rather than destroying in-flight GPU work"
+                        );
+                        guard.leak = true;
+                        return Err(GraphicsError::TextureUpload {
+                            message: format!("upload wait: {e} (resources leaked)"),
+                        });
+                    }
+                }
+            }
             self.device.destroy_fence(fence, None);
             self.device
                 .free_command_buffers(upload_pool, std::slice::from_ref(&cmd));
-            result.map_err(|e| GraphicsError::TextureUpload {
-                message: format!("upload submit/wait: {e}"),
-            })?;
         }
         // The staging buffer has done its job — release it now rather than
         // holding host memory for the texture's lifetime.
@@ -2280,6 +2434,8 @@ impl<'a> VulkanBackend<'a> {
             image: guard.image.take().expect("texture image"),
             memory: guard.image_memory.take().expect("texture memory"),
             pool: guard.descriptor_pool.take().expect("descriptor pool"),
+            alive: Arc::clone(&self.alive),
+            bindings: Arc::clone(&self.texture_bindings),
             set,
             width: desc.width,
             height: desc.height,
@@ -2331,6 +2487,7 @@ impl<'a> VulkanBackend<'a> {
                     message: format!("stale-frame recovery: {e}"),
                 })?;
             render.phase = RenderPhase::Idle;
+            self.drain_texture_bindings();
         }
 
         let (index, _suboptimal) = unsafe {
@@ -2580,6 +2737,16 @@ impl<'a> VulkanBackend<'a> {
         }
 
         unsafe {
+            // Register the texture as bound into this recording: a public
+            // handle dropped before the frame completes must retire into
+            // the graveyard, not destroy out from under the pending
+            // recording (review round 1, P1). Cleared at the Idle drain.
+            // Lock order: render (held) → bindings — never reversed.
+            self.texture_bindings
+                .lock()
+                .expect("texture bindings lock")
+                .bound
+                .insert(texture.raw as usize);
             self.device.cmd_bind_pipeline(
                 render.cmd,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -2743,9 +2910,13 @@ impl<'a> VulkanBackend<'a> {
         // acquire's recovery presents it back instead of silently losing it
         // from the pool (rounds 8–9, P1).
         match present_result {
-            Ok(_) => render.phase = RenderPhase::Idle,
+            Ok(_) => {
+                render.phase = RenderPhase::Idle;
+                self.drain_texture_bindings();
+            }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::ERROR_SURFACE_LOST_KHR) => {
-                render.phase = RenderPhase::Idle
+                render.phase = RenderPhase::Idle;
+                self.drain_texture_bindings();
             }
             Err(e) => {
                 // Drain ONLY when this invocation signaled render_finished
