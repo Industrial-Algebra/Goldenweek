@@ -29,8 +29,8 @@ use ash::{Entry, ext, khr, vk};
 
 use crate::frame::{Frame, FrameInner};
 use crate::{
-    CullMode, GpuBuffer, GraphicsError, PipelineConfig, RenderPipeline, Result, SurfaceHandle,
-    Topology, VertexFormat,
+    CullMode, FilterMode, GpuBuffer, GraphicsError, PipelineConfig, RenderPipeline, Result,
+    SurfaceHandle, Texture, TextureDesc, Topology, VertexFormat,
 };
 use zunesha::Device;
 
@@ -410,6 +410,118 @@ pub(super) fn drop_zunesha_buffer_box(raw: *mut c_void) {
     }
 }
 
+/// Owning handle for an M1 texture's GPU resources. `raw` is what
+/// [`Texture::raw`](crate::Texture) carries (boxed); the drop function
+/// destroys in dependency-safe order: view, sampler, image, memory, then the
+/// descriptor pool (which frees its sets).
+pub(crate) struct VulkanTextureInner {
+    pub view: vk::ImageView,
+    pub sampler: vk::Sampler,
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub pool: vk::DescriptorPool,
+    pub set: vk::DescriptorSet,
+    pub width: u32,
+    pub height: u32,
+    /// Cloned device handle so a boxed inner can destroy its own Vulkan
+    /// objects on drop — the same pattern [`VulkanPipelineInner`] uses
+    /// (an `ash::Device` is an Arc'd handle; cloning is the established
+    /// idiom in this file).
+    pub device: ash::Device,
+}
+
+/// Drop function stored in [`Texture`](crate::Texture) — drops the boxed inner
+/// and its Vulkan objects.
+pub(crate) fn vulkan_texture_drop(raw: *mut c_void) {
+    if !raw.is_null() {
+        // Safety: `raw` was produced by `Box::into_raw::<VulkanTextureInner>`
+        // in `create_texture` and the backend (device) is still alive — the
+        // handle type documents the outlive contract.
+        unsafe {
+            let inner = Box::from_raw(raw as *mut VulkanTextureInner);
+            debug_assert!(
+                inner.width > 0 && inner.height > 0,
+                "a created texture always has a non-zero extent",
+            );
+            // leak-safe: no DeviceWaitIdle here — the synchronous present
+            // contract guarantees in-flight frames completed (same argument
+            // as the pipeline and buffer drops).
+            inner.device.destroy_image_view(inner.view, None);
+            inner.device.destroy_sampler(inner.sampler, None);
+            inner.device.destroy_image(inner.image, None);
+            inner.device.free_memory(inner.memory, None);
+            inner.device.destroy_descriptor_pool(inner.pool, None);
+        }
+    }
+}
+
+/// Find a memory type index satisfying `required` among the `bits` mask.
+fn find_memory_type(
+    props: &vk::PhysicalDeviceMemoryProperties,
+    bits: u32,
+    required: vk::MemoryPropertyFlags,
+) -> Option<u32> {
+    (0..props.memory_type_count).find(|&i| {
+        bits & (1 << i) != 0
+            && props.memory_types[i as usize]
+                .property_flags
+                .contains(required)
+    })
+}
+
+/// RAII cleanup for `create_texture`'s partial construction.
+///
+/// Every handle is set the moment it is created — before the next fallible
+/// call — so a failure at any later `?` destroys exactly what exists so far
+/// (in dependency-safe order) on the caller's device. On success the fields
+/// are `take()`n into the returned [`VulkanTextureInner`] and `Drop` becomes a
+/// no-op for them.
+struct TextureScratch {
+    device: ash::Device,
+    staging: Option<vk::Buffer>,
+    staging_memory: Option<vk::DeviceMemory>,
+    image: Option<vk::Image>,
+    image_memory: Option<vk::DeviceMemory>,
+    view: Option<vk::ImageView>,
+    sampler: Option<vk::Sampler>,
+    command_pool: Option<vk::CommandPool>,
+    descriptor_pool: Option<vk::DescriptorPool>,
+}
+
+impl Drop for TextureScratch {
+    fn drop(&mut self) {
+        // Safety: every handle was created on `self.device` in
+        // `create_texture` and, while still `Some`, is owned exclusively by
+        // this guard — nothing else references it.
+        unsafe {
+            if let Some(pool) = self.descriptor_pool {
+                self.device.destroy_descriptor_pool(pool, None);
+            }
+            if let Some(pool) = self.command_pool {
+                self.device.destroy_command_pool(pool, None);
+            }
+            if let Some(sampler) = self.sampler {
+                self.device.destroy_sampler(sampler, None);
+            }
+            if let Some(view) = self.view {
+                self.device.destroy_image_view(view, None);
+            }
+            if let Some(memory) = self.image_memory {
+                self.device.free_memory(memory, None);
+            }
+            if let Some(image) = self.image {
+                self.device.destroy_image(image, None);
+            }
+            if let Some(memory) = self.staging_memory {
+                self.device.free_memory(memory, None);
+            }
+            if let Some(buffer) = self.staging {
+                self.device.destroy_buffer(buffer, None);
+            }
+        }
+    }
+}
+
 // ── Constructor cleanup guard ──────────────────────────────────────
 
 /// RAII cleanup for `VulkanBackend::new`'s partial construction.
@@ -437,6 +549,7 @@ struct InitScratch<'a> {
     fence: Option<vk::Fence>,
     image_available: Option<vk::Semaphore>,
     render_finished: Option<vk::Semaphore>,
+    texture_set_layout: Option<vk::DescriptorSetLayout>,
 }
 
 impl InitScratch<'_> {
@@ -453,6 +566,7 @@ impl InitScratch<'_> {
         self.fence = None;
         self.image_available = None;
         self.render_finished = None;
+        self.texture_set_layout = None;
     }
 }
 
@@ -493,6 +607,9 @@ impl Drop for InitScratch<'_> {
             if let Some(pool) = self.command_pool {
                 self.device.destroy_command_pool(pool, None);
             }
+            if let Some(layout) = self.texture_set_layout {
+                self.device.destroy_descriptor_set_layout(layout, None);
+            }
             if self.swapchain != vk::SwapchainKHR::null() {
                 self.swapchain_fn.destroy_swapchain(self.swapchain, None);
             }
@@ -526,6 +643,14 @@ pub struct VulkanBackend<'a> {
     /// `VK_KHR_swapchain` device functions.
     swapchain_fn: khr::swapchain::Device,
     surface: vk::SurfaceKHR,
+    /// Descriptor set layout for the M1 texture set (set 0): the sampled
+    /// image at binding 0 and its sampler at binding 1 — the split naga
+    /// emits for WGSL's separate `texture_2d` and `sampler` globals. It is
+    /// declared on every render pipeline layout; shaders that don't sample
+    /// simply never reference the set, which is valid. A single combined
+    /// binding 0 is not expressible through naga's WGSL to SPIR-V path (see
+    /// the M1 report).
+    texture_set_layout: vk::DescriptorSetLayout,
     swapchain: vk::SwapchainKHR,
     /// Whether the current swapchain's images carry `TRANSFER_SRC` usage
     /// (required by [`Self::read_pixels`]). False on surfaces that do not
@@ -601,6 +726,8 @@ impl Drop for VulkanBackend<'_> {
             self.device.free_memory(self.depth_memory, None);
             self.device.destroy_semaphore(self.image_available, None);
             self.device.destroy_semaphore(self.render_finished, None);
+            self.device
+                .destroy_descriptor_set_layout(self.texture_set_layout, None);
             self.device.destroy_command_pool(self.command_pool, None);
             // Null after a failed recreate destroyed the retired swapchain
             // (round 2, P1) — never double-destroy.
@@ -750,7 +877,31 @@ impl<'a> VulkanBackend<'a> {
             fence: None,
             image_available: None,
             render_finished: None,
+            texture_set_layout: None,
         };
+
+        // Texture set layout (M1): set 0 declares the sampled image at
+        // binding 0 and its sampler at binding 1 — the shape naga's
+        // WGSL→SPIR-V path produces for separate `texture_2d` + `sampler`
+        // globals. Registered with the guard before the next fallible call.
+        let texture_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        let dsl_ci = vk::DescriptorSetLayoutCreateInfo::default().bindings(&texture_bindings);
+        let texture_set_layout = unsafe { logical.create_descriptor_set_layout(&dsl_ci, None) }
+            .map_err(|e| GraphicsError::TextureCreate {
+                message: format!("descriptor set layout: {e}"),
+            })?;
+        scratch.texture_set_layout = Some(texture_set_layout);
 
         // Image views + render pass + framebuffers — the swapchain's rendering
         // surface. One framebuffer per swapchain image, all sized to `extent`.
@@ -954,6 +1105,7 @@ impl<'a> VulkanBackend<'a> {
             graphics_queue_family: graphics.family_index,
             image_available,
             render_finished,
+            texture_set_layout,
         })
     }
 
@@ -1358,6 +1510,9 @@ impl<'a> VulkanBackend<'a> {
             fence: None,
             image_available: None,
             render_finished: None,
+            // The texture set layout is owned by the backend and survives
+            // swapchain recreation — the scratch never destroys it.
+            texture_set_layout: None,
         };
 
         let create_info = vk::SwapchainCreateInfoKHR::default()
@@ -1681,9 +1836,11 @@ impl<'a> VulkanBackend<'a> {
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
-        // Empty layout: v0.1 pipelines take no descriptors and no push
-        // constants.
-        let layout_ci = vk::PipelineLayoutCreateInfo::default();
+        // Every layout declares set 0 (the M1 texture set): shaders that
+        // don't sample never reference it (legal); `draw_textured` binds it
+        // for those that do.
+        let set_layouts = [self.texture_set_layout];
+        let layout_ci = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
         let layout =
             unsafe { self.device.create_pipeline_layout(&layout_ci, None) }.map_err(|e| {
                 GraphicsError::PipelineFailed {
@@ -1751,6 +1908,388 @@ impl<'a> VulkanBackend<'a> {
             raw: Box::into_raw(Box::new(buffer)) as *mut c_void,
             len,
             drop_fn: drop_zunesha_buffer_box,
+        })
+    }
+
+    /// Create an immutable RGBA8 texture and upload `data` — M1.
+    ///
+    /// One call, one state machine: validate → stage → create image
+    /// resources → upload (synchronous submit-and-wait on the graphics
+    /// queue via a transient pool) → build the descriptor set. The texture
+    /// is immediately sampleable when this returns.
+    ///
+    /// The texture's descriptor set is declared against `self.texture_set_layout`:
+    /// binding 0 is the sampled image and binding 1 its sampler (the split
+    /// naga emits for WGSL's separate `texture_2d` + `sampler` globals).
+    pub fn create_texture(
+        &self,
+        desc: &TextureDesc,
+        data: &[u8],
+        filter: FilterMode,
+    ) -> Result<Texture> {
+        // `validate` also fixes the payload length (`w * h * 4`).
+        desc.validate(data)
+            .map_err(|e| GraphicsError::InvalidArgument {
+                message: e.to_string(),
+            })?;
+
+        let instance = self.zunesha_device.raw_instance();
+        let memory_props =
+            unsafe { instance.get_physical_device_memory_properties(self.physical_device) };
+        let mut guard = TextureScratch {
+            device: self.device.clone(),
+            staging: None,
+            staging_memory: None,
+            image: None,
+            image_memory: None,
+            view: None,
+            sampler: None,
+            command_pool: None,
+            descriptor_pool: None,
+        };
+
+        // 1. Staging: host-visible, HOST_COHERENT, TRANSFER_SRC. Hand-rolled
+        //    (a transient internal detail — the zunesha::Buffer seam stays
+        //    for compute-shared buffers).
+        let staging_ci = vk::BufferCreateInfo::default()
+            .size(data.len() as u64)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let staging = unsafe { self.device.create_buffer(&staging_ci, None) }.map_err(|e| {
+            GraphicsError::TextureCreate {
+                message: format!("staging buffer: {e}"),
+            }
+        })?;
+        guard.staging = Some(staging);
+        let staging_req = unsafe { self.device.get_buffer_memory_requirements(staging) };
+        let staging_type = find_memory_type(
+            &memory_props,
+            staging_req.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+        .ok_or_else(|| GraphicsError::TextureCreate {
+            message: "no host-visible, host-coherent memory type for staging".into(),
+        })?;
+        let staging_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(staging_req.size)
+            .memory_type_index(staging_type);
+        let staging_memory =
+            unsafe { self.device.allocate_memory(&staging_alloc, None) }.map_err(|e| {
+                GraphicsError::TextureCreate {
+                    message: format!("staging memory: {e}"),
+                }
+            })?;
+        guard.staging_memory = Some(staging_memory);
+        unsafe { self.device.bind_buffer_memory(staging, staging_memory, 0) }.map_err(|e| {
+            GraphicsError::TextureCreate {
+                message: format!("bind staging memory: {e}"),
+            }
+        })?;
+        unsafe {
+            let ptr = self
+                .device
+                .map_memory(
+                    staging_memory,
+                    0,
+                    staging_req.size,
+                    vk::MemoryMapFlags::empty(),
+                )
+                .map_err(|e| GraphicsError::TextureCreate {
+                    message: format!("map staging memory: {e}"),
+                })?;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.cast::<u8>(), data.len());
+            self.device.unmap_memory(staging_memory);
+        }
+
+        // 2. Image + memory + view + sampler.
+        let subresource = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
+        let image_ci = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .extent(vk::Extent3D {
+                width: desc.width,
+                height: desc.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::CONCURRENT)
+            .queue_family_indices(std::slice::from_ref(&self.graphics_queue_family))
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { self.device.create_image(&image_ci, None) }.map_err(|e| {
+            GraphicsError::TextureCreate {
+                message: format!("texture image: {e}"),
+            }
+        })?;
+        guard.image = Some(image);
+        let image_req = unsafe { self.device.get_image_memory_requirements(image) };
+        let image_type = find_memory_type(
+            &memory_props,
+            image_req.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .ok_or_else(|| GraphicsError::TextureCreate {
+            message: "no device-local memory type for texture".into(),
+        })?;
+        let image_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(image_req.size)
+            .memory_type_index(image_type);
+        let image_memory =
+            unsafe { self.device.allocate_memory(&image_alloc, None) }.map_err(|e| {
+                GraphicsError::TextureCreate {
+                    message: format!("texture memory: {e}"),
+                }
+            })?;
+        guard.image_memory = Some(image_memory);
+        unsafe { self.device.bind_image_memory(image, image_memory, 0) }.map_err(|e| {
+            GraphicsError::TextureCreate {
+                message: format!("bind texture memory: {e}"),
+            }
+        })?;
+        let view_ci = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .subresource_range(subresource);
+        let view = unsafe { self.device.create_image_view(&view_ci, None) }.map_err(|e| {
+            GraphicsError::TextureCreate {
+                message: format!("texture view: {e}"),
+            }
+        })?;
+        guard.view = Some(view);
+        let filter_vk = match filter {
+            FilterMode::Nearest => vk::Filter::NEAREST,
+            FilterMode::Linear => vk::Filter::LINEAR,
+        };
+        let sampler_ci = vk::SamplerCreateInfo::default()
+            .mag_filter(filter_vk)
+            .min_filter(filter_vk)
+            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .mip_lod_bias(0.0)
+            .anisotropy_enable(false)
+            .max_anisotropy(1.0)
+            .compare_enable(false)
+            .min_lod(0.0)
+            .max_lod(0.0)
+            .border_color(vk::BorderColor::FLOAT_OPAQUE_BLACK)
+            .unnormalized_coordinates(false);
+        let sampler = unsafe { self.device.create_sampler(&sampler_ci, None) }.map_err(|e| {
+            GraphicsError::TextureCreate {
+                message: format!("texture sampler: {e}"),
+            }
+        })?;
+        guard.sampler = Some(sampler);
+
+        // 3. Upload (synchronous, one-shot, transient pool + fence).
+        let pool_ci = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::TRANSIENT)
+            .queue_family_index(self.graphics_queue_family);
+        let upload_pool =
+            unsafe { self.device.create_command_pool(&pool_ci, None) }.map_err(|e| {
+                GraphicsError::TextureUpload {
+                    message: format!("upload command pool: {e}"),
+                }
+            })?;
+        guard.command_pool = Some(upload_pool);
+        let cb_ci = vk::CommandBufferAllocateInfo::default()
+            .command_pool(upload_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cmd = unsafe { self.device.allocate_command_buffers(&cb_ci) }
+            .map_err(|e| GraphicsError::TextureUpload {
+                message: format!("upload command buffer: {e}"),
+            })?
+            .first()
+            .copied()
+            .ok_or_else(|| GraphicsError::TextureUpload {
+                message: "no upload command buffer allocated".into(),
+            })?;
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        let to_transfer = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(subresource);
+        let to_shader = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(subresource);
+        let copy = vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D {
+                width: desc.width,
+                height: desc.height,
+                depth: 1,
+            });
+        unsafe {
+            self.device.begin_command_buffer(cmd, &begin).map_err(|e| {
+                GraphicsError::TextureUpload {
+                    message: format!("upload begin: {e}"),
+                }
+            })?;
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_transfer),
+            );
+            self.device.cmd_copy_buffer_to_image(
+                cmd,
+                staging,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                std::slice::from_ref(&copy),
+            );
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_shader),
+            );
+            self.device
+                .end_command_buffer(cmd)
+                .map_err(|e| GraphicsError::TextureUpload {
+                    message: format!("upload end: {e}"),
+                })?;
+            let fence_ci = vk::FenceCreateInfo::default();
+            let fence = self.device.create_fence(&fence_ci, None).map_err(|e| {
+                GraphicsError::TextureUpload {
+                    message: format!("upload fence: {e}"),
+                }
+            })?;
+            let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+            let result = self
+                .device
+                .queue_submit(self.graphics_queue, std::slice::from_ref(&submit), fence)
+                .and_then(|()| {
+                    self.device
+                        .wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)
+                });
+            self.device.destroy_fence(fence, None);
+            self.device
+                .free_command_buffers(upload_pool, std::slice::from_ref(&cmd));
+            result.map_err(|e| GraphicsError::TextureUpload {
+                message: format!("upload submit/wait: {e}"),
+            })?;
+        }
+        // The staging buffer has done its job — release it now rather than
+        // holding host memory for the texture's lifetime.
+        if let Some(memory) = guard.staging_memory.take() {
+            unsafe { self.device.free_memory(memory, None) };
+        }
+        if let Some(buffer) = guard.staging.take() {
+            unsafe { self.device.destroy_buffer(buffer, None) };
+        }
+
+        // 4. Descriptor pool + set (the pool is destroyed at texture drop,
+        //    which frees the set — no per-backend pool-exhaustion state).
+        let pool_sizes = [
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::SAMPLED_IMAGE,
+                descriptor_count: 1,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::SAMPLER,
+                descriptor_count: 1,
+            },
+        ];
+        let descriptor_pool_ci = vk::DescriptorPoolCreateInfo::default()
+            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
+            .max_sets(1)
+            .pool_sizes(&pool_sizes);
+        let descriptor_pool = unsafe {
+            self.device
+                .create_descriptor_pool(&descriptor_pool_ci, None)
+        }
+        .map_err(|e| GraphicsError::TextureCreate {
+            message: format!("descriptor pool: {e}"),
+        })?;
+        guard.descriptor_pool = Some(descriptor_pool);
+        let set_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(std::slice::from_ref(&self.texture_set_layout));
+        let set = unsafe { self.device.allocate_descriptor_sets(&set_alloc) }
+            .map_err(|e| GraphicsError::TextureCreate {
+                message: format!("descriptor set: {e}"),
+            })?
+            .first()
+            .copied()
+            .ok_or_else(|| GraphicsError::TextureCreate {
+                message: "no descriptor set allocated".into(),
+            })?;
+        let image_info = vk::DescriptorImageInfo {
+            sampler: vk::Sampler::null(),
+            image_view: view,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        };
+        let sampler_info = vk::DescriptorImageInfo {
+            sampler,
+            image_view: vk::ImageView::null(),
+            image_layout: vk::ImageLayout::UNDEFINED,
+        };
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(std::slice::from_ref(&image_info)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(std::slice::from_ref(&sampler_info)),
+        ];
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+
+        // 5. Box the inner and hand it to the opaque handle.
+        let inner = Box::new(VulkanTextureInner {
+            view: guard.view.take().expect("texture view"),
+            sampler: guard.sampler.take().expect("texture sampler"),
+            image: guard.image.take().expect("texture image"),
+            memory: guard.image_memory.take().expect("texture memory"),
+            pool: guard.descriptor_pool.take().expect("descriptor pool"),
+            set,
+            width: desc.width,
+            height: desc.height,
+            device: self.device.clone(),
+        });
+        Ok(Texture {
+            raw: Box::into_raw(inner) as *mut c_void,
+            width: desc.width,
+            height: desc.height,
+            drop_fn: vulkan_texture_drop,
         })
     }
 
@@ -1989,6 +2528,71 @@ impl<'a> VulkanBackend<'a> {
                 render.cmd,
                 vk::PipelineBindPoint::GRAPHICS,
                 pipeline_inner.pipeline,
+            );
+            self.device.cmd_bind_vertex_buffers(
+                render.cmd,
+                0,
+                std::slice::from_ref(&vertex_buffer),
+                &[0],
+            );
+            self.device.cmd_draw(render.cmd, vertex_count, 1, 0, 0);
+        }
+        Ok(())
+    }
+
+    /// Record a textured draw call into `frame` — M1. Identical guards to
+    /// [`Self::draw`]; additionally binds `texture`'s descriptor set (set 0)
+    /// before the vertex bind and draw.
+    pub fn draw_textured(
+        &self,
+        frame: &mut Frame,
+        pipeline: &RenderPipeline,
+        vertices: &GpuBuffer,
+        vertex_count: u32,
+        texture: &Texture,
+    ) -> Result<()> {
+        let Some(frame_index) = frame.peek_index() else {
+            return Err(GraphicsError::InvalidDraw {
+                message: "frame has no acquired image (already presented?)".into(),
+            });
+        };
+        let pipeline_inner =
+            // Safety: `raw` was produced by `Box::into_raw::<VulkanPipelineInner>`
+            // in `compile_render_pipeline` and is still valid.
+            unsafe { &*(pipeline.raw as *const VulkanPipelineInner) };
+        // Safety: `raw` was produced by `Box::into_raw::<zunesha::Buffer>` in
+        // `create_buffer` and is still valid.
+        let zunesha_buffer = unsafe { &*(vertices.raw as *const zunesha::Buffer) };
+        let vertex_buffer = self.zunesha_device.raw_buffer(zunesha_buffer);
+        // Safety: `raw` was produced by `Box::into_raw::<VulkanTextureInner>`
+        // in `create_texture` and is still valid.
+        let texture_inner = unsafe { &*(texture.raw as *const VulkanTextureInner) };
+
+        let render = self.render.lock().expect("render state lock");
+        Self::check_not_broken(&render)?;
+        if !matches!(render.phase, RenderPhase::Open(i) if i == frame_index) {
+            return Err(GraphicsError::InvalidDraw {
+                message: format!(
+                    "frame {frame_index} is not the frame being recorded ({:?})",
+                    render.phase
+                ),
+            });
+        }
+
+        unsafe {
+            self.device.cmd_bind_pipeline(
+                render.cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_inner.pipeline,
+            );
+            // Set 0 = the texture set (binding 0 image, binding 1 sampler).
+            self.device.cmd_bind_descriptor_sets(
+                render.cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_inner.layout,
+                0,
+                std::slice::from_ref(&texture_inner.set),
+                &[],
             );
             self.device.cmd_bind_vertex_buffers(
                 render.cmd,
@@ -2435,6 +3039,26 @@ impl crate::GraphicsBackend for VulkanBackend<'_> {
 
     fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<GpuBuffer> {
         VulkanBackend::create_buffer(self, data)
+    }
+
+    fn create_texture(
+        &self,
+        desc: &TextureDesc,
+        data: &[u8],
+        filter: FilterMode,
+    ) -> Result<Texture> {
+        VulkanBackend::create_texture(self, desc, data, filter)
+    }
+
+    fn draw_textured(
+        &self,
+        frame: &mut Frame,
+        pipeline: &RenderPipeline,
+        vertices: &GpuBuffer,
+        vertex_count: u32,
+        texture: &Texture,
+    ) -> Result<()> {
+        VulkanBackend::draw_textured(self, frame, pipeline, vertices, vertex_count, texture)
     }
 
     fn acquire_frame(&self) -> Result<Frame> {
@@ -3145,5 +3769,223 @@ fn fs_main() -> @location(0) vec4<f32> {
             Err(GraphicsError::InvalidDraw { .. })
         ));
         // `_current` is dropped unpresented below — safe by design.
+    }
+
+    // ── M1: textures & sampled images ───────────────────────────────
+
+    /// Textured vertex shader: `pos` + `uv` in, interpolated `uv` out.
+    const TEXTURED_VERT: &str = r#"
+struct VOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(1) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>) -> VOut {
+    return VOut(vec4<f32>(pos, 0.0, 1.0), uv);
+}
+"#;
+
+    /// Textured fragment shader. naga emits separate SPIR-V bindings for
+    /// WGSL's separate `texture_2d` + `sampler` globals, so the set layout
+    /// declares the image at binding 0 and the sampler at binding 1.
+    const TEXTURED_FRAG: &str = r#"
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+
+@fragment
+fn fs_main(@location(1) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    return textureSample(tex, samp, uv);
+}
+"#;
+
+    /// The four-texel verification palette (RGBA8, row-major, top-left
+    /// origin): red, green / blue, yellow.
+    const QUAD_TEXELS: [u8; 16] = [
+        255, 0, 0, 255, // red
+        0, 255, 0, 255, // green
+        0, 0, 255, 255, // blue
+        255, 255, 0, 255, // yellow
+    ];
+
+    /// The fullscreen textured quad (triangle strip, NDC y-up, UV top-left
+    /// origin): `(x, y, u, v)` per vertex, matching [`TEXTURED_VERT`].
+    const QUAD_VERTICES: [f32; 16] = [
+        -1.0, -1.0, 0.0, 1.0, // bottom-left
+        1.0, -1.0, 1.0, 1.0, // bottom-right
+        -1.0, 1.0, 0.0, 0.0, // top-left
+        1.0, 1.0, 1.0, 0.0, // top-right
+    ];
+
+    /// Vertex layout for [`TEXTURED_VERT`]: `vec2<f32>` position at loc 0,
+    /// `vec2<f32>` uv at loc 1.
+    fn textured_config() -> PipelineConfig {
+        PipelineConfig {
+            topology: Topology::TriangleStrip,
+            cull_mode: CullMode::None,
+            depth: None,
+            blend: None,
+            vertex_layout: crate::VertexLayout {
+                stride: 16,
+                attributes: vec![
+                    crate::VertexAttribute {
+                        location: 0,
+                        offset: 0,
+                        format: VertexFormat::Float32x2,
+                    },
+                    crate::VertexAttribute {
+                        location: 1,
+                        offset: 8,
+                        format: VertexFormat::Float32x2,
+                    },
+                ],
+            },
+        }
+    }
+
+    /// Reorder a texel's RGBA bytes into the swapchain readback order
+    /// (B8G8R8A8 readback is BGRA; anything else is treated as RGBA).
+    fn readback_texel(backend: &VulkanBackend<'_>, texel: [u8; 4]) -> [u8; 4] {
+        match backend.format() {
+            vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => {
+                [texel[2], texel[1], texel[0], texel[3]]
+            }
+            _ => texel,
+        }
+    }
+
+    /// M1: a 2×2 RGBA8 texture drawn as a fullscreen quad samples four
+    /// distinct texels in the four quadrants — a binding/layout bug that
+    /// samples the wrong texel fails positionally.
+    #[test]
+    #[serial]
+    fn textured_quad_samples_exact_texels() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let pipeline = backend
+            .compile_render_pipeline(
+                "vs_main",
+                TEXTURED_VERT,
+                "fs_main",
+                TEXTURED_FRAG,
+                &textured_config(),
+            )
+            .expect("textured pipeline");
+        let texture = backend
+            .create_texture(
+                &crate::TextureDesc {
+                    width: 2,
+                    height: 2,
+                },
+                &QUAD_TEXELS,
+                crate::FilterMode::Nearest,
+            )
+            .expect("create_texture");
+        let vb = backend.create_buffer(&QUAD_VERTICES).expect("quad vb");
+
+        let mut frame = backend.acquire_frame().expect("acquire");
+        backend
+            .draw_textured(&mut frame, &pipeline, &vb, 4, &texture)
+            .expect("draw_textured");
+        let pixels = backend.read_pixels(&frame).expect("read_pixels");
+        backend.present(frame).expect("present");
+
+        let w = backend.extent().width as usize;
+        let h = backend.extent().height as usize;
+        let px = |x: usize, y: usize| -> [u8; 4] {
+            let o = (y * w + x) * 4;
+            [pixels[o], pixels[o + 1], pixels[o + 2], pixels[o + 3]]
+        };
+        let tl = px(w / 4, h / 4);
+        let tr = px(3 * w / 4, h / 4);
+        let bl = px(w / 4, 3 * h / 4);
+        let br = px(3 * w / 4, 3 * h / 4);
+        println!(
+            "quadrants: TL={tl:?} TR={tr:?} BL={bl:?} BR={br:?} (format {:?})",
+            backend.format()
+        );
+        // Top-left quadrant samples texel 0 (red), top-right texel 1
+        // (green), bottom-left texel 2 (blue), bottom-right texel 3
+        // (yellow) — channel-order-aware.
+        assert_eq!(
+            tl,
+            readback_texel(&backend, [255, 0, 0, 255]),
+            "TL quadrant must sample the red texel"
+        );
+        assert_eq!(
+            tr,
+            readback_texel(&backend, [0, 255, 0, 255]),
+            "TR quadrant must sample the green texel"
+        );
+        assert_eq!(
+            bl,
+            readback_texel(&backend, [0, 0, 255, 255]),
+            "BL quadrant must sample the blue texel"
+        );
+        assert_eq!(
+            br,
+            readback_texel(&backend, [255, 255, 0, 255]),
+            "BR quadrant must sample the yellow texel"
+        );
+    }
+
+    /// M1: `draw_textured` shares `draw`'s frame-lifecycle guard — after a
+    /// `read_pixels` flush the phase is Flushed, not Open, so a textured
+    /// draw must be rejected with `InvalidDraw`.
+    #[test]
+    #[serial]
+    fn draw_textured_rejects_non_open_phase() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let pipeline = backend
+            .compile_render_pipeline(
+                "vs_main",
+                TEXTURED_VERT,
+                "fs_main",
+                TEXTURED_FRAG,
+                &textured_config(),
+            )
+            .expect("textured pipeline");
+        let texture = backend
+            .create_texture(
+                &crate::TextureDesc {
+                    width: 2,
+                    height: 2,
+                },
+                &QUAD_TEXELS,
+                crate::FilterMode::Nearest,
+            )
+            .expect("create_texture");
+        let vb = backend.create_buffer(&QUAD_VERTICES).expect("quad vb");
+
+        let mut frame = backend.acquire_frame().expect("acquire");
+        // Flush the recording: phase becomes Flushed, so draw_textured must
+        // reject the frame.
+        let _ = backend.read_pixels(&frame).expect("readback flush");
+        assert!(matches!(
+            backend.draw_textured(&mut frame, &pipeline, &vb, 4, &texture),
+            Err(GraphicsError::InvalidDraw { .. })
+        ));
+        // `frame` is dropped Flushed but unpresented — safe by design.
+    }
+
+    /// M1: a payload whose length is not `w * h * 4` is refused before any
+    /// GPU work, as `InvalidArgument`.
+    #[test]
+    #[serial]
+    fn texture_creation_rejects_bad_payload() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        assert!(matches!(
+            backend.create_texture(
+                &crate::TextureDesc {
+                    width: 2,
+                    height: 2,
+                },
+                &[0u8; 15],
+                crate::FilterMode::Nearest,
+            ),
+            Err(GraphicsError::InvalidArgument { .. })
+        ));
     }
 }

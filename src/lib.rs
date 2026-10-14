@@ -380,7 +380,6 @@ impl Drop for GpuBuffer {
     }
 }
 
-
 // ── Textures (M1) ─────────────────────────────────────────────────
 
 /// Description of an immutable texture to create (M1).
@@ -395,8 +394,9 @@ impl Drop for GpuBuffer {
 /// `len == width * height * 4`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextureDesc {
-    /// Extent in texels. Both dimensions must be non-zero.
+    /// Width in texels. Both dimensions must be non-zero.
     pub width: u32,
+    /// Height in texels.
     pub height: u32,
 }
 
@@ -430,7 +430,7 @@ impl TextureDesc {
     }
 }
 
-/// Texel filtering for a [`Texture`](crate::Texture)'s sampler.
+/// Texel filtering for a [`Texture`]'s sampler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FilterMode {
     /// Nearest-neighbour — exact texel reads (verification images,
@@ -748,15 +748,50 @@ mod tests {
 
     #[test]
     fn texture_desc_rejects_zero_extent() {
-        assert!(TextureDesc { width: 0, height: 2 }.validate(&[0u8; 8]).is_err());
-        assert!(TextureDesc { width: 2, height: 0 }.validate(&[0u8; 8]).is_err());
+        assert!(
+            TextureDesc {
+                width: 0,
+                height: 2
+            }
+            .validate(&[0u8; 8])
+            .is_err()
+        );
+        assert!(
+            TextureDesc {
+                width: 2,
+                height: 0
+            }
+            .validate(&[0u8; 8])
+            .is_err()
+        );
     }
 
     #[test]
     fn texture_desc_rejects_bad_stride() {
         // RGBA8: len must be exactly w * h * 4.
-        assert!(TextureDesc { width: 2, height: 2 }.validate(&[0u8; 15]).is_err());
-        assert!(TextureDesc { width: 2, height: 2 }.validate(&[0u8; 17]).is_err());
-        assert!(TextureDesc { width: 2, height: 2 }.validate(&[0u8; 16]).is_ok());
+        assert!(
+            TextureDesc {
+                width: 2,
+                height: 2
+            }
+            .validate(&[0u8; 15])
+            .is_err()
+        );
+        assert!(
+            TextureDesc {
+                width: 2,
+                height: 2
+            }
+            .validate(&[0u8; 17])
+            .is_err()
+        );
+        assert!(
+            TextureDesc {
+                width: 2,
+                height: 2
+            }
+            .validate(&[0u8; 16])
+            .is_ok()
+        );
     }
 }
