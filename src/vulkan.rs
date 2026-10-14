@@ -469,30 +469,31 @@ pub(crate) fn vulkan_texture_drop(raw: *mut c_void) {
         // 2. The texture may still be bound into a pending recording —
         //    its inner is moved into the backend's graveyard and
         //    destroyed when the frame completes.
+        // The ENTIRE decision + destroy sequence runs under the bindings
+        // lock, and the backend's `Drop` sets the `alive` tombstone under
+        // the SAME lock before tearing the device down — so a drop racing
+        // backend teardown either completes its destroys while the device
+        // is still alive (this path won the lock first) or observes
+        // `alive == false` and leaks. The check alone was racy (review
+        // round 2, P1).
         unsafe {
             let inner = Box::from_raw(raw as *mut VulkanTextureInner);
+            let key = raw as usize;
+            let bindings_arc = Arc::clone(&inner.bindings);
+            let mut bindings = bindings_arc.lock().expect("texture bindings lock");
             if !inner.alive.load(std::sync::atomic::Ordering::Acquire) {
+                drop(bindings);
                 eprintln!(
                     "goldenweek: a Texture outlived its backend; leaking its GPU resources (documented contract violation — see the Texture docs)"
                 );
                 std::mem::forget(inner);
                 return;
             }
-            let key = raw as usize;
-            let bindings_arc = Arc::clone(&inner.bindings);
-            let in_flight = bindings_arc
-                .lock()
-                .expect("texture bindings lock")
-                .bound
-                .contains(&key);
-            if in_flight {
-                bindings_arc
-                    .lock()
-                    .expect("texture bindings lock")
-                    .graveyard
-                    .push(*inner);
+            if bindings.bound.contains(&key) {
+                bindings.graveyard.push(*inner);
                 return;
             }
+            drop(bindings);
             destroy_texture_inner(inner);
         }
     }
@@ -806,15 +807,25 @@ impl Drop for VulkanBackend<'_> {
             for &view in &self.image_views {
                 self.device.destroy_image_view(view, None);
             }
-            // Tombstone FIRST: any texture still alive at backend death
-            // must leak (noted) instead of destroying on the dying device
-            // (review round 1, P1). The graveyard's deferred inners are
-            // gone with the device too — their handles are device children
-            // the driver reclaims; only the Rust-side boxes are dropped.
-            self.alive.store(false, AtomicOrdering::Release);
-            if let Ok(mut bindings) = self.texture_bindings.lock() {
+            // Tombstone + graveyard teardown, under the bindings lock
+            // (the SAME lock `vulkan_texture_drop` holds across its
+            // check-and-destroy — the ordering that closes the teardown
+            // race, review round 2 P1): a texture drop racing this either
+            // completed while the device was alive, or will observe
+            // `alive == false` and leak. The device is still very much
+            // alive HERE, so retired graveyard inners are destroyed — not
+            // leaked (review round 2, P2).
+            let retired: Vec<VulkanTextureInner> = {
+                let mut bindings = self.texture_bindings.lock().expect("texture bindings lock");
+                self.alive.store(false, AtomicOrdering::Release);
                 bindings.bound.clear();
-                bindings.graveyard.clear();
+                std::mem::take(&mut bindings.graveyard)
+            };
+            for inner in retired {
+                // Safety: device alive, no recording references these
+                // (retired), no concurrent drop can interleave (they queue
+                // on the lock and will see the tombstone).
+                destroy_texture_inner(Box::new(inner));
             }
             self.device.destroy_render_pass(self.render_pass, None);
             self.device.destroy_image_view(self.depth_view, None);
@@ -1478,6 +1489,10 @@ impl<'a> VulkanBackend<'a> {
                     // recreation (rounds 8–9, P1). No image is owned
                     // anymore.
                     render.phase = RenderPhase::Idle;
+                    // The stale recording that may have bound textures is
+                    // discarded with this frame — drain (review round 2,
+                    // P2; recovery runs under the render lock).
+                    self.drain_texture_bindings();
                     return Err(format!(
                         "recover present-back: {e} (swapchain/surface lost — recreate required)"
                     ));
