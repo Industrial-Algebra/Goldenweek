@@ -3368,7 +3368,14 @@ impl<'a> VulkanBackend<'a> {
                     // back-to-back latency race (round 9, P1). The fence has
                     // been waited, so the signal is complete: an empty
                     // submission waiting on it drains deterministically.
+                    // The drain SUBMITS — take the QUEUE_LOCK for the
+                    // whole sequence (round 12, P1): present_locked's guard
+                    // released when it returned, and this submission ran
+                    // bare, racing concurrent queue users. The poison call
+                    // in the error arm below runs under this guard —
+                    // queue→retention, the established order.
                     unsafe {
+                        let _queue = queue_guard();
                         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
                         let drain = vk::SubmitInfo::default()
                             .wait_semaphores(std::slice::from_ref(&self.render_finished))
