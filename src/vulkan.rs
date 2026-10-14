@@ -25,6 +25,20 @@ use std::ffi::{CString, c_void};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
+/// Serializes every graphics-QUEUE operation process-wide (review round 5,
+/// P1). Per-backend render locks cannot synchronize the queue when two
+/// backends share one device — the queue object itself requires external
+/// synchronization. This is a LEAF lock: taken while holding the render
+/// lock (order: render → queue, never reversed), never holding anything
+/// the queue-op paths would need. Cross-backend frames serialize on it —
+/// correct before concurrent (v0.1's synchronous model).
+static QUEUE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire the device-queue lock. See [`QUEUE_LOCK`].
+fn queue_guard() -> std::sync::MutexGuard<'static, ()> {
+    QUEUE_LOCK.lock().expect("device queue lock poisoned")
+}
+
 use ash::vk::Handle;
 use ash::{Entry, ext, khr, vk};
 
@@ -799,7 +813,10 @@ impl Drop for VulkanBackend<'_> {
         // by the caller (documented invariant). The device/instance/surface
         // belong to their owners and are NOT destroyed here.
         unsafe {
-            let _ = self.device.device_wait_idle();
+            {
+                let _queue = queue_guard();
+                let _ = self.device.device_wait_idle();
+            }
             let render = self.render.lock().expect("render state lock");
             self.device.destroy_fence(render.fence, None);
             self.device
@@ -1294,6 +1311,7 @@ impl<'a> VulkanBackend<'a> {
     /// flush and its interrupted-retry path — the recording must already be
     /// ended when this runs (round 7, P1).
     fn finish_flush(&self, render: &mut RenderState) -> Result<()> {
+        let _queue = queue_guard();
         let RenderPhase::Flushing(index) = render.phase else {
             return Err(GraphicsError::Internal(
                 "finish_flush called outside Flushing".into(),
@@ -1392,6 +1410,9 @@ impl<'a> VulkanBackend<'a> {
     /// acquire would re-run this recovery and block forever on the
     /// already-consumed semaphore (review round 4, P1).
     fn recover_stale_frame(&self, render: &mut RenderState) -> std::result::Result<(), String> {
+        // The recovery submits and presents — serialize against every other
+        // queue user, including OTHER backends on this device (round 5 P1).
+        let _queue = queue_guard();
         let index = match render.phase {
             RenderPhase::Idle => return Ok(()),
             RenderPhase::Acquired(i)
@@ -1590,7 +1611,10 @@ impl<'a> VulkanBackend<'a> {
         }
         // Safety: no submission may reference the objects being destroyed.
         unsafe {
-            let _ = self.device.device_wait_idle();
+            {
+                let _queue = queue_guard();
+                let _ = self.device.device_wait_idle();
+            }
         }
 
         let instance = self.zunesha_device.raw_instance();
@@ -2350,12 +2374,14 @@ impl<'a> VulkanBackend<'a> {
                 }
             })?;
             let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
-            // Serialize with all other graphics-queue users (the render
-            // state lock): Vulkan queues require external synchronization,
-            // and concurrent `create_texture` calls raced submissions
-            // (review round 1, P1). Uploads are init-time — blocking a
-            // concurrent frame briefly is the v0.1 contract.
+            // Serialize with all other graphics-queue users — BOTH the
+            // render state lock (this backend) and the process-wide queue
+            // lock (other backends sharing this device's queue): Vulkan
+            // queues require external synchronization (review rounds 1
+            // and 5, P1). Uploads are init-time — blocking concurrent
+            // frames briefly is the v0.1 contract.
             let _render_guard = self.render.lock().expect("render state lock");
+            let _queue_guard = queue_guard();
             let submitted =
                 self.device
                     .queue_submit(self.graphics_queue, std::slice::from_ref(&submit), fence);
@@ -2835,6 +2861,10 @@ impl<'a> VulkanBackend<'a> {
             })?;
         let mut render = self.render.lock().expect("render state lock");
         Self::check_not_broken(&render)?;
+        // Present submits and presents — cross-backend queue serialization
+        // (round 5 P1). Held through the fence wait: conservative but
+        // correct; v0.1's frame loop is synchronous anyway.
+        let _queue = queue_guard();
         let flush_state = match render.phase {
             // Recording active — end it, submit, present.
             RenderPhase::Open(i) if i == index => NeedsSubmit::Record,
@@ -3211,17 +3241,20 @@ impl<'a> VulkanBackend<'a> {
             self.device
                 .end_command_buffer(cmd)
                 .map_err(|e| GraphicsError::Internal(format!("one-shot end: {e}")))?;
-            let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
-            self.device
-                .queue_submit(
-                    self.graphics_queue,
-                    std::slice::from_ref(&submit),
-                    vk::Fence::null(),
-                )
-                .map_err(|e| GraphicsError::Internal(format!("one-shot submit: {e}")))?;
-            self.device
-                .queue_wait_idle(self.graphics_queue)
-                .map_err(|e| GraphicsError::Internal(format!("one-shot wait: {e}")))?;
+            {
+                let _queue = queue_guard();
+                let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+                self.device
+                    .queue_submit(
+                        self.graphics_queue,
+                        std::slice::from_ref(&submit),
+                        vk::Fence::null(),
+                    )
+                    .map_err(|e| GraphicsError::Internal(format!("one-shot submit: {e}")))?;
+                self.device
+                    .queue_wait_idle(self.graphics_queue)
+                    .map_err(|e| GraphicsError::Internal(format!("one-shot wait: {e}")))?;
+            }
             self.device
                 .free_command_buffers(self.command_pool, std::slice::from_ref(&cmd));
         }
