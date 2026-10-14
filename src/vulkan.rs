@@ -1049,13 +1049,11 @@ impl Drop for VulkanBackend<'_> {
 }
 
 impl<'a> VulkanBackend<'a> {
-    /// Present's submit/present/wait section, run under the QUEUE_LOCK by
-    /// [`present`] (round 10, P1 restructure): the guard is scoped to this
-    /// section only, so present's post-present arms can call the drains —
-    /// which take the queue themselves — without re-locking on this thread
-    /// (std's Mutex is non-reentrant). Early `return`s are GraphicsError,
-    /// same as present's; the `Ok` payload carries the queue_present result
-    /// plus whether THIS invocation submitted (the signal-drain condition).
+    /// Present's submit/present/wait section — every queue operation in
+    /// it is covered by the CALLER's whole-body guard. Early `return`s are
+    /// GraphicsError, same as present's; the `Ok` payload carries the
+    /// queue_present result plus whether THIS invocation submitted (the
+    /// signal-drain condition).
     /// CALLER-LOCKS CONTRACT (round 13 consolidation): `present` holds the
     /// QUEUE_LOCK across this entire section AND the post-present arms —
     /// this function takes NO guard itself (self-locking helpers are
@@ -1717,17 +1715,19 @@ impl<'a> VulkanBackend<'a> {
     }
 
     /// Drain buffer retention at a frame's Idle commit: completion was
-    /// fence-confirmed, so the graveyard can be destroyed (under the
-    /// QUEUE_LOCK — zunesha teardown quiesces the device) and the bound
-    /// set clears. Lock order: render (held) → retention → queue.
-    /// CALLER-LOCKS CONTRACT (round 13 consolidation): every queue
-    /// operation — submit, present, wait, and quiescing teardown — runs
-    /// under an explicit `queue_guard()` acquired in the SAME function;
-    /// self-locking helpers are forbidden (they deadlock under a caller's
-    /// held guard, review rounds 11–12, and invite bare call sites,
-    /// round 12). The zunesha teardown below quiesces the device, so the
-    /// CALLER must hold QUEUE_LOCK across this call; the retention lock is
-    /// then taken inside (queue→retention — never inverted).
+    /// fence-confirmed, so the graveyard can be destroyed and the bound
+    /// set clears. Lock order: render (held by callers) → queue (held by
+    /// callers) → retention (taken inside).
+    /// CALLER-LOCKS CONTRACT (round 13 consolidation): every QUEUE-mutating
+    /// operation — submit, present, and quiescing teardown — runs under an
+    /// explicit `queue_guard()` acquired in the SAME function; self-locking
+    /// helpers are forbidden (they deadlock under a caller's held guard,
+    /// review rounds 11–12, and invite bare call sites, round 12). Pure
+    /// fence waits (wait_for_fences) need no QUEUE_LOCK — a fence is not a
+    /// queue object and no external synchronization is required. The
+    /// zunesha teardown below quiesces the device, so the CALLER must hold
+    /// QUEUE_LOCK across this call; the retention lock is then taken
+    /// inside (queue→retention — never inverted).
     fn drain_buffer_retention(&self) {
         let mut guard = self.buffer_retention.lock().expect("buffer retention lock");
         guard.bound.clear();
@@ -3345,11 +3345,7 @@ impl<'a> VulkanBackend<'a> {
         let mut render = self.render.lock().expect("render state lock");
         Self::check_not_broken(&render)?;
         // Present submits and presents — cross-backend queue serialization
-        // (round 5 P1). The guard is scoped to the submit/present/wait
-        // SECTION (round 10, P1): the post-present arms call the drains,
-        // which take the queue themselves — holding it across them would
-        // re-lock on this thread.
-        // CALLER-LOCKS CONTRACT: ONE whole-body guard covers the
+        // (round 5 P1). CALLER-LOCKS CONTRACT: ONE whole-body guard covers the
         // submit/present/wait section, the post-present arms, AND the
         // error arm's semaphore-drain submission (round 13 consolidation —
         // rounds 10–12's narrowing/self-locking alternation is gone).
