@@ -432,11 +432,15 @@ pub(super) fn drop_vulkan_pipeline(raw: *mut c_void) {
         // Safety: `raw` was produced by `Box::into_raw` in
         // `compile_render_pipeline`.
         let inner = unsafe { Box::from_raw(raw as *mut VulkanPipelineInner) };
-        let (Some(retention), Some(alive)) = (&inner.retention, &inner.alive) else {
+        // QUEUE→RETENTION + check-and-destroy inside both guards — same
+        // teardown-atomicity contract as buffers (round 10, P1).
+        let (Some(retention), Some(alive)) = (inner.retention.clone(), inner.alive.clone()) else {
             // Safety: no retention metadata — destroy directly.
             unsafe { destroy_pipeline_inner(*inner) };
             return;
         };
+        let _queue = queue_guard();
+        let mut guard = retention.lock().expect("buffer retention lock");
         if !alive.load(AtomicOrdering::Acquire) {
             eprintln!(
                 "goldenweek: a RenderPipeline outlived its backend; leaking its GPU resources (documented contract violation)"
@@ -445,8 +449,6 @@ pub(super) fn drop_vulkan_pipeline(raw: *mut c_void) {
             return;
         }
         let key = raw as usize;
-        let retention = Arc::clone(retention);
-        let mut guard = retention.lock().expect("buffer retention lock");
         if guard.poisoned {
             guard.leaked_pipelines.push(*inner);
             return;
@@ -455,8 +457,7 @@ pub(super) fn drop_vulkan_pipeline(raw: *mut c_void) {
             guard.graveyard_pipelines.push(*inner);
             return;
         }
-        drop(guard);
-        // Safety: no pending submission references it.
+        // Safety: no pending submission references it; device alive.
         unsafe { destroy_pipeline_inner(*inner) };
     }
 }
@@ -509,7 +510,16 @@ pub(super) fn drop_zunesha_buffer_box(raw: *mut c_void) {
     if !raw.is_null() {
         // Safety: `raw` was produced by `Box::into_raw` in `create_buffer`.
         let inner = unsafe { Box::from_raw(raw as *mut GpuBufferInner) };
-        if !inner.alive.load(std::sync::atomic::Ordering::Acquire) {
+        // QUEUE→RETENTION order (round 10, P1: poison sites take retention
+        // while QUEUE_LOCK is already held — retention-then-queue here
+        // would invert). Liveness check AND destroy inside BOTH guards:
+        // teardown tombstones under retention, so this critical section is
+        // atomic with backend teardown — the destroy runs while the device
+        // is provably valid, or the tombstone is observed and we leak.
+        let _queue = queue_guard();
+        let retention = Arc::clone(&inner.retention);
+        let mut guard = retention.lock().expect("buffer retention lock");
+        if !inner.alive.load(AtomicOrdering::Acquire) {
             eprintln!(
                 "goldenweek: a GpuBuffer outlived its backend; leaking its GPU resources (documented contract violation)"
             );
@@ -517,24 +527,15 @@ pub(super) fn drop_zunesha_buffer_box(raw: *mut c_void) {
             return;
         }
         let key = raw as usize;
-        let retention = Arc::clone(&inner.retention);
-        let mut guard = retention.lock().expect("buffer retention lock");
         if guard.poisoned {
-            // This buffer was bound into (or retired behind) a recording
-            // whose completion could not be confirmed — leak rather than
-            // destroy unconfirmed GPU work (round 9, P1).
             guard.leaked.push(*inner);
             return;
         }
         if guard.bound.contains(&key) {
-            // Still referenced by the pending recording — retire; the Idle
-            // drain destroys it once completion is fence-confirmed.
             guard.graveyard.push(*inner);
             return;
         }
-        drop(guard);
-        let _queue = queue_guard();
-        drop(inner);
+        drop(inner); // zunesha teardown (device quiesce) — queue held ✓
     }
 }
 
@@ -992,6 +993,13 @@ impl Drop for VulkanBackend<'_> {
             // again on purpose.
             let (retired_buffers, leaked_buffers, retired_pipelines, leaked_pipelines) = {
                 let mut retention = self.buffer_retention.lock().expect("buffer retention lock");
+                // Tombstone set UNDER RETENTION as well (round 10, P1): the
+                // public buffer/pipeline drops hold this lock across their
+                // alive-check-and-destroy, so this critical section is
+                // atomic with them — a racing drop either completed its
+                // device calls while the device was valid (we were blocked
+                // on this lock), or observes the tombstone and leaks.
+                self.alive.store(false, AtomicOrdering::Release);
                 retention.bound.clear();
                 retention.bound_pipelines.clear();
                 (
@@ -1041,6 +1049,138 @@ impl Drop for VulkanBackend<'_> {
 }
 
 impl<'a> VulkanBackend<'a> {
+    /// Present's submit/present/wait section, run under the QUEUE_LOCK by
+    /// [`present`] (round 10, P1 restructure): the guard is scoped to this
+    /// section only, so present's post-present arms can call the drains —
+    /// which take the queue themselves — without re-locking on this thread
+    /// (std's Mutex is non-reentrant). Early `return`s are GraphicsError,
+    /// same as present's; the `Ok` payload carries the queue_present result
+    /// plus whether THIS invocation submitted (the signal-drain condition).
+    fn present_locked(
+        &self,
+        render: &mut RenderState,
+        index: u32,
+    ) -> std::result::Result<(ash::prelude::VkResult<bool>, bool), GraphicsError> {
+        let flush_state = match render.phase {
+            // Recording active — end it, submit, present.
+            RenderPhase::Open(i) if i == index => NeedsSubmit::Record,
+            // Recording already ENDED (a `read_pixels` flush was interrupted
+            // between end and submit) — submit without ending (round 7, P1).
+            RenderPhase::Flushing(i) if i == index => NeedsSubmit::Ended,
+            // A `read_pixels` flush already submitted the rendering and
+            // fence-waited it; present without semaphore waits (the image is
+            // idle from the host's perspective).
+            RenderPhase::Flushed(i) if i == index => NeedsSubmit::No,
+            ref other => {
+                return Err(GraphicsError::InvalidDraw {
+                    message: format!("frame {index} is not the frame being recorded ({other:?})"),
+                });
+            }
+        };
+
+        // Whether THIS invocation submitted (and therefore signaled
+        // render_finished): only then can a failed present strand the
+        // signal and only then may the drain wait on it (round 10, P1).
+        let submitted = !matches!(flush_state, NeedsSubmit::No);
+
+        let present_result = match flush_state {
+            NeedsSubmit::No => {
+                let swapchains = [self.swapchain];
+                let indices = [index];
+                let present_info = vk::PresentInfoKHR::default()
+                    .swapchains(&swapchains)
+                    .image_indices(&indices);
+                // Safety: queue and image are idle (flush fence-waited).
+                unsafe {
+                    self.swapchain_fn
+                        .queue_present(self.graphics_queue, &present_info)
+                }
+            }
+            needs_submit => {
+                unsafe {
+                    if matches!(needs_submit, NeedsSubmit::Record) {
+                        self.device.cmd_end_render_pass(render.cmd);
+                        let end = self.device.end_command_buffer(render.cmd);
+                        if let Err(e) = end {
+                            // Same boundary as the readback flush: the
+                            // recording is invalid, reset it away and commit
+                            // Acquired so recovery presents the image back
+                            // (round 8, P1).
+                            let _ = self.device.reset_command_buffer(
+                                render.cmd,
+                                vk::CommandBufferResetFlags::empty(),
+                            );
+                            render.phase = RenderPhase::Acquired(index);
+                            return Err(GraphicsError::PresentFailed {
+                                message: format!("end command buffer: {e}"),
+                            });
+                        }
+                        // Commit the ended state before the fallible fence
+                        // reset (round 7, P1): an interruption here resumes
+                        // without ending twice.
+                        render.phase = RenderPhase::Flushing(index);
+                    }
+
+                    let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+                    let submit = vk::SubmitInfo::default()
+                        .wait_semaphores(std::slice::from_ref(&self.image_available))
+                        .wait_dst_stage_mask(&wait_stages)
+                        .command_buffers(std::slice::from_ref(&render.cmd))
+                        .signal_semaphores(std::slice::from_ref(&self.render_finished));
+                    // Reset the fence only now — immediately before the submit that
+                    // will signal it — so it is unsignalled for the shortest possible
+                    // window (unobservable in the synchronous loop).
+                    self.device
+                        .reset_fences(std::slice::from_ref(&render.fence))
+                        .map_err(|e| GraphicsError::PresentFailed {
+                            message: format!("fence reset: {e}"),
+                        })?;
+                    // A submission failure here strands the unsignaled fence
+                    // exactly as in frame recovery — poison so entry points fail
+                    // fast instead of deadlocking (review round 6, P1).
+                    if let Err(e) = self.device.queue_submit(
+                        self.graphics_queue,
+                        std::slice::from_ref(&submit),
+                        render.fence,
+                    ) {
+                        render.broken = true;
+                        self.poison_buffer_retention();
+                        return Err(GraphicsError::PresentFailed {
+                            message: format!("vkQueueSubmit: {e}"),
+                        });
+                    }
+
+                    let swapchains = [self.swapchain];
+                    let indices = [index];
+                    let present_info = vk::PresentInfoKHR::default()
+                        .wait_semaphores(std::slice::from_ref(&self.render_finished))
+                        .swapchains(&swapchains)
+                        .image_indices(&indices);
+                    self.swapchain_fn
+                        .queue_present(self.graphics_queue, &present_info)
+                }
+            }
+        };
+        // Block until the frame's work is complete, so the next acquire can
+        // safely reset and reuse the command buffer (the synchronous
+        // frame-loop contract). In the Flushed path the fence is already
+        // signalled (and waited) — the wait returns immediately.
+        // Safety: the fence was submitted on this device (present or flush).
+        unsafe {
+            self.device
+                .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
+                .map_err(|e| {
+                    render.broken = true;
+                    self.poison_buffer_retention();
+                    GraphicsError::PresentFailed {
+                        message: format!("fence wait: {e}"),
+                    }
+                })?;
+        }
+
+        Ok((present_result, submitted))
+    }
+
     /// Construct the backend over a borrowed Zunesha device and an external
     /// surface, building the swapchain, render pass, and framebuffers against
     /// the surface.
@@ -1577,25 +1717,24 @@ impl<'a> VulkanBackend<'a> {
     /// QUEUE_LOCK — zunesha teardown quiesces the device) and the bound
     /// set clears. Lock order: render (held) → retention → queue.
     fn drain_buffer_retention(&self) {
-        let (graveyard, guard_p) = {
-            let mut guard = self.buffer_retention.lock().expect("buffer retention lock");
-            guard.bound.clear();
-            guard.bound_pipelines.clear();
-            (
-                std::mem::take(&mut guard.graveyard),
-                std::mem::take(&mut guard.graveyard_pipelines),
-            )
-        };
-        let graveyard_pipelines = guard_p;
-        if !graveyard.is_empty() || !graveyard_pipelines.is_empty() {
-            let _queue = queue_guard();
-            for inner in graveyard {
-                drop(inner);
-            }
-            // Safety: completion fence-confirmed at the Idle commit.
-            for inner in graveyard_pipelines {
-                unsafe { destroy_pipeline_inner(inner) };
-            }
+        // QUEUE→RETENTION order (round 10, P1 — the public drops and every
+        // poison site establish queue→retention; never invert). Callers
+        // must NOT already hold the QUEUE_LOCK (std's Mutex is
+        // non-reentrant — present scopes its guard to its submit section
+        // for exactly this reason).
+        let _queue = queue_guard();
+        let mut guard = self.buffer_retention.lock().expect("buffer retention lock");
+        guard.bound.clear();
+        guard.bound_pipelines.clear();
+        let graveyard = std::mem::take(&mut guard.graveyard);
+        let graveyard_pipelines = std::mem::take(&mut guard.graveyard_pipelines);
+        drop(guard);
+        for inner in graveyard {
+            drop(inner); // zunesha teardown (device quiesce) — queue held ✓
+        }
+        // Safety: completion fence-confirmed at the Idle commit.
+        for inner in graveyard_pipelines {
+            unsafe { destroy_pipeline_inner(inner) };
         }
     }
 
@@ -2984,6 +3123,23 @@ impl<'a> VulkanBackend<'a> {
         // Safety: `raw` was produced by `Box::into_raw<GpuBufferInner>` in
         // `create_buffer` and is still valid.
         let buffer_inner = unsafe { &*(vertices.raw as *const GpuBufferInner) };
+        // Owner validation (round 10, P1): a destructor consults the
+        // registry baked into its inner (the OWNER's) — a foreign handle
+        // would register here but never be retained for THIS recording.
+        // Rejected, mirroring the texture rule.
+        if !Arc::ptr_eq(&buffer_inner.retention, &self.buffer_retention) {
+            return Err(GraphicsError::InvalidDraw {
+                message: "vertex buffer belongs to a different backend".into(),
+            });
+        }
+        match &pipeline_inner.retention {
+            Some(r) if Arc::ptr_eq(r, &self.buffer_retention) => {}
+            _ => {
+                return Err(GraphicsError::InvalidDraw {
+                    message: "pipeline belongs to a different backend".into(),
+                });
+            }
+        }
         let zunesha_buffer = &buffer_inner.buffer;
         // Retain: the pending recording references this buffer — a public
         // drop before completion must retire into the graveyard, and a
@@ -3054,6 +3210,23 @@ impl<'a> VulkanBackend<'a> {
         // Safety: `raw` was produced by `Box::into_raw<GpuBufferInner>` in
         // `create_buffer` and is still valid.
         let buffer_inner = unsafe { &*(vertices.raw as *const GpuBufferInner) };
+        // Owner validation (round 10, P1): a destructor consults the
+        // registry baked into its inner (the OWNER's) — a foreign handle
+        // would register here but never be retained for THIS recording.
+        // Rejected, mirroring the texture rule.
+        if !Arc::ptr_eq(&buffer_inner.retention, &self.buffer_retention) {
+            return Err(GraphicsError::InvalidDraw {
+                message: "vertex buffer belongs to a different backend".into(),
+            });
+        }
+        match &pipeline_inner.retention {
+            Some(r) if Arc::ptr_eq(r, &self.buffer_retention) => {}
+            _ => {
+                return Err(GraphicsError::InvalidDraw {
+                    message: "pipeline belongs to a different backend".into(),
+                });
+            }
+        }
         let zunesha_buffer = &buffer_inner.buffer;
         // Retain: the pending recording references this buffer — a public
         // drop before completion must retire into the graveyard, and a
@@ -3148,125 +3321,14 @@ impl<'a> VulkanBackend<'a> {
         let mut render = self.render.lock().expect("render state lock");
         Self::check_not_broken(&render)?;
         // Present submits and presents — cross-backend queue serialization
-        // (round 5 P1). Held through the fence wait: conservative but
-        // correct; v0.1's frame loop is synchronous anyway.
-        let _queue = queue_guard();
-        let flush_state = match render.phase {
-            // Recording active — end it, submit, present.
-            RenderPhase::Open(i) if i == index => NeedsSubmit::Record,
-            // Recording already ENDED (a `read_pixels` flush was interrupted
-            // between end and submit) — submit without ending (round 7, P1).
-            RenderPhase::Flushing(i) if i == index => NeedsSubmit::Ended,
-            // A `read_pixels` flush already submitted the rendering and
-            // fence-waited it; present without semaphore waits (the image is
-            // idle from the host's perspective).
-            RenderPhase::Flushed(i) if i == index => NeedsSubmit::No,
-            ref other => {
-                return Err(GraphicsError::InvalidDraw {
-                    message: format!("frame {index} is not the frame being recorded ({other:?})"),
-                });
-            }
+        // (round 5 P1). The guard is scoped to the submit/present/wait
+        // SECTION (round 10, P1): the post-present arms call the drains,
+        // which take the queue themselves — holding it across them would
+        // re-lock on this thread.
+        let (present_result, submitted) = {
+            let _queue = queue_guard();
+            self.present_locked(&mut render, index)?
         };
-
-        // Whether THIS invocation submitted (and therefore signaled
-        // render_finished): only then can a failed present strand the
-        // signal and only then may the drain wait on it (round 10, P1).
-        let submitted = !matches!(flush_state, NeedsSubmit::No);
-
-        let present_result = match flush_state {
-            NeedsSubmit::No => {
-                let swapchains = [self.swapchain];
-                let indices = [index];
-                let present_info = vk::PresentInfoKHR::default()
-                    .swapchains(&swapchains)
-                    .image_indices(&indices);
-                // Safety: queue and image are idle (flush fence-waited).
-                unsafe {
-                    self.swapchain_fn
-                        .queue_present(self.graphics_queue, &present_info)
-                }
-            }
-            needs_submit => {
-                unsafe {
-                    if matches!(needs_submit, NeedsSubmit::Record) {
-                        self.device.cmd_end_render_pass(render.cmd);
-                        let end = self.device.end_command_buffer(render.cmd);
-                        if let Err(e) = end {
-                            // Same boundary as the readback flush: the
-                            // recording is invalid, reset it away and commit
-                            // Acquired so recovery presents the image back
-                            // (round 8, P1).
-                            let _ = self.device.reset_command_buffer(
-                                render.cmd,
-                                vk::CommandBufferResetFlags::empty(),
-                            );
-                            render.phase = RenderPhase::Acquired(index);
-                            return Err(GraphicsError::PresentFailed {
-                                message: format!("end command buffer: {e}"),
-                            });
-                        }
-                        // Commit the ended state before the fallible fence
-                        // reset (round 7, P1): an interruption here resumes
-                        // without ending twice.
-                        render.phase = RenderPhase::Flushing(index);
-                    }
-
-                    let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-                    let submit = vk::SubmitInfo::default()
-                        .wait_semaphores(std::slice::from_ref(&self.image_available))
-                        .wait_dst_stage_mask(&wait_stages)
-                        .command_buffers(std::slice::from_ref(&render.cmd))
-                        .signal_semaphores(std::slice::from_ref(&self.render_finished));
-                    // Reset the fence only now — immediately before the submit that
-                    // will signal it — so it is unsignalled for the shortest possible
-                    // window (unobservable in the synchronous loop).
-                    self.device
-                        .reset_fences(std::slice::from_ref(&render.fence))
-                        .map_err(|e| GraphicsError::PresentFailed {
-                            message: format!("fence reset: {e}"),
-                        })?;
-                    // A submission failure here strands the unsignaled fence
-                    // exactly as in frame recovery — poison so entry points fail
-                    // fast instead of deadlocking (review round 6, P1).
-                    if let Err(e) = self.device.queue_submit(
-                        self.graphics_queue,
-                        std::slice::from_ref(&submit),
-                        render.fence,
-                    ) {
-                        render.broken = true;
-                        self.poison_buffer_retention();
-                        return Err(GraphicsError::PresentFailed {
-                            message: format!("vkQueueSubmit: {e}"),
-                        });
-                    }
-
-                    let swapchains = [self.swapchain];
-                    let indices = [index];
-                    let present_info = vk::PresentInfoKHR::default()
-                        .wait_semaphores(std::slice::from_ref(&self.render_finished))
-                        .swapchains(&swapchains)
-                        .image_indices(&indices);
-                    self.swapchain_fn
-                        .queue_present(self.graphics_queue, &present_info)
-                }
-            }
-        };
-        // Block until the frame's work is complete, so the next acquire can
-        // safely reset and reuse the command buffer (the synchronous
-        // frame-loop contract). In the Flushed path the fence is already
-        // signalled (and waited) — the wait returns immediately.
-        // Safety: the fence was submitted on this device (present or flush).
-        unsafe {
-            self.device
-                .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
-                .map_err(|e| {
-                    render.broken = true;
-                    self.poison_buffer_retention();
-                    GraphicsError::PresentFailed {
-                        message: format!("fence wait: {e}"),
-                    }
-                })?;
-        }
 
         // OUT_OF_DATE and SURFACE_LOST release the image (the engine
         // consumes it despite the error) — Idle is correct and the caller
