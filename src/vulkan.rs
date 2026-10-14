@@ -25,13 +25,22 @@ use std::ffi::{CString, c_void};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
-/// Serializes every graphics-QUEUE operation process-wide (review round 5,
-/// P1). Per-backend render locks cannot synchronize the queue when two
-/// backends share one device — the queue object itself requires external
-/// synchronization. This is a LEAF lock: taken while holding the render
-/// lock (order: render → queue, never reversed), never holding anything
-/// the queue-op paths would need. Cross-backend frames serialize on it —
-/// correct before concurrent (v0.1's synchronous model).
+/// Serializes every graphics-QUEUE operation process-wide (review rounds
+/// 5–6, P1). Per-backend render locks cannot synchronize the queue when
+/// two backends share one device — the queue object itself requires
+/// external synchronization. This covers BOTH Goldenweek's direct
+/// submissions AND the substrate-mediated ones (zunesha's device-local
+/// staging in `create_buffer`, its readback transfer in `read_pixels`).
+/// This is a LEAF lock: taken while holding the render lock (order:
+/// render → queue, never reversed), never holding anything the queue-op
+/// paths would need. Cross-backend frames serialize on it — correct
+/// before concurrent (v0.1's synchronous model).
+///
+/// RESIDUAL (documented): a consumer calling ZUNESHA directly on the
+/// shared device concurrent with Goldenweek operations is NOT
+/// synchronized by this lock — that requires one shared protocol owned
+/// by the substrate (a Zunesha ADR candidate; the queue-serialization
+/// seam belongs there, not in each consumer).
 static QUEUE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Acquire the device-queue lock. See [`QUEUE_LOCK`].
@@ -2077,6 +2086,12 @@ impl<'a> VulkanBackend<'a> {
     /// backend, and in-flight frames reading it must complete first (the
     /// synchronous `present` guarantees this).
     pub fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<GpuBuffer> {
+        // Zunesha's device-local staging uploads SUBMIT to the graphics
+        // queue inside this call — a queue user like any other. Take the
+        // process-wide QUEUE_LOCK so substrate-mediated submissions
+        // serialize with Goldenweek's direct ones (review round 6, P1;
+        // reproduced: 10 threading errors without it).
+        let _queue = queue_guard();
         let buffer = self.zunesha_device.create_buffer(data).map_err(|e| {
             GraphicsError::BufferCreationFailed {
                 message: format!("{e}"),
@@ -3259,10 +3274,14 @@ impl<'a> VulkanBackend<'a> {
                 .free_command_buffers(self.command_pool, std::slice::from_ref(&cmd));
         }
 
-        let pixels: Vec<u8> = self
-            .zunesha_device
-            .read_buffer(&staging)
-            .map_err(|e| GraphicsError::Internal(format!("staging readback: {e}")))?;
+        // Zunesha's readback transfer SUBMITS to the queue — same
+        // protocol as every other queue user (review round 6, P1).
+        let pixels: Vec<u8> = {
+            let _queue = queue_guard();
+            self.zunesha_device
+                .read_buffer(&staging)
+                .map_err(|e| GraphicsError::Internal(format!("staging readback: {e}")))?
+        };
         drop(staging);
         Ok(pixels)
     }
