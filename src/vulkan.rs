@@ -424,13 +424,38 @@ pub(super) fn drop_vulkan_pipeline(raw: *mut c_void) {
 }
 
 /// Drop function stored in [`GpuBuffer`] — drops the boxed `zunesha::Buffer`,
-/// whose own drop destroys the Vulkan buffer + memory.
+/// whose own drop destroys the Vulkan buffer + memory. The teardown may
+/// quiesce the device (`vkDeviceWaitIdle`) — a queue operation — so it
+/// joins the QUEUE_LOCK protocol (review round 8, P1: the public drop
+/// raced concurrent uploads).
+///
+/// RECURSION RULE: never let a `zunesha::Buffer` drop (this function, or
+/// [`QueueLockedStaging`]) unwind or run while the QUEUE_LOCK is already
+/// held on this thread — std's Mutex is non-reentrant. Goldenweek's call
+/// sites guarantee this by capturing results inside queue-guard scopes
+/// and handling errors after release.
 pub(super) fn drop_zunesha_buffer_box(raw: *mut c_void) {
     if !raw.is_null() {
+        let _queue = queue_guard();
         // Safety: `raw` was produced by `Box::into_raw` in `create_buffer`.
         unsafe {
             drop(Box::from_raw(raw as *mut zunesha::Buffer));
         }
+    }
+}
+
+/// A bare (unboxed) zunesha staging buffer whose teardown joins the
+/// QUEUE_LOCK protocol — used by `read_pixels`' local staging. Same
+/// recursion rule as [`drop_zunesha_buffer_box`].
+struct QueueLockedStaging(std::mem::ManuallyDrop<zunesha::Buffer>);
+
+impl Drop for QueueLockedStaging {
+    fn drop(&mut self) {
+        let _queue = queue_guard();
+        // Safety: ManuallyDrop field — dropped exactly once, here, under
+        // the guard (a bare field would double-drop after this impl: the
+        // compiler still drops fields after a custom Drop runs).
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.0) };
     }
 }
 
@@ -3170,6 +3195,11 @@ impl<'a> VulkanBackend<'a> {
         // too (device-local staging upload), which round 7 caught racing
         // concurrent uploads — so both run under the QUEUE_LOCK
         // (create_buffer's own internal lock covers only its own path).
+        // The staging lives in a `QueueLockedStaging` so its teardown —
+        // including error unwinding — also joins the protocol (round 8,
+        // P1); the recursion rule (see that type) forbids `?` unwinding
+        // it through a queue-guard scope, hence the result-capturing
+        // blocks below.
         let (staging, staging_vk) = {
             let _queue = queue_guard();
             let staging = self
@@ -3181,6 +3211,7 @@ impl<'a> VulkanBackend<'a> {
             let staging_vk = self.zunesha_device.raw_buffer(&staging);
             (staging, staging_vk)
         };
+        let staging = QueueLockedStaging(std::mem::ManuallyDrop::new(staging));
 
         // One-shot copy command buffer from the same pool.
         let cb_ci = vk::CommandBufferAllocateInfo::default()
@@ -3264,7 +3295,11 @@ impl<'a> VulkanBackend<'a> {
             self.device
                 .end_command_buffer(cmd)
                 .map_err(|e| GraphicsError::Internal(format!("one-shot end: {e}")))?;
-            {
+            // Capture results INSIDE the queue-guard scope; the `?` comes
+            // after release — unwinding the staging buffer (whose drop
+            // takes the same lock) through the held guard would deadlock
+            // (round 8, P1 recursion rule).
+            let oneshot: std::result::Result<(), String> = {
                 let _queue = queue_guard();
                 let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
                 self.device
@@ -3273,24 +3308,43 @@ impl<'a> VulkanBackend<'a> {
                         std::slice::from_ref(&submit),
                         vk::Fence::null(),
                     )
-                    .map_err(|e| GraphicsError::Internal(format!("one-shot submit: {e}")))?;
-                self.device
-                    .queue_wait_idle(self.graphics_queue)
-                    .map_err(|e| GraphicsError::Internal(format!("one-shot wait: {e}")))?;
+                    .map_err(|e| format!("one-shot submit: {e}"))
+                    .and_then(|()| {
+                        self.device
+                            .queue_wait_idle(self.graphics_queue)
+                            .map_err(|e| format!("one-shot wait: {e}"))
+                    })
+            };
+            if let Err(e) = oneshot {
+                // The one-shot SUBMISSION is pending on the queue (the
+                // submit succeeded; only the wait failed): destroying the
+                // staging now is use-after-free (VUID 00922 — destroying a
+                // buffer with in-flight GPU work referencing it). LEAK it
+                // deliberately with a stderr note — the Zunesha 0.1.2
+                // `unconfirmed_submission` discipline, applied to
+                // Goldenweek's readback staging (review round 8, P1).
+                eprintln!(
+                    "goldenweek: readback one-shot wait failed ({e}); leaking the staging buffer rather than destroying in-flight GPU work"
+                );
+                std::mem::forget(staging);
+                return Err(GraphicsError::Internal(e));
             }
             self.device
                 .free_command_buffers(self.command_pool, std::slice::from_ref(&cmd));
         }
 
         // Zunesha's readback transfer SUBMITS to the queue — same
-        // protocol as every other queue user (review round 6, P1).
-        let pixels: Vec<u8> = {
+        // protocol as every other queue user (review round 6, P1). Result
+        // captured inside the guard; the `?` and the staging's (locked)
+        // drop happen after release (round 8 recursion rule).
+        let read: std::result::Result<Vec<u8>, String> = {
             let _queue = queue_guard();
             self.zunesha_device
-                .read_buffer(&staging)
-                .map_err(|e| GraphicsError::Internal(format!("staging readback: {e}")))?
+                .read_buffer(&staging.0)
+                .map_err(|e| e.to_string())
         };
-        drop(staging);
+        let pixels = read.map_err(|e| GraphicsError::Internal(format!("staging readback: {e}")))?;
+        drop(staging); // QueueLockedStaging: teardown under the protocol
         Ok(pixels)
     }
 }
