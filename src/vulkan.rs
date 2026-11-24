@@ -75,6 +75,37 @@ fn stage_name(stage: naga::ShaderStage) -> &'static str {
 /// Parses, validates, and lowers via naga. The entry point is selected in the
 /// backend pass ([`naga::back::spv::PipelineOptions`]), so a missing entry
 /// name is reported here rather than by the driver.
+/// The @location inputs of a vertex stage, parsed via naga (VERIFY fix
+/// for VUID-VkGraphicsPipelineCreateInfo-Input-07904: the pipeline is
+/// spec-invalid if the shader declares an input location the vertex
+/// bindings do not describe, and vice versa — the exact-set match below
+/// mirrors what the validation layer checks at pipeline creation).
+fn vertex_stage_input_locations(
+    entry: &str,
+    source: &str,
+) -> Result<std::collections::BTreeSet<u32>> {
+    let mut frontend = naga::front::wgsl::Frontend::new();
+    let module = frontend
+        .parse(source)
+        .map_err(|e| GraphicsError::CompileFailed {
+            stage: "vertex",
+            entry: entry.into(),
+            message: e.emit_to_string(source),
+        })?;
+    let mut locations = std::collections::BTreeSet::new();
+    for ep in &module.entry_points {
+        if ep.stage != naga::ShaderStage::Vertex || ep.name != entry {
+            continue;
+        }
+        for arg in ep.function.arguments.iter() {
+            if let Some(naga::Binding::Location { location, .. }) = &arg.binding {
+                locations.insert(*location);
+            }
+        }
+    }
+    Ok(locations)
+}
+
 fn compile_stage(entry: &str, source: &str, stage: naga::ShaderStage) -> Result<Vec<u32>> {
     let mut frontend = naga::front::wgsl::Frontend::new();
     let module = frontend
@@ -2381,6 +2412,25 @@ impl<'a> VulkanBackend<'a> {
         // Binding validation BEFORE anything else (M3): arity, global
         // location uniqueness, stride sanity — no shader work, no GPU work.
         validate_vertex_bindings(&config.vertex_bindings)?;
+        // VERIFY (07904): the shader's @location inputs and the bindings'
+        // locations must match EXACTLY — a shader input without a binding
+        // is a spec-invalid pipeline (UB on strict drivers), and a binding
+        // without a shader input is dead data. Checked before any GPU work.
+        {
+            let shader_locations = vertex_stage_input_locations(vertex_entry, vertex_source)?;
+            let binding_locations: std::collections::BTreeSet<u32> = config
+                .vertex_bindings
+                .iter()
+                .flat_map(|b| b.attributes.iter().map(|a| a.location))
+                .collect();
+            if shader_locations != binding_locations {
+                return Err(GraphicsError::InvalidArgument {
+                    message: format!(
+                        "vertex shader input locations {shader_locations:?} do not match vertex binding locations {binding_locations:?} (VUID Input-07904)"
+                    ),
+                });
+            }
+        }
 
         let vs_spv = compile_stage(vertex_entry, vertex_source, naga::ShaderStage::Vertex)?;
         let fs_spv = compile_stage(fragment_entry, fragment_source, naga::ShaderStage::Fragment)?;
@@ -5201,6 +5251,23 @@ fn fs_main(@location(4) uv: vec2<f32>) -> @location(0) vec4<f32> {
 
     /// A 0.5 × 0.5 quad (triangle strip) with its lower-left corner at the
     /// NDC origin — the per-instance offset places a copy of it.
+    /// Vertex stage with NO @location inputs — position from
+    /// @builtin(vertex_index). Pairs with empty bindings (07904 exact
+    /// match: no shader inputs, no bindings).
+    const NO_INPUT_VERT: &str = r#"
+struct VOut { @builtin(position) pos: vec4<f32> };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
+    var p = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 3.0, -1.0),
+        vec2<f32>(-1.0,  3.0),
+    );
+    return VOut(vec4<f32>(p[vi], 0.0, 1.0));
+}
+"#;
+
     const UNIT_QUAD: [f32; 8] = [
         0.0, -0.25, //
         0.5, -0.25, //
@@ -5386,11 +5453,12 @@ fn fs_main(@location(4) uv: vec2<f32>) -> @location(0) vec4<f32> {
             .expect("two-binding instanced pipeline compiles");
         drop(pipeline);
 
-        // Empty bindings = no vertex input, exactly as before M3.
+        // Empty bindings = no vertex input, exactly as before M3 — but
+        // the shader must have no inputs either (07904 exact match).
         let no_input = backend
             .compile_render_pipeline(
                 "vs_main",
-                crate::kernels::FLAT_TRIANGLE_VERT,
+                NO_INPUT_VERT,
                 "fs_main",
                 crate::kernels::FLAT_TRIANGLE_FRAG,
                 &PipelineConfig::default(),
@@ -5927,5 +5995,72 @@ fn fs_main(@location(4) uv: vec2<f32>) -> @location(0) vec4<f32> {
             crate::GraphicsBackend::import_zunesha_buffer(&stub, buffer),
             Err(GraphicsError::NoBackend)
         ));
+    }
+
+    /// M3 VERIFY (07904): the pipeline must reject a shader/bindings
+    /// location mismatch — the vertex stage's @location inputs must be
+    /// exactly the bindings' locations (mirrors
+    /// VUID-VkGraphicsPipelineCreateInfo-Input-07904; a spec-invalid
+    /// pipeline is UB on strict drivers, and the validation layer flagged
+    /// the library accepting one).
+    #[test]
+    #[serial]
+    fn pipeline_rejects_shader_binding_location_mismatch() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        // Shader declares @location(0); bindings are empty.
+        let empty = backend.compile_render_pipeline(
+            "vs_main",
+            crate::kernels::FLAT_TRIANGLE_VERT,
+            "fs_main",
+            crate::kernels::FLAT_TRIANGLE_FRAG,
+            &PipelineConfig::default(),
+        );
+        assert!(
+            matches!(empty, Err(GraphicsError::InvalidArgument { .. })),
+            "empty bindings with an input-ful shader must be rejected (07904)"
+        );
+        // Shader declares @location(0)+@location(1); bindings cover only 0.
+        let missing_instance = backend.compile_render_pipeline(
+            "vs_main",
+            INSTANCED_VERT,
+            "fs_main",
+            crate::kernels::FLAT_TRIANGLE_FRAG,
+            &PipelineConfig {
+                vertex_bindings: vec![crate::VertexBindingLayout {
+                    stride: 8,
+                    rate: crate::VertexInputRate::Vertex,
+                    attributes: vec![crate::VertexAttribute {
+                        location: 0,
+                        offset: 0,
+                        format: VertexFormat::Float32x2,
+                    }],
+                }],
+                ..instanced_transform_config()
+            },
+        );
+        assert!(
+            matches!(missing_instance, Err(GraphicsError::InvalidArgument { .. })),
+            "a shader input without a binding must be rejected (07904)"
+        );
+    }
+
+    /// M3 VERIFY: empty bindings compile when the shader has no vertex
+    /// inputs (position generated from @builtin(vertex_index)).
+    #[test]
+    #[serial]
+    fn empty_bindings_compile_with_input_less_shader() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let pipeline = backend
+            .compile_render_pipeline(
+                "vs_main",
+                NO_INPUT_VERT,
+                "fs_main",
+                crate::kernels::FLAT_TRIANGLE_FRAG,
+                &PipelineConfig::default(),
+            )
+            .expect("empty bindings + input-less shader compiles");
+        drop(pipeline);
     }
 }
