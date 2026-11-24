@@ -106,6 +106,31 @@ pub enum GraphicsError {
         message: String,
     },
 
+    /// Invalid argument supplied to a backend operation — M1.
+    ///
+    /// The descriptor/payload failed validation before any GPU work began
+    /// (e.g. an RGBA8 texture whose payload length is not `w * h * 4`).
+    #[error("invalid argument: {message}")]
+    InvalidArgument {
+        /// What was invalid.
+        message: String,
+    },
+
+    /// Texture (image, view, sampler, memory, or descriptor) creation
+    /// failed — M1.
+    #[error("texture creation failed: {message}")]
+    TextureCreate {
+        /// Driver/API detail.
+        message: String,
+    },
+
+    /// A texture upload (staging, copy, or its submission) failed — M1.
+    #[error("texture upload failed: {message}")]
+    TextureUpload {
+        /// Driver/API detail.
+        message: String,
+    },
+
     /// Invalid draw call — mismatched vertex layout, null handle, or
     /// out-of-range vertex count.
     #[error("invalid draw call: {message}")]

@@ -22,15 +22,39 @@
 //! the `VkBuffer` for binding.
 
 use std::ffi::{CString, c_void};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
+
+/// Serializes every graphics-QUEUE operation process-wide (review rounds
+/// 5–6, P1). Per-backend render locks cannot synchronize the queue when
+/// two backends share one device — the queue object itself requires
+/// external synchronization. This covers BOTH Goldenweek's direct
+/// submissions AND the substrate-mediated ones (zunesha's device-local
+/// staging in `create_buffer`, its readback transfer in `read_pixels`).
+/// This is a LEAF lock: taken while holding the render lock (order:
+/// render → queue, never reversed), never holding anything the queue-op
+/// paths would need. Cross-backend frames serialize on it — correct
+/// before concurrent (v0.1's synchronous model).
+///
+/// RESIDUAL (documented): a consumer calling ZUNESHA directly on the
+/// shared device concurrent with Goldenweek operations is NOT
+/// synchronized by this lock — that requires one shared protocol owned
+/// by the substrate (a Zunesha ADR candidate; the queue-serialization
+/// seam belongs there, not in each consumer).
+static QUEUE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire the device-queue lock. See [`QUEUE_LOCK`].
+fn queue_guard() -> std::sync::MutexGuard<'static, ()> {
+    QUEUE_LOCK.lock().expect("device queue lock poisoned")
+}
 
 use ash::vk::Handle;
 use ash::{Entry, ext, khr, vk};
 
 use crate::frame::{Frame, FrameInner};
 use crate::{
-    CullMode, GpuBuffer, GraphicsError, PipelineConfig, RenderPipeline, Result, SurfaceHandle,
-    Topology, VertexFormat,
+    CullMode, FilterMode, GpuBuffer, GraphicsError, PipelineConfig, RenderPipeline, Result,
+    SurfaceHandle, Texture, TextureDesc, Topology, VertexFormat,
 };
 use zunesha::Device;
 
@@ -375,37 +399,351 @@ enum RenderPhase {
 /// Internal state for a compiled Vulkan pipeline, stored behind the opaque
 /// [`RenderPipeline`] handle. Self-contained (clones the device) so it can
 /// destroy itself on drop.
-struct VulkanPipelineInner {
+pub(crate) struct VulkanPipelineInner {
     pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
     vs_module: vk::ShaderModule,
     fs_module: vk::ShaderModule,
     device: ash::Device,
+    /// Retention (round 9, P1): a pipeline bound into a recording whose
+    /// completion is unconfirmed must not be destroyed — same discipline
+    /// as vertex buffers.
+    retention: Option<Arc<Mutex<BufferRetention>>>,
+    /// The backend's liveness tombstone.
+    alive: Option<Arc<AtomicBool>>,
 }
 
-/// Drop function stored in [`RenderPipeline`] — drops the boxed inner and its
-/// Vulkan objects.
+/// Destroy a pipeline inner's Vulkan objects (device alive, no pending
+/// submission references it).
+unsafe fn destroy_pipeline_inner(inner: VulkanPipelineInner) {
+    unsafe {
+        inner.device.destroy_pipeline(inner.pipeline, None);
+        inner.device.destroy_pipeline_layout(inner.layout, None);
+        inner.device.destroy_shader_module(inner.vs_module, None);
+        inner.device.destroy_shader_module(inner.fs_module, None);
+    }
+}
+
+/// Drop function stored in [`RenderPipeline`] — retention-aware (round 9,
+/// P1): bound-into-pending → graveyard (drained at Idle, completion
+/// confirmed); poisoned → leak; else destroy now.
 pub(super) fn drop_vulkan_pipeline(raw: *mut c_void) {
     if !raw.is_null() {
         // Safety: `raw` was produced by `Box::into_raw` in
         // `compile_render_pipeline`.
+        let inner = unsafe { Box::from_raw(raw as *mut VulkanPipelineInner) };
+        // QUEUE→RETENTION + check-and-destroy inside both guards — same
+        // teardown-atomicity contract as buffers (round 10, P1).
+        let (Some(retention), Some(alive)) = (inner.retention.clone(), inner.alive.clone()) else {
+            // Safety: no retention metadata — destroy directly.
+            unsafe { destroy_pipeline_inner(*inner) };
+            return;
+        };
+        let _queue = queue_guard();
+        let mut guard = retention.lock().expect("buffer retention lock");
+        if !alive.load(AtomicOrdering::Acquire) {
+            eprintln!(
+                "goldenweek: a RenderPipeline outlived its backend; leaking its GPU resources (documented contract violation)"
+            );
+            std::mem::forget(inner);
+            return;
+        }
+        let key = raw as usize;
+        if guard.poisoned {
+            guard.leaked_pipelines.push(*inner);
+            return;
+        }
+        if guard.bound_pipelines.contains(&key) {
+            guard.graveyard_pipelines.push(*inner);
+            return;
+        }
+        // Safety: no pending submission references it; device alive.
+        unsafe { destroy_pipeline_inner(*inner) };
+    }
+}
+
+/// What is boxed inside a [`GpuBuffer`]'s `raw` (vulkan backend): the
+/// zunesha buffer plus the retention state that keeps it alive while a
+/// submission whose completion is unconfirmed still references it
+/// (review round 9, P1).
+pub(crate) struct GpuBufferInner {
+    pub buffer: zunesha::Buffer,
+    /// The backend's liveness tombstone (shared with textures).
+    pub alive: Arc<AtomicBool>,
+    /// The backend's buffer-retention registry.
+    pub retention: Arc<Mutex<BufferRetention>>,
+}
+
+/// Backend-side retention for vertex buffers (mirrors the texture
+/// bindings registry): buffers bound into the pending recording, and
+/// deferred destructions. Buffers whose frame completion could not be
+/// confirmed (poisoned backend) move to `leaked` and are never destroyed
+/// — the Zunesha 0.1.2 unconfirmed_submission discipline.
+#[derive(Default)]
+pub(crate) struct BufferRetention {
+    /// Boxed-`GpuBufferInner` pointers bound into the CURRENT recording.
+    pub bound: std::collections::HashSet<usize>,
+    /// Inners whose public handle dropped while bound — destroyed at the
+    /// frame's Idle drain (completion confirmed by the fence wait).
+    pub graveyard: Vec<GpuBufferInner>,
+    /// Inners with unconfirmable completion (poison) — LEAKED, never
+    /// destroyed.
+    pub leaked: Vec<GpuBufferInner>,
+    /// Set when the backend is poisoned with GPU work outstanding: every
+    /// later buffer drop leaks too — its submission's completion can
+    /// never be confirmed (round 9, P1).
+    pub poisoned: bool,
+    /// Pipelines bound into the CURRENT recording (round 9, P1 — the
+    /// same class as buffers: 00765 destroy-while-pending).
+    pub bound_pipelines: std::collections::HashSet<usize>,
+    /// Retired pipelines — destroyed at the Idle drain.
+    pub graveyard_pipelines: Vec<VulkanPipelineInner>,
+    /// Leaked pipelines (poison) — never destroyed.
+    pub leaked_pipelines: Vec<VulkanPipelineInner>,
+}
+
+/// Drop function stored in [`GpuBuffer`] — retention-aware (round 9, P1).
+///
+/// RECURSION RULE: destruction takes the QUEUE_LOCK — never run this
+/// while that lock is held on this thread.
+pub(super) fn drop_zunesha_buffer_box(raw: *mut c_void) {
+    if !raw.is_null() {
+        // Safety: `raw` was produced by `Box::into_raw` in `create_buffer`.
+        let inner = unsafe { Box::from_raw(raw as *mut GpuBufferInner) };
+        // QUEUE→RETENTION order (round 10, P1: poison sites take retention
+        // while QUEUE_LOCK is already held — retention-then-queue here
+        // would invert). Liveness check AND destroy inside BOTH guards:
+        // teardown tombstones under retention, so this critical section is
+        // atomic with backend teardown — the destroy runs while the device
+        // is provably valid, or the tombstone is observed and we leak.
+        let _queue = queue_guard();
+        let retention = Arc::clone(&inner.retention);
+        let mut guard = retention.lock().expect("buffer retention lock");
+        if !inner.alive.load(AtomicOrdering::Acquire) {
+            eprintln!(
+                "goldenweek: a GpuBuffer outlived its backend; leaking its GPU resources (documented contract violation)"
+            );
+            std::mem::forget(inner);
+            return;
+        }
+        let key = raw as usize;
+        if guard.poisoned {
+            guard.leaked.push(*inner);
+            return;
+        }
+        if guard.bound.contains(&key) {
+            guard.graveyard.push(*inner);
+            return;
+        }
+        drop(inner); // zunesha teardown (device quiesce) — queue held ✓
+    }
+}
+
+/// A bare (unboxed) zunesha staging buffer whose teardown joins the
+/// QUEUE_LOCK protocol — used by `read_pixels`' local staging. Same
+/// recursion rule as [`drop_zunesha_buffer_box`].
+struct QueueLockedStaging(std::mem::ManuallyDrop<zunesha::Buffer>);
+
+impl Drop for QueueLockedStaging {
+    fn drop(&mut self) {
+        let _queue = queue_guard();
+        // Safety: ManuallyDrop field — dropped exactly once, here, under
+        // the guard (a bare field would double-drop after this impl: the
+        // compiler still drops fields after a custom Drop runs).
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.0) };
+    }
+}
+
+/// Owning handle for an M1 texture's GPU resources. `raw` is what
+/// [`Texture::raw`](crate::Texture) carries (boxed); the drop function
+/// destroys in dependency-safe order: view, sampler, image, memory, then the
+/// descriptor pool (which frees its sets).
+pub(crate) struct VulkanTextureInner {
+    pub view: vk::ImageView,
+    pub sampler: vk::Sampler,
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub pool: vk::DescriptorPool,
+    pub set: vk::DescriptorSet,
+    pub width: u32,
+    pub height: u32,
+    /// Cloned device handle so a boxed inner can destroy its own Vulkan
+    /// objects on drop — the same pattern [`VulkanPipelineInner`] uses
+    /// (an `ash::Device` is an Arc'd handle; cloning is the established
+    /// idiom in this file).
+    pub device: ash::Device,
+    /// Tombstone set by the backend's `Drop` before it destroys the
+    /// device — a texture dropped after its backend must NOT issue
+    /// destroys on a dead device (review round 1, P1); it leaks with a
+    /// stderr note instead, mirroring the Zunesha 0.1.2 discipline.
+    pub alive: Arc<AtomicBool>,
+    /// Backend-side registry of textures bound into the frame still being
+    /// recorded: a texture dropped while its recording is pending is
+    /// retired into the graveyard at that frame's completion instead of
+    /// destroyed out from under it (review round 1, P1).
+    pub bindings: Arc<Mutex<TextureBindings>>,
+}
+
+/// Textures with outstanding recordings, and deferred destructions.
+///
+/// `bound` collects the raw inner pointers bound by `draw_textured` into
+/// the CURRENT recording; the graveyard holds inners whose public handle
+/// dropped while still bound. Both are cleared/drained when a frame
+/// completes (phase commits to Idle) — that is the first moment no
+/// pending recording can reference a texture.
+#[derive(Default)]
+pub(crate) struct TextureBindings {
+    pub bound: std::collections::HashSet<usize>,
+    pub graveyard: Vec<VulkanTextureInner>,
+}
+
+/// Drop function stored in [`Texture`](crate::Texture) — drops the boxed inner
+/// and its Vulkan objects.
+pub(crate) fn vulkan_texture_drop(raw: *mut c_void) {
+    if !raw.is_null() {
+        // Safety: `raw` was produced by `Box::into_raw::<VulkanTextureInner>`
+        // in `create_texture`.
+        //
+        // Two lifetime hazards are handled before any destroy
+        // (review round 1, P1s):
+        // 1. The backend may already be destroyed — the `alive` tombstone
+        //    is checked first and the texture LEAKS with a stderr note
+        //    rather than issuing destroys on a dead device.
+        // 2. The texture may still be bound into a pending recording —
+        //    its inner is moved into the backend's graveyard and
+        //    destroyed when the frame completes.
+        // The ENTIRE decision + destroy sequence runs under the bindings
+        // lock, and the backend's `Drop` sets the `alive` tombstone under
+        // the SAME lock before tearing the device down — so a drop racing
+        // backend teardown either completes its destroys while the device
+        // is still alive (this path won the lock first) or observes
+        // `alive == false` and leaks. The check alone was racy (review
+        // round 2, P1).
         unsafe {
-            let inner = Box::from_raw(raw as *mut VulkanPipelineInner);
-            inner.device.destroy_pipeline(inner.pipeline, None);
-            inner.device.destroy_pipeline_layout(inner.layout, None);
-            inner.device.destroy_shader_module(inner.vs_module, None);
-            inner.device.destroy_shader_module(inner.fs_module, None);
+            let inner = Box::from_raw(raw as *mut VulkanTextureInner);
+            let key = raw as usize;
+            let bindings_arc = Arc::clone(&inner.bindings);
+            let mut bindings = bindings_arc.lock().expect("texture bindings lock");
+            if !inner.alive.load(std::sync::atomic::Ordering::Acquire) {
+                drop(bindings);
+                eprintln!(
+                    "goldenweek: a Texture outlived its backend; leaking its GPU resources (documented contract violation — see the Texture docs)"
+                );
+                std::mem::forget(inner);
+                return;
+            }
+            if bindings.bound.contains(&key) {
+                bindings.graveyard.push(*inner);
+                return;
+            }
+            // Destroy WHILE STILL HOLDING the guard (review round 3, P1):
+            // releasing first re-opened the teardown race — backend Drop
+            // could invalidate the device between the release and these
+            // destroys. `destroy_texture_inner` takes no locks, so holding
+            // the guard across it cannot deadlock.
+            destroy_texture_inner(inner);
         }
     }
 }
 
-/// Drop function stored in [`GpuBuffer`] — drops the boxed `zunesha::Buffer`,
-/// whose own drop destroys the Vulkan buffer + memory.
-pub(super) fn drop_zunesha_buffer_box(raw: *mut c_void) {
-    if !raw.is_null() {
-        // Safety: `raw` was produced by `Box::into_raw` in `create_buffer`.
+/// Destroy a texture's resources — caller has verified the backend is
+/// alive and no recording references it.
+///
+/// Safety: `inner`'s device is alive and `inner.set`'s pool is `inner.pool`.
+unsafe fn destroy_texture_inner(inner: Box<VulkanTextureInner>) {
+    debug_assert!(
+        inner.width > 0 && inner.height > 0,
+        "a created texture always has a non-zero extent",
+    );
+    // leak-safe: no DeviceWaitIdle here — the caller has verified no
+    // pending recording references this texture (bound-set check at
+    // drop, drain at frame completion).
+    unsafe {
+        inner.device.destroy_image_view(inner.view, None);
+        inner.device.destroy_sampler(inner.sampler, None);
+        inner.device.destroy_image(inner.image, None);
+        inner.device.free_memory(inner.memory, None);
+        inner.device.destroy_descriptor_pool(inner.pool, None);
+    }
+}
+
+/// Find a memory type index satisfying `required` among the `bits` mask.
+fn find_memory_type(
+    props: &vk::PhysicalDeviceMemoryProperties,
+    bits: u32,
+    required: vk::MemoryPropertyFlags,
+) -> Option<u32> {
+    (0..props.memory_type_count).find(|&i| {
+        bits & (1 << i) != 0
+            && props.memory_types[i as usize]
+                .property_flags
+                .contains(required)
+    })
+}
+
+/// RAII cleanup for `create_texture`'s partial construction.
+///
+/// Every handle is set the moment it is created — before the next fallible
+/// call — so a failure at any later `?` destroys exactly what exists so far
+/// (in dependency-safe order) on the caller's device. On success the fields
+/// are `take()`n into the returned [`VulkanTextureInner`] and `Drop` becomes a
+/// no-op for them.
+struct TextureScratch {
+    device: ash::Device,
+    staging: Option<vk::Buffer>,
+    staging_memory: Option<vk::DeviceMemory>,
+    image: Option<vk::Image>,
+    image_memory: Option<vk::DeviceMemory>,
+    view: Option<vk::ImageView>,
+    sampler: Option<vk::Sampler>,
+    command_pool: Option<vk::CommandPool>,
+    descriptor_pool: Option<vk::DescriptorPool>,
+    /// Set when a SUBMITTED upload's fence wait failed: the submission is
+    /// still pending on the queue, so destroying anything it touches is
+    /// use-after-free. The guard then LEAKS deliberately (with a stderr
+    /// note) instead of destroying in-flight resources — the Zunesha
+    /// 0.1.2 `unconfirmed_submission` discipline (review round 1, P1).
+    leak: bool,
+}
+
+impl Drop for TextureScratch {
+    fn drop(&mut self) {
+        // Leaked mode (upload wait failure with the submission pending):
+        // destroy NOTHING — the fence, command buffers, staging, and image
+        // are all in flight; the guard's whole purpose is to keep them
+        // alive by dropping the handles without destroying them (the
+        // stderr note at the failure site explains the leak).
+        if self.leak {
+            return;
+        }
+        // Safety: every handle was created on `self.device` in
+        // `create_texture` and, while still `Some`, is owned exclusively by
+        // this guard — nothing else references it.
         unsafe {
-            drop(Box::from_raw(raw as *mut zunesha::Buffer));
+            if let Some(pool) = self.descriptor_pool {
+                self.device.destroy_descriptor_pool(pool, None);
+            }
+            if let Some(pool) = self.command_pool {
+                self.device.destroy_command_pool(pool, None);
+            }
+            if let Some(sampler) = self.sampler {
+                self.device.destroy_sampler(sampler, None);
+            }
+            if let Some(view) = self.view {
+                self.device.destroy_image_view(view, None);
+            }
+            if let Some(memory) = self.image_memory {
+                self.device.free_memory(memory, None);
+            }
+            if let Some(image) = self.image {
+                self.device.destroy_image(image, None);
+            }
+            if let Some(memory) = self.staging_memory {
+                self.device.free_memory(memory, None);
+            }
+            if let Some(buffer) = self.staging {
+                self.device.destroy_buffer(buffer, None);
+            }
         }
     }
 }
@@ -437,6 +775,7 @@ struct InitScratch<'a> {
     fence: Option<vk::Fence>,
     image_available: Option<vk::Semaphore>,
     render_finished: Option<vk::Semaphore>,
+    texture_set_layout: Option<vk::DescriptorSetLayout>,
 }
 
 impl InitScratch<'_> {
@@ -453,6 +792,7 @@ impl InitScratch<'_> {
         self.fence = None;
         self.image_available = None;
         self.render_finished = None;
+        self.texture_set_layout = None;
     }
 }
 
@@ -493,6 +833,9 @@ impl Drop for InitScratch<'_> {
             if let Some(pool) = self.command_pool {
                 self.device.destroy_command_pool(pool, None);
             }
+            if let Some(layout) = self.texture_set_layout {
+                self.device.destroy_descriptor_set_layout(layout, None);
+            }
             if self.swapchain != vk::SwapchainKHR::null() {
                 self.swapchain_fn.destroy_swapchain(self.swapchain, None);
             }
@@ -526,6 +869,25 @@ pub struct VulkanBackend<'a> {
     /// `VK_KHR_swapchain` device functions.
     swapchain_fn: khr::swapchain::Device,
     surface: vk::SurfaceKHR,
+    /// Descriptor set layout for the M1 texture set (set 0): the sampled
+    /// image at binding 0 and its sampler at binding 1 — the split naga
+    /// emits for WGSL's separate `texture_2d` and `sampler` globals. It is
+    /// declared on every render pipeline layout; shaders that don't sample
+    /// simply never reference the set, which is valid. A single combined
+    /// binding 0 is not expressible through naga's WGSL to SPIR-V path (see
+    /// the M1 report).
+    texture_set_layout: vk::DescriptorSetLayout,
+    /// Tombstone: false once the backend's `Drop` begins — a `Texture`
+    /// dropped after that leaks (with a stderr note) instead of destroying
+    /// on a dead device (review round 1, P1).
+    alive: Arc<AtomicBool>,
+    /// Textures bound into the current recording + deferred destructions
+    /// (see [`TextureBindings`]) — drained when a frame completes (phase
+    /// commits Idle).
+    texture_bindings: Arc<Mutex<TextureBindings>>,
+    /// Vertex-buffer retention (see [`BufferRetention`]) — bound into the
+    /// pending recording, drained at Idle, leaked on poison (round 9 P1).
+    buffer_retention: Arc<Mutex<BufferRetention>>,
     swapchain: vk::SwapchainKHR,
     /// Whether the current swapchain's images carry `TRANSFER_SRC` usage
     /// (required by [`Self::read_pixels`]). False on surfaces that do not
@@ -583,7 +945,10 @@ impl Drop for VulkanBackend<'_> {
         // by the caller (documented invariant). The device/instance/surface
         // belong to their owners and are NOT destroyed here.
         unsafe {
-            let _ = self.device.device_wait_idle();
+            let idle_ok = {
+                let _queue = queue_guard();
+                self.device.device_wait_idle().is_ok()
+            };
             let render = self.render.lock().expect("render state lock");
             self.device.destroy_fence(render.fence, None);
             self.device
@@ -595,12 +960,84 @@ impl Drop for VulkanBackend<'_> {
             for &view in &self.image_views {
                 self.device.destroy_image_view(view, None);
             }
+            // Tombstone + graveyard teardown. The tombstone is set INSIDE
+            // the bindings-lock critical section (the same lock
+            // `vulkan_texture_drop` holds across its check-and-destroy —
+            // the ordering that closes the teardown race, review round 2
+            // P1): a racing drop either completed while the device was
+            // alive, or will observe `alive == false` and leak. The
+            // retired destroys below run OUTSIDE the guard — deliberately
+            // and safely (review round 4, P3): every inner was REMOVED
+            // from the registry under the guard, and any later public
+            // drop sees the tombstone and leaks rather than destroying,
+            // so nothing races these destroys. The device is still very
+            // much alive HERE, so retired inners are destroyed — not
+            // leaked (review round 2, P2).
+            let retired: Vec<VulkanTextureInner> = {
+                let mut bindings = self.texture_bindings.lock().expect("texture bindings lock");
+                self.alive.store(false, AtomicOrdering::Release);
+                bindings.bound.clear();
+                std::mem::take(&mut bindings.graveyard)
+            };
+            for inner in retired {
+                // Safety: device alive, no recording references these
+                // (retired), no concurrent drop can interleave (they queue
+                // on the lock and will see the tombstone).
+                destroy_texture_inner(Box::new(inner));
+            }
+            // Buffer retention teardown (round 9, P1): destruction requires
+            // CONFIRMED completion. If device_wait_idle succeeded, the GPU
+            // is quiescent and the graveyard may be destroyed; if it failed
+            // (or the backend was poisoned), leak with a note — never
+            // destroy unconfirmed GPU work. `leaked` is never touched
+            // again on purpose.
+            let (retired_buffers, leaked_buffers, retired_pipelines, leaked_pipelines) = {
+                let mut retention = self.buffer_retention.lock().expect("buffer retention lock");
+                // Tombstone set UNDER RETENTION as well (round 10, P1): the
+                // public buffer/pipeline drops hold this lock across their
+                // alive-check-and-destroy, so this critical section is
+                // atomic with them — a racing drop either completed its
+                // device calls while the device was valid (we were blocked
+                // on this lock), or observes the tombstone and leaks.
+                self.alive.store(false, AtomicOrdering::Release);
+                retention.bound.clear();
+                retention.bound_pipelines.clear();
+                (
+                    std::mem::take(&mut retention.graveyard),
+                    std::mem::take(&mut retention.leaked),
+                    std::mem::take(&mut retention.graveyard_pipelines),
+                    std::mem::take(&mut retention.leaked_pipelines),
+                )
+            };
+            if idle_ok {
+                // Completion confirmed (device_wait_idle succeeded).
+                let _queue = queue_guard();
+                for inner in retired_buffers {
+                    drop(inner);
+                }
+                // Safety: GPU quiescent.
+                for inner in retired_pipelines {
+                    destroy_pipeline_inner(inner);
+                }
+            } else {
+                eprintln!(
+                    "goldenweek: backend teardown could not confirm GPU quiescence; leaking {} buffer(s) and {} pipeline(s) rather than destroying unconfirmed GPU work",
+                    retired_buffers.len() + leaked_buffers.len(),
+                    retired_pipelines.len() + leaked_pipelines.len()
+                );
+                std::mem::forget(retired_buffers);
+                std::mem::forget(retired_pipelines);
+            }
+            std::mem::forget(leaked_buffers);
+            std::mem::forget(leaked_pipelines);
             self.device.destroy_render_pass(self.render_pass, None);
             self.device.destroy_image_view(self.depth_view, None);
             self.device.destroy_image(self.depth_image, None);
             self.device.free_memory(self.depth_memory, None);
             self.device.destroy_semaphore(self.image_available, None);
             self.device.destroy_semaphore(self.render_finished, None);
+            self.device
+                .destroy_descriptor_set_layout(self.texture_set_layout, None);
             self.device.destroy_command_pool(self.command_pool, None);
             // Null after a failed recreate destroyed the retired swapchain
             // (round 2, P1) — never double-destroy.
@@ -612,6 +1049,140 @@ impl Drop for VulkanBackend<'_> {
 }
 
 impl<'a> VulkanBackend<'a> {
+    /// Present's submit/present/wait section — every queue operation in
+    /// it is covered by the CALLER's whole-body guard. Early `return`s are
+    /// GraphicsError, same as present's; the `Ok` payload carries the
+    /// queue_present result plus whether THIS invocation submitted (the
+    /// signal-drain condition).
+    /// CALLER-LOCKS CONTRACT (round 13 consolidation): `present` holds the
+    /// QUEUE_LOCK across this entire section AND the post-present arms —
+    /// this function takes NO guard itself (self-locking helpers are
+    /// forbidden; rounds 11–12 were both born from that pattern).
+    fn present_locked(
+        &self,
+        render: &mut RenderState,
+        index: u32,
+    ) -> std::result::Result<(ash::prelude::VkResult<bool>, bool), GraphicsError> {
+        let flush_state = match render.phase {
+            // Recording active — end it, submit, present.
+            RenderPhase::Open(i) if i == index => NeedsSubmit::Record,
+            // Recording already ENDED (a `read_pixels` flush was interrupted
+            // between end and submit) — submit without ending (round 7, P1).
+            RenderPhase::Flushing(i) if i == index => NeedsSubmit::Ended,
+            // A `read_pixels` flush already submitted the rendering and
+            // fence-waited it; present without semaphore waits (the image is
+            // idle from the host's perspective).
+            RenderPhase::Flushed(i) if i == index => NeedsSubmit::No,
+            ref other => {
+                return Err(GraphicsError::InvalidDraw {
+                    message: format!("frame {index} is not the frame being recorded ({other:?})"),
+                });
+            }
+        };
+
+        // Whether THIS invocation submitted (and therefore signaled
+        // render_finished): only then can a failed present strand the
+        // signal and only then may the drain wait on it (round 10, P1).
+        let submitted = !matches!(flush_state, NeedsSubmit::No);
+
+        let present_result = match flush_state {
+            NeedsSubmit::No => {
+                let swapchains = [self.swapchain];
+                let indices = [index];
+                let present_info = vk::PresentInfoKHR::default()
+                    .swapchains(&swapchains)
+                    .image_indices(&indices);
+                // Safety: queue and image are idle (flush fence-waited).
+                unsafe {
+                    self.swapchain_fn
+                        .queue_present(self.graphics_queue, &present_info)
+                }
+            }
+            needs_submit => {
+                unsafe {
+                    if matches!(needs_submit, NeedsSubmit::Record) {
+                        self.device.cmd_end_render_pass(render.cmd);
+                        let end = self.device.end_command_buffer(render.cmd);
+                        if let Err(e) = end {
+                            // Same boundary as the readback flush: the
+                            // recording is invalid, reset it away and commit
+                            // Acquired so recovery presents the image back
+                            // (round 8, P1).
+                            let _ = self.device.reset_command_buffer(
+                                render.cmd,
+                                vk::CommandBufferResetFlags::empty(),
+                            );
+                            render.phase = RenderPhase::Acquired(index);
+                            return Err(GraphicsError::PresentFailed {
+                                message: format!("end command buffer: {e}"),
+                            });
+                        }
+                        // Commit the ended state before the fallible fence
+                        // reset (round 7, P1): an interruption here resumes
+                        // without ending twice.
+                        render.phase = RenderPhase::Flushing(index);
+                    }
+
+                    let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+                    let submit = vk::SubmitInfo::default()
+                        .wait_semaphores(std::slice::from_ref(&self.image_available))
+                        .wait_dst_stage_mask(&wait_stages)
+                        .command_buffers(std::slice::from_ref(&render.cmd))
+                        .signal_semaphores(std::slice::from_ref(&self.render_finished));
+                    // Reset the fence only now — immediately before the submit that
+                    // will signal it — so it is unsignalled for the shortest possible
+                    // window (unobservable in the synchronous loop).
+                    self.device
+                        .reset_fences(std::slice::from_ref(&render.fence))
+                        .map_err(|e| GraphicsError::PresentFailed {
+                            message: format!("fence reset: {e}"),
+                        })?;
+                    // A submission failure here strands the unsignaled fence
+                    // exactly as in frame recovery — poison so entry points fail
+                    // fast instead of deadlocking (review round 6, P1).
+                    if let Err(e) = self.device.queue_submit(
+                        self.graphics_queue,
+                        std::slice::from_ref(&submit),
+                        render.fence,
+                    ) {
+                        render.broken = true;
+                        self.poison_buffer_retention();
+                        return Err(GraphicsError::PresentFailed {
+                            message: format!("vkQueueSubmit: {e}"),
+                        });
+                    }
+
+                    let swapchains = [self.swapchain];
+                    let indices = [index];
+                    let present_info = vk::PresentInfoKHR::default()
+                        .wait_semaphores(std::slice::from_ref(&self.render_finished))
+                        .swapchains(&swapchains)
+                        .image_indices(&indices);
+                    self.swapchain_fn
+                        .queue_present(self.graphics_queue, &present_info)
+                }
+            }
+        };
+        // Block until the frame's work is complete, so the next acquire can
+        // safely reset and reuse the command buffer (the synchronous
+        // frame-loop contract). In the Flushed path the fence is already
+        // signalled (and waited) — the wait returns immediately.
+        // Safety: the fence was submitted on this device (present or flush).
+        unsafe {
+            self.device
+                .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
+                .map_err(|e| {
+                    render.broken = true;
+                    self.poison_buffer_retention();
+                    GraphicsError::PresentFailed {
+                        message: format!("fence wait: {e}"),
+                    }
+                })?;
+        }
+
+        Ok((present_result, submitted))
+    }
+
     /// Construct the backend over a borrowed Zunesha device and an external
     /// surface, building the swapchain, render pass, and framebuffers against
     /// the surface.
@@ -750,7 +1321,31 @@ impl<'a> VulkanBackend<'a> {
             fence: None,
             image_available: None,
             render_finished: None,
+            texture_set_layout: None,
         };
+
+        // Texture set layout (M1): set 0 declares the sampled image at
+        // binding 0 and its sampler at binding 1 — the shape naga's
+        // WGSL→SPIR-V path produces for separate `texture_2d` + `sampler`
+        // globals. Registered with the guard before the next fallible call.
+        let texture_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        let dsl_ci = vk::DescriptorSetLayoutCreateInfo::default().bindings(&texture_bindings);
+        let texture_set_layout = unsafe { logical.create_descriptor_set_layout(&dsl_ci, None) }
+            .map_err(|e| GraphicsError::TextureCreate {
+                message: format!("descriptor set layout: {e}"),
+            })?;
+        scratch.texture_set_layout = Some(texture_set_layout);
 
         // Image views + render pass + framebuffers — the swapchain's rendering
         // surface. One framebuffer per swapchain image, all sized to `extent`.
@@ -954,6 +1549,10 @@ impl<'a> VulkanBackend<'a> {
             graphics_queue_family: graphics.family_index,
             image_available,
             render_finished,
+            texture_set_layout,
+            alive: Arc::new(AtomicBool::new(true)),
+            texture_bindings: Arc::new(Mutex::new(TextureBindings::default())),
+            buffer_retention: Arc::new(Mutex::new(BufferRetention::default())),
         })
     }
 
@@ -1024,6 +1623,7 @@ impl<'a> VulkanBackend<'a> {
     /// flush and its interrupted-retry path — the recording must already be
     /// ended when this runs (round 7, P1).
     fn finish_flush(&self, render: &mut RenderState) -> Result<()> {
+        let _queue = queue_guard();
         let RenderPhase::Flushing(index) = render.phase else {
             return Err(GraphicsError::Internal(
                 "finish_flush called outside Flushing".into(),
@@ -1047,6 +1647,7 @@ impl<'a> VulkanBackend<'a> {
                 render.fence,
             ) {
                 render.broken = true;
+                self.poison_buffer_retention();
                 return Err(GraphicsError::Internal(format!("readback submit: {e}")));
             }
             if let Err(e) =
@@ -1054,11 +1655,110 @@ impl<'a> VulkanBackend<'a> {
                     .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
             {
                 render.broken = true;
+                self.poison_buffer_retention();
                 return Err(GraphicsError::Internal(format!("readback wait: {e}")));
             }
         }
         render.phase = RenderPhase::Flushed(index);
         Ok(())
+    }
+
+    /// Drain textures bound into the completed recording: clear the
+    /// bound set and destroy graveyard inners. Called at every Idle
+    /// commit — the first moment no pending recording can reference a
+    /// texture (review round 1, P1).
+    ///
+    /// Lock order: render lock (held by caller) → bindings lock. Never
+    /// the reverse (`vulkan_texture_drop` takes only the bindings lock).
+    ///
+    /// PROTOCOL NOTE (review round 4, P3): these destroys run OUTSIDE the
+    /// bindings guard — deliberately, and safely: this path is
+    /// backend-owned and runs under the render lock, and the inners it
+    /// destroys were REMOVED from the registry under the guard, so a
+    /// concurrent public drop targets a different inner or queues on the
+    /// lock. The guard-through-destroy discipline applies to the public
+    /// drop path, whose races are arbitrary users; backend-owned paths
+    /// are ordered by construction.
+    /// Poison buffer retention (called wherever `broken` is set): the
+    /// pending recording's completion can no longer be confirmed, so every
+    /// bound or retired buffer moves to the leak list — never destroyed
+    /// (round 9, P1). Lock order: render (held by callers) → retention.
+    fn poison_buffer_retention(&self) {
+        let mut guard = self.buffer_retention.lock().expect("buffer retention lock");
+        if guard.poisoned {
+            return; // already poisoned — idempotent
+        }
+        guard.poisoned = true;
+        let bound = std::mem::take(&mut guard.bound);
+        let graveyard = std::mem::take(&mut guard.graveyard);
+        let bound_p = std::mem::take(&mut guard.bound_pipelines);
+        let graveyard_p = std::mem::take(&mut guard.graveyard_pipelines);
+        if !bound.is_empty() || !graveyard.is_empty() {
+            eprintln!(
+                "goldenweek: backend broken with in-flight vertex buffers; leaking {} GPU buffer(s) rather than destroying unconfirmed GPU work",
+                bound.len() + graveyard.len()
+            );
+        }
+        if !bound_p.is_empty() || !graveyard_p.is_empty() {
+            eprintln!(
+                "goldenweek: backend broken with in-flight pipelines; leaking {} pipeline(s) rather than destroying unconfirmed GPU work",
+                bound_p.len() + graveyard_p.len()
+            );
+        }
+        guard.leaked.extend(graveyard);
+        guard.leaked_pipelines.extend(graveyard_p);
+        let _ = (bound, bound_p);
+        // `bound` holds only pointers; the boxes they point at are the
+        // public handles' — nothing to move for still-live ones here.
+        // The still-live handles will find `alive`/poison state on drop.
+        let _ = bound;
+    }
+
+    /// Drain buffer retention at a frame's Idle commit: completion was
+    /// fence-confirmed, so the graveyard can be destroyed and the bound
+    /// set clears. Lock order: render (held by callers) → queue (held by
+    /// callers) → retention (taken inside).
+    /// CALLER-LOCKS CONTRACT (round 13 consolidation): every QUEUE-mutating
+    /// operation — submit, present, and quiescing teardown — runs under an
+    /// explicit `queue_guard()` acquired in the SAME function; self-locking
+    /// helpers are forbidden (they deadlock under a caller's held guard,
+    /// review rounds 11–12, and invite bare call sites, round 12). Pure
+    /// fence waits (wait_for_fences) need no QUEUE_LOCK — a fence is not a
+    /// queue object and no external synchronization is required. The
+    /// zunesha teardown below quiesces the device, so the CALLER must hold
+    /// QUEUE_LOCK across this call; the retention lock is then taken
+    /// inside (queue→retention — never inverted).
+    fn drain_buffer_retention(&self) {
+        let mut guard = self.buffer_retention.lock().expect("buffer retention lock");
+        guard.bound.clear();
+        guard.bound_pipelines.clear();
+        let graveyard = std::mem::take(&mut guard.graveyard);
+        let graveyard_pipelines = std::mem::take(&mut guard.graveyard_pipelines);
+        drop(guard);
+        for inner in graveyard {
+            drop(inner); // zunesha teardown (device quiesce) — queue held ✓
+        }
+        // Safety: completion fence-confirmed at the Idle commit.
+        for inner in graveyard_pipelines {
+            unsafe { destroy_pipeline_inner(inner) };
+        }
+    }
+
+    /// CALLER-LOCKS CONTRACT (round 13 consolidation): the caller must
+    /// hold QUEUE_LOCK across this call — uniform with
+    /// [`drain_buffer_retention`], even though the texture destroys here
+    /// are direct ash calls; one rule, no exceptions.
+    fn drain_texture_bindings(&self) {
+        let drained: Vec<VulkanTextureInner> = {
+            let mut bindings = self.texture_bindings.lock().expect("texture bindings lock");
+            bindings.bound.clear();
+            std::mem::take(&mut bindings.graveyard)
+        };
+        for inner in drained {
+            // Safety: backend alive (caller holds render lock), no
+            // recording references these (drain point).
+            unsafe { destroy_texture_inner(Box::new(inner)) };
+        }
     }
 
     /// Fast-fail check for a backend poisoned by a failed frame recovery —
@@ -1093,6 +1793,9 @@ impl<'a> VulkanBackend<'a> {
     /// acquire would re-run this recovery and block forever on the
     /// already-consumed semaphore (review round 4, P1).
     fn recover_stale_frame(&self, render: &mut RenderState) -> std::result::Result<(), String> {
+        // The recovery submits and presents — serialize against every other
+        // queue user, including OTHER backends on this device (round 5 P1).
+        let _queue = queue_guard();
         let index = match render.phase {
             RenderPhase::Idle => return Ok(()),
             RenderPhase::Acquired(i)
@@ -1166,6 +1869,7 @@ impl<'a> VulkanBackend<'a> {
                     render.fence,
                 ) {
                     render.broken = true;
+                    self.poison_buffer_retention();
                     return Err(format!("recover submit: {e}"));
                 }
                 if let Err(e) =
@@ -1173,6 +1877,7 @@ impl<'a> VulkanBackend<'a> {
                         .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
                 {
                     render.broken = true;
+                    self.poison_buffer_retention();
                     return Err(format!("recover fence wait: {e}"));
                 }
             }
@@ -1208,6 +1913,15 @@ impl<'a> VulkanBackend<'a> {
                     // recreation (rounds 8–9, P1). No image is owned
                     // anymore.
                     render.phase = RenderPhase::Idle;
+                    // The stale recording that may have bound textures is
+                    // discarded with this frame — drain (review round 2,
+                    // P2; recovery runs under the render lock). The
+                    // CALLER-LOCKS CONTRACT (round 13 consolidation)
+                    // makes this safe under the still-held guard: the
+                    // drains take no queue lock themselves — round 11's
+                    // deadlock was born from them doing so.
+                    self.drain_texture_bindings();
+                    self.drain_buffer_retention();
                     return Err(format!(
                         "recover present-back: {e} (swapchain/surface lost — recreate required)"
                     ));
@@ -1280,10 +1994,23 @@ impl<'a> VulkanBackend<'a> {
                     .reset_command_buffer(render.cmd, vk::CommandBufferResetFlags::empty());
             }
             render.phase = RenderPhase::Idle;
+            // The discarded recording may have bound textures — drain
+            // BEFORE the teardown destroys anything they reference (review
+            // round 3, P2; recovery ran under the render lock).
+            // CALLER-LOCKS CONTRACT: this section takes the queue guard
+            // itself (round 13 consolidation).
+            {
+                let _queue = queue_guard();
+                self.drain_texture_bindings();
+                self.drain_buffer_retention();
+            }
         }
         // Safety: no submission may reference the objects being destroyed.
         unsafe {
-            let _ = self.device.device_wait_idle();
+            {
+                let _queue = queue_guard();
+                let _ = self.device.device_wait_idle();
+            }
         }
 
         let instance = self.zunesha_device.raw_instance();
@@ -1358,6 +2085,9 @@ impl<'a> VulkanBackend<'a> {
             fence: None,
             image_available: None,
             render_finished: None,
+            // The texture set layout is owned by the backend and survives
+            // swapchain recreation — the scratch never destroys it.
+            texture_set_layout: None,
         };
 
         let create_info = vk::SwapchainCreateInfoKHR::default()
@@ -1681,9 +2411,11 @@ impl<'a> VulkanBackend<'a> {
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
-        // Empty layout: v0.1 pipelines take no descriptors and no push
-        // constants.
-        let layout_ci = vk::PipelineLayoutCreateInfo::default();
+        // Every layout declares set 0 (the M1 texture set): shaders that
+        // don't sample never reference it (legal); `draw_textured` binds it
+        // for those that do.
+        let set_layouts = [self.texture_set_layout];
+        let layout_ci = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
         let layout =
             unsafe { self.device.create_pipeline_layout(&layout_ci, None) }.map_err(|e| {
                 GraphicsError::PipelineFailed {
@@ -1726,6 +2458,8 @@ impl<'a> VulkanBackend<'a> {
             vs_module,
             fs_module,
             device: self.device.clone(),
+            retention: Some(Arc::clone(&self.buffer_retention)),
+            alive: Some(Arc::clone(&self.alive)),
         });
         Ok(RenderPipeline {
             raw: Box::into_raw(inner) as *mut c_void,
@@ -1741,16 +2475,449 @@ impl<'a> VulkanBackend<'a> {
     /// backend, and in-flight frames reading it must complete first (the
     /// synchronous `present` guarantees this).
     pub fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<GpuBuffer> {
+        // Zunesha's device-local staging uploads SUBMIT to the graphics
+        // queue inside this call — a queue user like any other. Take the
+        // process-wide QUEUE_LOCK so substrate-mediated submissions
+        // serialize with Goldenweek's direct ones (review round 6, P1;
+        // reproduced: 10 threading errors without it).
+        let _queue = queue_guard();
         let buffer = self.zunesha_device.create_buffer(data).map_err(|e| {
             GraphicsError::BufferCreationFailed {
                 message: format!("{e}"),
             }
         })?;
         let len = std::mem::size_of_val(data);
+        let inner = GpuBufferInner {
+            buffer,
+            alive: Arc::clone(&self.alive),
+            retention: Arc::clone(&self.buffer_retention),
+        };
         Ok(GpuBuffer {
-            raw: Box::into_raw(Box::new(buffer)) as *mut c_void,
+            raw: Box::into_raw(Box::new(inner)) as *mut c_void,
             len,
             drop_fn: drop_zunesha_buffer_box,
+        })
+    }
+
+    /// Create an immutable RGBA8 texture and upload `data` — M1.
+    ///
+    /// One call, one state machine: validate → stage → create image
+    /// resources → upload (synchronous submit-and-wait on the graphics
+    /// queue via a transient pool) → build the descriptor set. The texture
+    /// is immediately sampleable when this returns.
+    ///
+    /// The texture's descriptor set is declared against `self.texture_set_layout`:
+    /// binding 0 is the sampled image and binding 1 its sampler (the split
+    /// naga emits for WGSL's separate `texture_2d` + `sampler` globals).
+    pub fn create_texture(
+        &self,
+        desc: &TextureDesc,
+        data: &[u8],
+        filter: FilterMode,
+    ) -> Result<Texture> {
+        // `validate` also fixes the payload length (`w * h * 4`).
+        desc.validate(data)
+            .map_err(|e| GraphicsError::InvalidArgument {
+                message: e.to_string(),
+            })?;
+
+        let instance = self.zunesha_device.raw_instance();
+        let memory_props =
+            unsafe { instance.get_physical_device_memory_properties(self.physical_device) };
+        let mut guard = TextureScratch {
+            device: self.device.clone(),
+            staging: None,
+            staging_memory: None,
+            image: None,
+            image_memory: None,
+            view: None,
+            sampler: None,
+            command_pool: None,
+            descriptor_pool: None,
+            leak: false,
+        };
+
+        // 1. Staging: host-visible, HOST_COHERENT, TRANSFER_SRC. Hand-rolled
+        //    (a transient internal detail — the zunesha::Buffer seam stays
+        //    for compute-shared buffers).
+        let staging_ci = vk::BufferCreateInfo::default()
+            .size(data.len() as u64)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let staging = unsafe { self.device.create_buffer(&staging_ci, None) }.map_err(|e| {
+            GraphicsError::TextureCreate {
+                message: format!("staging buffer: {e}"),
+            }
+        })?;
+        guard.staging = Some(staging);
+        let staging_req = unsafe { self.device.get_buffer_memory_requirements(staging) };
+        let staging_type = find_memory_type(
+            &memory_props,
+            staging_req.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+        .ok_or_else(|| GraphicsError::TextureCreate {
+            message: "no host-visible, host-coherent memory type for staging".into(),
+        })?;
+        let staging_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(staging_req.size)
+            .memory_type_index(staging_type);
+        let staging_memory =
+            unsafe { self.device.allocate_memory(&staging_alloc, None) }.map_err(|e| {
+                GraphicsError::TextureCreate {
+                    message: format!("staging memory: {e}"),
+                }
+            })?;
+        guard.staging_memory = Some(staging_memory);
+        unsafe { self.device.bind_buffer_memory(staging, staging_memory, 0) }.map_err(|e| {
+            GraphicsError::TextureCreate {
+                message: format!("bind staging memory: {e}"),
+            }
+        })?;
+        unsafe {
+            let ptr = self
+                .device
+                .map_memory(
+                    staging_memory,
+                    0,
+                    staging_req.size,
+                    vk::MemoryMapFlags::empty(),
+                )
+                .map_err(|e| GraphicsError::TextureCreate {
+                    message: format!("map staging memory: {e}"),
+                })?;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.cast::<u8>(), data.len());
+            self.device.unmap_memory(staging_memory);
+        }
+
+        // 2. Image + memory + view + sampler.
+        let subresource = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
+        let image_ci = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .extent(vk::Extent3D {
+                width: desc.width,
+                height: desc.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            // EXCLUSIVE: M1 images are touched only by the graphics
+            // family; CONCURRENT with a single family index is flagged by
+            // validation (00942) and gains nothing until cross-queue
+            // ownership lands (Zunesha ADR 0005 Phase 2's ledger) —
+            // review round 1, P1.
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { self.device.create_image(&image_ci, None) }.map_err(|e| {
+            GraphicsError::TextureCreate {
+                message: format!("texture image: {e}"),
+            }
+        })?;
+        guard.image = Some(image);
+        let image_req = unsafe { self.device.get_image_memory_requirements(image) };
+        let image_type = find_memory_type(
+            &memory_props,
+            image_req.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .ok_or_else(|| GraphicsError::TextureCreate {
+            message: "no device-local memory type for texture".into(),
+        })?;
+        let image_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(image_req.size)
+            .memory_type_index(image_type);
+        let image_memory =
+            unsafe { self.device.allocate_memory(&image_alloc, None) }.map_err(|e| {
+                GraphicsError::TextureCreate {
+                    message: format!("texture memory: {e}"),
+                }
+            })?;
+        guard.image_memory = Some(image_memory);
+        unsafe { self.device.bind_image_memory(image, image_memory, 0) }.map_err(|e| {
+            GraphicsError::TextureCreate {
+                message: format!("bind texture memory: {e}"),
+            }
+        })?;
+        let view_ci = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .subresource_range(subresource);
+        let view = unsafe { self.device.create_image_view(&view_ci, None) }.map_err(|e| {
+            GraphicsError::TextureCreate {
+                message: format!("texture view: {e}"),
+            }
+        })?;
+        guard.view = Some(view);
+        let filter_vk = match filter {
+            FilterMode::Nearest => vk::Filter::NEAREST,
+            FilterMode::Linear => vk::Filter::LINEAR,
+        };
+        let sampler_ci = vk::SamplerCreateInfo::default()
+            .mag_filter(filter_vk)
+            .min_filter(filter_vk)
+            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .mip_lod_bias(0.0)
+            .anisotropy_enable(false)
+            .max_anisotropy(1.0)
+            .compare_enable(false)
+            .min_lod(0.0)
+            .max_lod(0.0)
+            .border_color(vk::BorderColor::FLOAT_OPAQUE_BLACK)
+            .unnormalized_coordinates(false);
+        let sampler = unsafe { self.device.create_sampler(&sampler_ci, None) }.map_err(|e| {
+            GraphicsError::TextureCreate {
+                message: format!("texture sampler: {e}"),
+            }
+        })?;
+        guard.sampler = Some(sampler);
+
+        // 3. Upload (synchronous, one-shot, transient pool + fence).
+        let pool_ci = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::TRANSIENT)
+            .queue_family_index(self.graphics_queue_family);
+        let upload_pool =
+            unsafe { self.device.create_command_pool(&pool_ci, None) }.map_err(|e| {
+                GraphicsError::TextureUpload {
+                    message: format!("upload command pool: {e}"),
+                }
+            })?;
+        guard.command_pool = Some(upload_pool);
+        let cb_ci = vk::CommandBufferAllocateInfo::default()
+            .command_pool(upload_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cmd = unsafe { self.device.allocate_command_buffers(&cb_ci) }
+            .map_err(|e| GraphicsError::TextureUpload {
+                message: format!("upload command buffer: {e}"),
+            })?
+            .first()
+            .copied()
+            .ok_or_else(|| GraphicsError::TextureUpload {
+                message: "no upload command buffer allocated".into(),
+            })?;
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        let to_transfer = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(subresource);
+        let to_shader = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(subresource);
+        let copy = vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D {
+                width: desc.width,
+                height: desc.height,
+                depth: 1,
+            });
+        unsafe {
+            self.device.begin_command_buffer(cmd, &begin).map_err(|e| {
+                GraphicsError::TextureUpload {
+                    message: format!("upload begin: {e}"),
+                }
+            })?;
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_transfer),
+            );
+            self.device.cmd_copy_buffer_to_image(
+                cmd,
+                staging,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                std::slice::from_ref(&copy),
+            );
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_shader),
+            );
+            self.device
+                .end_command_buffer(cmd)
+                .map_err(|e| GraphicsError::TextureUpload {
+                    message: format!("upload end: {e}"),
+                })?;
+            let fence_ci = vk::FenceCreateInfo::default();
+            let fence = self.device.create_fence(&fence_ci, None).map_err(|e| {
+                GraphicsError::TextureUpload {
+                    message: format!("upload fence: {e}"),
+                }
+            })?;
+            let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+            // Serialize with all other graphics-queue users — BOTH the
+            // render state lock (this backend) and the process-wide queue
+            // lock (other backends sharing this device's queue): Vulkan
+            // queues require external synchronization (review rounds 1
+            // and 5, P1). Uploads are init-time — blocking concurrent
+            // frames briefly is the v0.1 contract.
+            let _render_guard = self.render.lock().expect("render state lock");
+            let _queue_guard = queue_guard();
+            let submitted =
+                self.device
+                    .queue_submit(self.graphics_queue, std::slice::from_ref(&submit), fence);
+            match submitted {
+                Err(e) => {
+                    // The submission was not enqueued — the fence and
+                    // command buffer are idle and safe to release.
+                    self.device.destroy_fence(fence, None);
+                    self.device
+                        .free_command_buffers(upload_pool, std::slice::from_ref(&cmd));
+                    return Err(GraphicsError::TextureUpload {
+                        message: format!("upload submit: {e}"),
+                    });
+                }
+                Ok(()) => {
+                    if let Err(e) =
+                        self.device
+                            .wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)
+                    {
+                        // The submission IS pending on the queue: destroying
+                        // the fence, the command buffer, the staging buffer,
+                        // or the image now is use-after-free. LEAK
+                        // everything deliberately (stderr note) — the Zunesha
+                        // 0.1.2 `unconfirmed_submission` discipline (review
+                        // round 1, P1).
+                        eprintln!(
+                            "goldenweek: texture upload fence wait failed ({e}); \nleaking upload resources (fence, command pool, staging, image) rather than destroying in-flight GPU work"
+                        );
+                        guard.leak = true;
+                        return Err(GraphicsError::TextureUpload {
+                            message: format!("upload wait: {e} (resources leaked)"),
+                        });
+                    }
+                }
+            }
+            self.device.destroy_fence(fence, None);
+            self.device
+                .free_command_buffers(upload_pool, std::slice::from_ref(&cmd));
+        }
+        // The staging buffer has done its job — release it now rather than
+        // holding host memory for the texture's lifetime.
+        if let Some(memory) = guard.staging_memory.take() {
+            unsafe { self.device.free_memory(memory, None) };
+        }
+        if let Some(buffer) = guard.staging.take() {
+            unsafe { self.device.destroy_buffer(buffer, None) };
+        }
+
+        // 4. Descriptor pool + set (the pool is destroyed at texture drop,
+        //    which frees the set — no per-backend pool-exhaustion state).
+        let pool_sizes = [
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::SAMPLED_IMAGE,
+                descriptor_count: 1,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::SAMPLER,
+                descriptor_count: 1,
+            },
+        ];
+        let descriptor_pool_ci = vk::DescriptorPoolCreateInfo::default()
+            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
+            .max_sets(1)
+            .pool_sizes(&pool_sizes);
+        let descriptor_pool = unsafe {
+            self.device
+                .create_descriptor_pool(&descriptor_pool_ci, None)
+        }
+        .map_err(|e| GraphicsError::TextureCreate {
+            message: format!("descriptor pool: {e}"),
+        })?;
+        guard.descriptor_pool = Some(descriptor_pool);
+        let set_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(std::slice::from_ref(&self.texture_set_layout));
+        let set = unsafe { self.device.allocate_descriptor_sets(&set_alloc) }
+            .map_err(|e| GraphicsError::TextureCreate {
+                message: format!("descriptor set: {e}"),
+            })?
+            .first()
+            .copied()
+            .ok_or_else(|| GraphicsError::TextureCreate {
+                message: "no descriptor set allocated".into(),
+            })?;
+        let image_info = vk::DescriptorImageInfo {
+            sampler: vk::Sampler::null(),
+            image_view: view,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        };
+        let sampler_info = vk::DescriptorImageInfo {
+            sampler,
+            image_view: vk::ImageView::null(),
+            image_layout: vk::ImageLayout::UNDEFINED,
+        };
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(std::slice::from_ref(&image_info)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(std::slice::from_ref(&sampler_info)),
+        ];
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+
+        // 5. Box the inner and hand it to the opaque handle.
+        let inner = Box::new(VulkanTextureInner {
+            view: guard.view.take().expect("texture view"),
+            sampler: guard.sampler.take().expect("texture sampler"),
+            image: guard.image.take().expect("texture image"),
+            memory: guard.image_memory.take().expect("texture memory"),
+            pool: guard.descriptor_pool.take().expect("descriptor pool"),
+            alive: Arc::clone(&self.alive),
+            bindings: Arc::clone(&self.texture_bindings),
+            set,
+            width: desc.width,
+            height: desc.height,
+            device: self.device.clone(),
+        });
+        Ok(Texture {
+            raw: Box::into_raw(inner) as *mut c_void,
+            width: desc.width,
+            height: desc.height,
+            drop_fn: vulkan_texture_drop,
         })
     }
 
@@ -1792,6 +2959,13 @@ impl<'a> VulkanBackend<'a> {
                     message: format!("stale-frame recovery: {e}"),
                 })?;
             render.phase = RenderPhase::Idle;
+            // CALLER-LOCKS CONTRACT: recovery released its guard on
+            // return; this drain section takes its own (round 13).
+            {
+                let _queue = queue_guard();
+                self.drain_texture_bindings();
+                self.drain_buffer_retention();
+            }
         }
 
         let (index, _suboptimal) = unsafe {
@@ -1970,7 +3144,41 @@ impl<'a> VulkanBackend<'a> {
             unsafe { &*(pipeline.raw as *const VulkanPipelineInner) };
         // Safety: `raw` was produced by `Box::into_raw::<zunesha::Buffer>` in
         // `create_buffer` and is still valid.
-        let zunesha_buffer = unsafe { &*(vertices.raw as *const zunesha::Buffer) };
+        // Safety: `raw` was produced by `Box::into_raw<GpuBufferInner>` in
+        // `create_buffer` and is still valid.
+        let buffer_inner = unsafe { &*(vertices.raw as *const GpuBufferInner) };
+        // Owner validation (round 10, P1): a destructor consults the
+        // registry baked into its inner (the OWNER's) — a foreign handle
+        // would register here but never be retained for THIS recording.
+        // Rejected, mirroring the texture rule.
+        if !Arc::ptr_eq(&buffer_inner.retention, &self.buffer_retention) {
+            return Err(GraphicsError::InvalidDraw {
+                message: "vertex buffer belongs to a different backend".into(),
+            });
+        }
+        match &pipeline_inner.retention {
+            Some(r) if Arc::ptr_eq(r, &self.buffer_retention) => {}
+            _ => {
+                return Err(GraphicsError::InvalidDraw {
+                    message: "pipeline belongs to a different backend".into(),
+                });
+            }
+        }
+        let zunesha_buffer = &buffer_inner.buffer;
+        // Retain: the pending recording references this buffer — a public
+        // drop before completion must retire into the graveyard, and a
+        // poisoned (unconfirmable) frame must LEAK it (round 9, P1).
+        // Lock order: render (held) → retention — never reversed.
+        self.buffer_retention
+            .lock()
+            .expect("buffer retention lock")
+            .bound
+            .insert(vertices.raw as usize);
+        self.buffer_retention
+            .lock()
+            .expect("buffer retention lock")
+            .bound_pipelines
+            .insert(pipeline.raw as usize);
         let vertex_buffer = self.zunesha_device.raw_buffer(zunesha_buffer);
 
         let render = self.render.lock().expect("render state lock");
@@ -2001,6 +3209,126 @@ impl<'a> VulkanBackend<'a> {
         Ok(())
     }
 
+    /// Record a textured draw call into `frame` — M1. Identical guards to
+    /// [`Self::draw`]; additionally binds `texture`'s descriptor set (set 0)
+    /// before the vertex bind and draw.
+    pub fn draw_textured(
+        &self,
+        frame: &mut Frame,
+        pipeline: &RenderPipeline,
+        vertices: &GpuBuffer,
+        vertex_count: u32,
+        texture: &Texture,
+    ) -> Result<()> {
+        let Some(frame_index) = frame.peek_index() else {
+            return Err(GraphicsError::InvalidDraw {
+                message: "frame has no acquired image (already presented?)".into(),
+            });
+        };
+        let pipeline_inner =
+            // Safety: `raw` was produced by `Box::into_raw::<VulkanPipelineInner>`
+            // in `compile_render_pipeline` and is still valid.
+            unsafe { &*(pipeline.raw as *const VulkanPipelineInner) };
+        // Safety: `raw` was produced by `Box::into_raw::<zunesha::Buffer>` in
+        // `create_buffer` and is still valid.
+        // Safety: `raw` was produced by `Box::into_raw<GpuBufferInner>` in
+        // `create_buffer` and is still valid.
+        let buffer_inner = unsafe { &*(vertices.raw as *const GpuBufferInner) };
+        // Owner validation (round 10, P1): a destructor consults the
+        // registry baked into its inner (the OWNER's) — a foreign handle
+        // would register here but never be retained for THIS recording.
+        // Rejected, mirroring the texture rule.
+        if !Arc::ptr_eq(&buffer_inner.retention, &self.buffer_retention) {
+            return Err(GraphicsError::InvalidDraw {
+                message: "vertex buffer belongs to a different backend".into(),
+            });
+        }
+        match &pipeline_inner.retention {
+            Some(r) if Arc::ptr_eq(r, &self.buffer_retention) => {}
+            _ => {
+                return Err(GraphicsError::InvalidDraw {
+                    message: "pipeline belongs to a different backend".into(),
+                });
+            }
+        }
+        let zunesha_buffer = &buffer_inner.buffer;
+        // Retain: the pending recording references this buffer — a public
+        // drop before completion must retire into the graveyard, and a
+        // poisoned (unconfirmable) frame must LEAK it (round 9, P1).
+        // Lock order: render (held) → retention — never reversed.
+        self.buffer_retention
+            .lock()
+            .expect("buffer retention lock")
+            .bound
+            .insert(vertices.raw as usize);
+        self.buffer_retention
+            .lock()
+            .expect("buffer retention lock")
+            .bound_pipelines
+            .insert(pipeline.raw as usize);
+        let vertex_buffer = self.zunesha_device.raw_buffer(zunesha_buffer);
+        // Safety: `raw` was produced by `Box::into_raw::<VulkanTextureInner>`
+        // in `create_texture` and is still valid.
+        let texture_inner = unsafe { &*(texture.raw as *const VulkanTextureInner) };
+        // Foreign textures are rejected (review round 4, P1): a texture
+        // created by ANOTHER backend on the same device was never valid
+        // here — its descriptor set was allocated against that backend's
+        // set-layout object (binding a mismatched set is invalid Vulkan),
+        // and its drop retention belongs to the owner's registry, so a
+        // drop after this draw would destroy the recorded view.
+        if !Arc::ptr_eq(&texture_inner.bindings, &self.texture_bindings) {
+            return Err(GraphicsError::InvalidDraw {
+                message: "texture was created by a different backend — \ncross-backend texture use is not supported; create the texture with the backend that draws it".into(),
+            });
+        }
+
+        let render = self.render.lock().expect("render state lock");
+        Self::check_not_broken(&render)?;
+        if !matches!(render.phase, RenderPhase::Open(i) if i == frame_index) {
+            return Err(GraphicsError::InvalidDraw {
+                message: format!(
+                    "frame {frame_index} is not the frame being recorded ({:?})",
+                    render.phase
+                ),
+            });
+        }
+
+        unsafe {
+            // Register the texture as bound into this recording: a public
+            // handle dropped before the frame completes must retire into
+            // the graveyard, not destroy out from under the pending
+            // recording (review round 1, P1). Cleared at the Idle drain.
+            // Lock order: render (held) → bindings — never reversed.
+            self.texture_bindings
+                .lock()
+                .expect("texture bindings lock")
+                .bound
+                .insert(texture.raw as usize);
+            self.device.cmd_bind_pipeline(
+                render.cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_inner.pipeline,
+            );
+            // Set 0 = the texture set (binding 0 image, binding 1 sampler).
+            self.device.cmd_bind_descriptor_sets(
+                render.cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_inner.layout,
+                0,
+                std::slice::from_ref(&texture_inner.set),
+                &[],
+            );
+            self.device.cmd_bind_vertex_buffers(
+                render.cmd,
+                0,
+                std::slice::from_ref(&vertex_buffer),
+                &[0],
+            );
+            self.device.cmd_draw(render.cmd, vertex_count, 1, 0, 0);
+        }
+        Ok(())
+    }
+
     /// Finish, submit, and display `frame`, then block until it is safe to
     /// acquire the next frame.
     ///
@@ -2016,120 +3344,13 @@ impl<'a> VulkanBackend<'a> {
             })?;
         let mut render = self.render.lock().expect("render state lock");
         Self::check_not_broken(&render)?;
-        let flush_state = match render.phase {
-            // Recording active — end it, submit, present.
-            RenderPhase::Open(i) if i == index => NeedsSubmit::Record,
-            // Recording already ENDED (a `read_pixels` flush was interrupted
-            // between end and submit) — submit without ending (round 7, P1).
-            RenderPhase::Flushing(i) if i == index => NeedsSubmit::Ended,
-            // A `read_pixels` flush already submitted the rendering and
-            // fence-waited it; present without semaphore waits (the image is
-            // idle from the host's perspective).
-            RenderPhase::Flushed(i) if i == index => NeedsSubmit::No,
-            ref other => {
-                return Err(GraphicsError::InvalidDraw {
-                    message: format!("frame {index} is not the frame being recorded ({other:?})"),
-                });
-            }
-        };
-
-        // Whether THIS invocation submitted (and therefore signaled
-        // render_finished): only then can a failed present strand the
-        // signal and only then may the drain wait on it (round 10, P1).
-        let submitted = !matches!(flush_state, NeedsSubmit::No);
-
-        let present_result = match flush_state {
-            NeedsSubmit::No => {
-                let swapchains = [self.swapchain];
-                let indices = [index];
-                let present_info = vk::PresentInfoKHR::default()
-                    .swapchains(&swapchains)
-                    .image_indices(&indices);
-                // Safety: queue and image are idle (flush fence-waited).
-                unsafe {
-                    self.swapchain_fn
-                        .queue_present(self.graphics_queue, &present_info)
-                }
-            }
-            needs_submit => {
-                unsafe {
-                    if matches!(needs_submit, NeedsSubmit::Record) {
-                        self.device.cmd_end_render_pass(render.cmd);
-                        let end = self.device.end_command_buffer(render.cmd);
-                        if let Err(e) = end {
-                            // Same boundary as the readback flush: the
-                            // recording is invalid, reset it away and commit
-                            // Acquired so recovery presents the image back
-                            // (round 8, P1).
-                            let _ = self.device.reset_command_buffer(
-                                render.cmd,
-                                vk::CommandBufferResetFlags::empty(),
-                            );
-                            render.phase = RenderPhase::Acquired(index);
-                            return Err(GraphicsError::PresentFailed {
-                                message: format!("end command buffer: {e}"),
-                            });
-                        }
-                        // Commit the ended state before the fallible fence
-                        // reset (round 7, P1): an interruption here resumes
-                        // without ending twice.
-                        render.phase = RenderPhase::Flushing(index);
-                    }
-
-                    let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-                    let submit = vk::SubmitInfo::default()
-                        .wait_semaphores(std::slice::from_ref(&self.image_available))
-                        .wait_dst_stage_mask(&wait_stages)
-                        .command_buffers(std::slice::from_ref(&render.cmd))
-                        .signal_semaphores(std::slice::from_ref(&self.render_finished));
-                    // Reset the fence only now — immediately before the submit that
-                    // will signal it — so it is unsignalled for the shortest possible
-                    // window (unobservable in the synchronous loop).
-                    self.device
-                        .reset_fences(std::slice::from_ref(&render.fence))
-                        .map_err(|e| GraphicsError::PresentFailed {
-                            message: format!("fence reset: {e}"),
-                        })?;
-                    // A submission failure here strands the unsignaled fence
-                    // exactly as in frame recovery — poison so entry points fail
-                    // fast instead of deadlocking (review round 6, P1).
-                    if let Err(e) = self.device.queue_submit(
-                        self.graphics_queue,
-                        std::slice::from_ref(&submit),
-                        render.fence,
-                    ) {
-                        render.broken = true;
-                        return Err(GraphicsError::PresentFailed {
-                            message: format!("vkQueueSubmit: {e}"),
-                        });
-                    }
-
-                    let swapchains = [self.swapchain];
-                    let indices = [index];
-                    let present_info = vk::PresentInfoKHR::default()
-                        .wait_semaphores(std::slice::from_ref(&self.render_finished))
-                        .swapchains(&swapchains)
-                        .image_indices(&indices);
-                    self.swapchain_fn
-                        .queue_present(self.graphics_queue, &present_info)
-                }
-            }
-        };
-        // Block until the frame's work is complete, so the next acquire can
-        // safely reset and reuse the command buffer (the synchronous
-        // frame-loop contract). In the Flushed path the fence is already
-        // signalled (and waited) — the wait returns immediately.
-        // Safety: the fence was submitted on this device (present or flush).
-        unsafe {
-            self.device
-                .wait_for_fences(std::slice::from_ref(&render.fence), true, u64::MAX)
-                .map_err(|e| {
-                    render.broken = true;
-                    GraphicsError::PresentFailed {
-                        message: format!("fence wait: {e}"),
-                    }
-                })?;
-        }
+        // Present submits and presents — cross-backend queue serialization
+        // (round 5 P1). CALLER-LOCKS CONTRACT: ONE whole-body guard covers the
+        // submit/present/wait section, the post-present arms, AND the
+        // error arm's semaphore-drain submission (round 13 consolidation —
+        // rounds 10–12's narrowing/self-locking alternation is gone).
+        let _queue = queue_guard();
+        let (present_result, submitted) = self.present_locked(&mut render, index)?;
 
         // OUT_OF_DATE and SURFACE_LOST release the image (the engine
         // consumes it despite the error) — Idle is correct and the caller
@@ -2139,9 +3360,15 @@ impl<'a> VulkanBackend<'a> {
         // acquire's recovery presents it back instead of silently losing it
         // from the pool (rounds 8–9, P1).
         match present_result {
-            Ok(_) => render.phase = RenderPhase::Idle,
+            Ok(_) => {
+                render.phase = RenderPhase::Idle;
+                self.drain_texture_bindings();
+                self.drain_buffer_retention();
+            }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::ERROR_SURFACE_LOST_KHR) => {
-                render.phase = RenderPhase::Idle
+                render.phase = RenderPhase::Idle;
+                self.drain_texture_bindings();
+                self.drain_buffer_retention();
             }
             Err(e) => {
                 // Drain ONLY when this invocation signaled render_finished
@@ -2157,6 +3384,11 @@ impl<'a> VulkanBackend<'a> {
                     // back-to-back latency race (round 9, P1). The fence has
                     // been waited, so the signal is complete: an empty
                     // submission waiting on it drains deterministically.
+                    // The drain SUBMITS — covered by present's whole-body
+                    // guard (round 13 consolidation; the round-12 site was
+                    // bare after round 10's narrowing). The poison call in
+                    // the error path below runs under the same guard —
+                    // queue→retention, the established order.
                     unsafe {
                         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
                         let drain = vk::SubmitInfo::default()
@@ -2184,6 +3416,7 @@ impl<'a> VulkanBackend<'a> {
                             // completing submit) — poison per the round-6
                             // discipline and surface both errors.
                             render.broken = true;
+                            self.poison_buffer_retention();
                             return Err(GraphicsError::PresentFailed {
                                 message: format!(
                                     "vkQueuePresentKHR: {e}; render_finished drain: {drain_err}"
@@ -2297,14 +3530,28 @@ impl<'a> VulkanBackend<'a> {
         let height = self.extent.height;
         let size = (width as usize) * (height as usize) * 4;
 
-        // Staging via Zunesha (host-visible path), read via Zunesha.
-        let staging = self
-            .zunesha_device
-            .create_buffer(&vec![0u8; size])
-            .map_err(|e| GraphicsError::BufferCreationFailed {
-                message: format!("staging: {e}"),
-            })?;
-        let staging_vk = self.zunesha_device.raw_buffer(&staging);
+        // Staging via Zunesha (host-visible path), read via Zunesha. BOTH
+        // zunesha calls submit to the shared queue — the ALLOCATION
+        // too (device-local staging upload), which round 7 caught racing
+        // concurrent uploads — so both run under the QUEUE_LOCK
+        // (create_buffer's own internal lock covers only its own path).
+        // The staging lives in a `QueueLockedStaging` so its teardown —
+        // including error unwinding — also joins the protocol (round 8,
+        // P1); the recursion rule (see that type) forbids `?` unwinding
+        // it through a queue-guard scope, hence the result-capturing
+        // blocks below.
+        let (staging, staging_vk) = {
+            let _queue = queue_guard();
+            let staging = self
+                .zunesha_device
+                .create_buffer(&vec![0u8; size])
+                .map_err(|e| GraphicsError::BufferCreationFailed {
+                    message: format!("staging: {e}"),
+                })?;
+            let staging_vk = self.zunesha_device.raw_buffer(&staging);
+            (staging, staging_vk)
+        };
+        let staging = QueueLockedStaging(std::mem::ManuallyDrop::new(staging));
 
         // One-shot copy command buffer from the same pool.
         let cb_ci = vk::CommandBufferAllocateInfo::default()
@@ -2388,26 +3635,56 @@ impl<'a> VulkanBackend<'a> {
             self.device
                 .end_command_buffer(cmd)
                 .map_err(|e| GraphicsError::Internal(format!("one-shot end: {e}")))?;
-            let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
-            self.device
-                .queue_submit(
-                    self.graphics_queue,
-                    std::slice::from_ref(&submit),
-                    vk::Fence::null(),
-                )
-                .map_err(|e| GraphicsError::Internal(format!("one-shot submit: {e}")))?;
-            self.device
-                .queue_wait_idle(self.graphics_queue)
-                .map_err(|e| GraphicsError::Internal(format!("one-shot wait: {e}")))?;
+            // Capture results INSIDE the queue-guard scope; the `?` comes
+            // after release — unwinding the staging buffer (whose drop
+            // takes the same lock) through the held guard would deadlock
+            // (round 8, P1 recursion rule).
+            let oneshot: std::result::Result<(), String> = {
+                let _queue = queue_guard();
+                let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+                self.device
+                    .queue_submit(
+                        self.graphics_queue,
+                        std::slice::from_ref(&submit),
+                        vk::Fence::null(),
+                    )
+                    .map_err(|e| format!("one-shot submit: {e}"))
+                    .and_then(|()| {
+                        self.device
+                            .queue_wait_idle(self.graphics_queue)
+                            .map_err(|e| format!("one-shot wait: {e}"))
+                    })
+            };
+            if let Err(e) = oneshot {
+                // The one-shot SUBMISSION is pending on the queue (the
+                // submit succeeded; only the wait failed): destroying the
+                // staging now is use-after-free (VUID 00922 — destroying a
+                // buffer with in-flight GPU work referencing it). LEAK it
+                // deliberately with a stderr note — the Zunesha 0.1.2
+                // `unconfirmed_submission` discipline, applied to
+                // Goldenweek's readback staging (review round 8, P1).
+                eprintln!(
+                    "goldenweek: readback one-shot wait failed ({e}); leaking the staging buffer rather than destroying in-flight GPU work"
+                );
+                std::mem::forget(staging);
+                return Err(GraphicsError::Internal(e));
+            }
             self.device
                 .free_command_buffers(self.command_pool, std::slice::from_ref(&cmd));
         }
 
-        let pixels: Vec<u8> = self
-            .zunesha_device
-            .read_buffer(&staging)
-            .map_err(|e| GraphicsError::Internal(format!("staging readback: {e}")))?;
-        drop(staging);
+        // Zunesha's readback transfer SUBMITS to the queue — same
+        // protocol as every other queue user (review round 6, P1). Result
+        // captured inside the guard; the `?` and the staging's (locked)
+        // drop happen after release (round 8 recursion rule).
+        let read: std::result::Result<Vec<u8>, String> = {
+            let _queue = queue_guard();
+            self.zunesha_device
+                .read_buffer(&staging.0)
+                .map_err(|e| e.to_string())
+        };
+        let pixels = read.map_err(|e| GraphicsError::Internal(format!("staging readback: {e}")))?;
+        drop(staging); // QueueLockedStaging: teardown under the protocol
         Ok(pixels)
     }
 }
@@ -2435,6 +3712,26 @@ impl crate::GraphicsBackend for VulkanBackend<'_> {
 
     fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<GpuBuffer> {
         VulkanBackend::create_buffer(self, data)
+    }
+
+    fn create_texture(
+        &self,
+        desc: &TextureDesc,
+        data: &[u8],
+        filter: FilterMode,
+    ) -> Result<Texture> {
+        VulkanBackend::create_texture(self, desc, data, filter)
+    }
+
+    fn draw_textured(
+        &self,
+        frame: &mut Frame,
+        pipeline: &RenderPipeline,
+        vertices: &GpuBuffer,
+        vertex_count: u32,
+        texture: &Texture,
+    ) -> Result<()> {
+        VulkanBackend::draw_textured(self, frame, pipeline, vertices, vertex_count, texture)
     }
 
     fn acquire_frame(&self) -> Result<Frame> {
@@ -3145,5 +4442,223 @@ fn fs_main() -> @location(0) vec4<f32> {
             Err(GraphicsError::InvalidDraw { .. })
         ));
         // `_current` is dropped unpresented below — safe by design.
+    }
+
+    // ── M1: textures & sampled images ───────────────────────────────
+
+    /// Textured vertex shader: `pos` + `uv` in, interpolated `uv` out.
+    const TEXTURED_VERT: &str = r#"
+struct VOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(1) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>) -> VOut {
+    return VOut(vec4<f32>(pos, 0.0, 1.0), uv);
+}
+"#;
+
+    /// Textured fragment shader. naga emits separate SPIR-V bindings for
+    /// WGSL's separate `texture_2d` + `sampler` globals, so the set layout
+    /// declares the image at binding 0 and the sampler at binding 1.
+    const TEXTURED_FRAG: &str = r#"
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+
+@fragment
+fn fs_main(@location(1) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    return textureSample(tex, samp, uv);
+}
+"#;
+
+    /// The four-texel verification palette (RGBA8, row-major, top-left
+    /// origin): red, green / blue, yellow.
+    const QUAD_TEXELS: [u8; 16] = [
+        255, 0, 0, 255, // red
+        0, 255, 0, 255, // green
+        0, 0, 255, 255, // blue
+        255, 255, 0, 255, // yellow
+    ];
+
+    /// The fullscreen textured quad (triangle strip, NDC y-up, UV top-left
+    /// origin): `(x, y, u, v)` per vertex, matching [`TEXTURED_VERT`].
+    const QUAD_VERTICES: [f32; 16] = [
+        -1.0, -1.0, 0.0, 1.0, // bottom-left
+        1.0, -1.0, 1.0, 1.0, // bottom-right
+        -1.0, 1.0, 0.0, 0.0, // top-left
+        1.0, 1.0, 1.0, 0.0, // top-right
+    ];
+
+    /// Vertex layout for [`TEXTURED_VERT`]: `vec2<f32>` position at loc 0,
+    /// `vec2<f32>` uv at loc 1.
+    fn textured_config() -> PipelineConfig {
+        PipelineConfig {
+            topology: Topology::TriangleStrip,
+            cull_mode: CullMode::None,
+            depth: None,
+            blend: None,
+            vertex_layout: crate::VertexLayout {
+                stride: 16,
+                attributes: vec![
+                    crate::VertexAttribute {
+                        location: 0,
+                        offset: 0,
+                        format: VertexFormat::Float32x2,
+                    },
+                    crate::VertexAttribute {
+                        location: 1,
+                        offset: 8,
+                        format: VertexFormat::Float32x2,
+                    },
+                ],
+            },
+        }
+    }
+
+    /// Reorder a texel's RGBA bytes into the swapchain readback order
+    /// (B8G8R8A8 readback is BGRA; anything else is treated as RGBA).
+    fn readback_texel(backend: &VulkanBackend<'_>, texel: [u8; 4]) -> [u8; 4] {
+        match backend.format() {
+            vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => {
+                [texel[2], texel[1], texel[0], texel[3]]
+            }
+            _ => texel,
+        }
+    }
+
+    /// M1: a 2×2 RGBA8 texture drawn as a fullscreen quad samples four
+    /// distinct texels in the four quadrants — a binding/layout bug that
+    /// samples the wrong texel fails positionally.
+    #[test]
+    #[serial]
+    fn textured_quad_samples_exact_texels() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let pipeline = backend
+            .compile_render_pipeline(
+                "vs_main",
+                TEXTURED_VERT,
+                "fs_main",
+                TEXTURED_FRAG,
+                &textured_config(),
+            )
+            .expect("textured pipeline");
+        let texture = backend
+            .create_texture(
+                &crate::TextureDesc {
+                    width: 2,
+                    height: 2,
+                },
+                &QUAD_TEXELS,
+                crate::FilterMode::Nearest,
+            )
+            .expect("create_texture");
+        let vb = backend.create_buffer(&QUAD_VERTICES).expect("quad vb");
+
+        let mut frame = backend.acquire_frame().expect("acquire");
+        backend
+            .draw_textured(&mut frame, &pipeline, &vb, 4, &texture)
+            .expect("draw_textured");
+        let pixels = backend.read_pixels(&frame).expect("read_pixels");
+        backend.present(frame).expect("present");
+
+        let w = backend.extent().width as usize;
+        let h = backend.extent().height as usize;
+        let px = |x: usize, y: usize| -> [u8; 4] {
+            let o = (y * w + x) * 4;
+            [pixels[o], pixels[o + 1], pixels[o + 2], pixels[o + 3]]
+        };
+        let tl = px(w / 4, h / 4);
+        let tr = px(3 * w / 4, h / 4);
+        let bl = px(w / 4, 3 * h / 4);
+        let br = px(3 * w / 4, 3 * h / 4);
+        println!(
+            "quadrants: TL={tl:?} TR={tr:?} BL={bl:?} BR={br:?} (format {:?})",
+            backend.format()
+        );
+        // Top-left quadrant samples texel 0 (red), top-right texel 1
+        // (green), bottom-left texel 2 (blue), bottom-right texel 3
+        // (yellow) — channel-order-aware.
+        assert_eq!(
+            tl,
+            readback_texel(&backend, [255, 0, 0, 255]),
+            "TL quadrant must sample the red texel"
+        );
+        assert_eq!(
+            tr,
+            readback_texel(&backend, [0, 255, 0, 255]),
+            "TR quadrant must sample the green texel"
+        );
+        assert_eq!(
+            bl,
+            readback_texel(&backend, [0, 0, 255, 255]),
+            "BL quadrant must sample the blue texel"
+        );
+        assert_eq!(
+            br,
+            readback_texel(&backend, [255, 255, 0, 255]),
+            "BR quadrant must sample the yellow texel"
+        );
+    }
+
+    /// M1: `draw_textured` shares `draw`'s frame-lifecycle guard — after a
+    /// `read_pixels` flush the phase is Flushed, not Open, so a textured
+    /// draw must be rejected with `InvalidDraw`.
+    #[test]
+    #[serial]
+    fn draw_textured_rejects_non_open_phase() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let pipeline = backend
+            .compile_render_pipeline(
+                "vs_main",
+                TEXTURED_VERT,
+                "fs_main",
+                TEXTURED_FRAG,
+                &textured_config(),
+            )
+            .expect("textured pipeline");
+        let texture = backend
+            .create_texture(
+                &crate::TextureDesc {
+                    width: 2,
+                    height: 2,
+                },
+                &QUAD_TEXELS,
+                crate::FilterMode::Nearest,
+            )
+            .expect("create_texture");
+        let vb = backend.create_buffer(&QUAD_VERTICES).expect("quad vb");
+
+        let mut frame = backend.acquire_frame().expect("acquire");
+        // Flush the recording: phase becomes Flushed, so draw_textured must
+        // reject the frame.
+        let _ = backend.read_pixels(&frame).expect("readback flush");
+        assert!(matches!(
+            backend.draw_textured(&mut frame, &pipeline, &vb, 4, &texture),
+            Err(GraphicsError::InvalidDraw { .. })
+        ));
+        // `frame` is dropped Flushed but unpresented — safe by design.
+    }
+
+    /// M1: a payload whose length is not `w * h * 4` is refused before any
+    /// GPU work, as `InvalidArgument`.
+    #[test]
+    #[serial]
+    fn texture_creation_rejects_bad_payload() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        assert!(matches!(
+            backend.create_texture(
+                &crate::TextureDesc {
+                    width: 2,
+                    height: 2,
+                },
+                &[0u8; 15],
+                crate::FilterMode::Nearest,
+            ),
+            Err(GraphicsError::InvalidArgument { .. })
+        ));
     }
 }
