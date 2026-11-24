@@ -274,15 +274,23 @@ pub struct VertexAttribute {
     pub format: VertexFormat,
 }
 
-/// Layout of interleaved vertex data bound into a draw call.
-///
-/// Passed to [`GraphicsBackend::compile_render_pipeline`] so the backend
-/// can bake the vertex-input description into the render pipeline.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct VertexLayout {
-    /// Number of bytes between consecutive vertices.
+/// Input rate of a vertex-input binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VertexInputRate {
+    /// One element per vertex.
+    Vertex,
+    /// One element per instance.
+    Instance,
+}
+
+/// One vertex-input buffer binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VertexBindingLayout {
+    /// Number of bytes between consecutive elements.
     pub stride: u32,
-    /// Vertex attributes, in binding order.
+    /// Whether the binding advances per vertex or per instance.
+    pub rate: VertexInputRate,
+    /// Attributes read from this binding (offsets are within one element).
     pub attributes: Vec<VertexAttribute>,
 }
 
@@ -297,8 +305,12 @@ pub struct PipelineConfig {
     pub topology: Topology,
     /// Face culling mode.
     pub cull_mode: CullMode,
-    /// Vertex input layout.
-    pub vertex_layout: VertexLayout,
+    /// Vertex-input bindings, in binding order (binding index = list
+    /// position). v0.1 draw arity: AT MOST ONE Vertex-rate binding and
+    /// AT MOST ONE Instance-rate binding (compile_render_pipeline
+    /// rejects more with InvalidArgument); the list shape is the
+    /// future multi-stream surface.
+    pub vertex_bindings: Vec<VertexBindingLayout>,
     /// Fixed-function depth test / write. `None` (default) disables the
     /// depth test entirely — fragments pass through in draw order.
     pub depth: Option<DepthState>,
@@ -532,8 +544,31 @@ pub trait GraphicsBackend: Sized {
     ///
     /// Used for vertex, index, or uniform storage. The buffer's
     /// interpretation at draw time is fixed by the pipeline's
-    /// [`VertexLayout`].
+    /// [`VertexBindingLayout`] list.
     fn create_buffer<T: bytemuck::Pod>(&self, data: &[T]) -> Result<GpuBuffer>;
+
+    /// Adopt an externally-created `zunesha::Buffer` as a `GpuBuffer`
+    /// WITHOUT any Goldenweek-side upload — the buffer's contents were
+    /// written by another client of the shared device (Borsalino's
+    /// dispatch, or zunesha's own staging). Zero copies, zero
+    /// re-uploads: the draw reads the same physical buffer.
+    ///
+    /// Same-graphics-queue writes only in v0.1: queue FIFO ordering
+    /// makes the writes visible to subsequently recorded draws.
+    /// Cross-family (compute-queue) writes require ownership transfer
+    /// — deliberately out of scope (M2 / Zunesha ADR 0005 Phase 2).
+    #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+    /// `device` is the shared device the buffer was created on — it must
+    /// be the device this backend borrowed (checked by identity; a
+    /// foreign-device buffer is rejected before any Vulkan command).
+    /// Trust boundary: the caller asserts the buffer↔device pairing; a
+    /// buffer from a third device passed WITH this one is not detectable
+    /// until zunesha exposes buffer ownership (planned `owns_buffer`).
+    fn import_zunesha_buffer(
+        &self,
+        device: &zunesha::vulkan::VulkanDevice,
+        buffer: zunesha::Buffer,
+    ) -> Result<GpuBuffer>;
 
     /// Create an immutable texture and upload `data` (M1).
     ///
@@ -565,6 +600,36 @@ pub trait GraphicsBackend: Sized {
         texture: &Texture,
     ) -> Result<()>;
 
+    /// Record a non-indexed instanced draw into `frame`.
+    ///
+    /// `vertices` is bound at the pipeline's Vertex-rate binding,
+    /// `instances` at its Instance-rate binding; `vertex_count` and
+    /// `instance_count` are the draw's first parameters.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_instanced(
+        &self,
+        frame: &mut Frame,
+        pipeline: &RenderPipeline,
+        vertices: &GpuBuffer,
+        instances: &GpuBuffer,
+        vertex_count: u32,
+        instance_count: u32,
+    ) -> Result<()>;
+
+    /// Record a non-indexed instanced textured draw into `frame`
+    /// (the M1 texture set + the M3 instance binding).
+    #[allow(clippy::too_many_arguments)]
+    fn draw_instanced_textured(
+        &self,
+        frame: &mut Frame,
+        pipeline: &RenderPipeline,
+        vertices: &GpuBuffer,
+        instances: &GpuBuffer,
+        vertex_count: u32,
+        instance_count: u32,
+        texture: &Texture,
+    ) -> Result<()>;
+
     /// Acquire the next frame for rendering.
     ///
     /// Blocks until a swapchain image is available. Returns [`Frame`],
@@ -575,7 +640,7 @@ pub trait GraphicsBackend: Sized {
     /// Record a non-indexed draw call into `frame`.
     ///
     /// `vertices` is bound as vertex input (interpreted per the pipeline's
-    /// [`VertexLayout`]); `vertex_count` is the number of vertices to draw.
+    /// `vertex_bindings`); `vertex_count` is the number of vertices to draw.
     /// Call zero or more times per frame before [`present`](Self::present).
     fn draw(
         &self,
@@ -616,6 +681,14 @@ impl GraphicsBackend for NoBackendStub {
     fn create_buffer<T: bytemuck::Pod>(&self, _data: &[T]) -> Result<GpuBuffer> {
         Err(GraphicsError::NoBackend)
     }
+    #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+    fn import_zunesha_buffer(
+        &self,
+        _device: &zunesha::vulkan::VulkanDevice,
+        _buffer: zunesha::Buffer,
+    ) -> Result<GpuBuffer> {
+        Err(GraphicsError::NoBackend)
+    }
     fn create_texture(
         &self,
         _desc: &TextureDesc,
@@ -630,6 +703,31 @@ impl GraphicsBackend for NoBackendStub {
         _pipeline: &RenderPipeline,
         _vertices: &GpuBuffer,
         _vertex_count: u32,
+        _texture: &Texture,
+    ) -> Result<()> {
+        Err(GraphicsError::NoBackend)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn draw_instanced(
+        &self,
+        _frame: &mut Frame,
+        _pipeline: &RenderPipeline,
+        _vertices: &GpuBuffer,
+        _instances: &GpuBuffer,
+        _vertex_count: u32,
+        _instance_count: u32,
+    ) -> Result<()> {
+        Err(GraphicsError::NoBackend)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn draw_instanced_textured(
+        &self,
+        _frame: &mut Frame,
+        _pipeline: &RenderPipeline,
+        _vertices: &GpuBuffer,
+        _instances: &GpuBuffer,
+        _vertex_count: u32,
+        _instance_count: u32,
         _texture: &Texture,
     ) -> Result<()> {
         Err(GraphicsError::NoBackend)
@@ -716,8 +814,10 @@ mod tests {
         let cfg = PipelineConfig::default();
         assert_eq!(cfg.topology, Topology::TriangleList);
         assert_eq!(cfg.cull_mode, CullMode::None);
-        assert!(cfg.vertex_layout.attributes.is_empty());
-        assert_eq!(cfg.vertex_layout.stride, 0);
+        assert!(
+            cfg.vertex_bindings.is_empty(),
+            "no vertex-input bindings by default"
+        );
         assert!(cfg.depth.is_none(), "no depth test by default (additive)");
         assert!(cfg.blend.is_none(), "no blending by default (additive)");
     }
@@ -741,6 +841,61 @@ mod tests {
         assert_eq!(VertexFormat::Float32x2.byte_size(), 8);
         assert_eq!(VertexFormat::Float32x3.byte_size(), 12);
         assert_eq!(VertexFormat::Float32x4.byte_size(), 16);
+    }
+
+    /// A drop function that touches nothing — lets the stub test build
+    /// zero-handle opaque types without a backend.
+    fn noop_drop(_: *mut std::ffi::c_void) {}
+
+    #[test]
+    fn stub_reports_no_backend_for_the_draw_family() {
+        // M3: the whole draw family — plain, textured, instanced,
+        // instanced-textured — is a total surface on the stub. (The import
+        // seam's NoBackend case lives with the Vulkan tests: a
+        // `zunesha::Buffer` cannot be fabricated without a device.)
+        let stub = NoBackendStub;
+        let mut frame = Frame {
+            raw: std::ptr::null_mut(),
+            drop_fn: noop_drop,
+        };
+        let pipeline = RenderPipeline {
+            raw: std::ptr::null_mut(),
+            drop_fn: noop_drop,
+        };
+        let vertices = GpuBuffer {
+            raw: std::ptr::null_mut(),
+            len: 0,
+            drop_fn: noop_drop,
+        };
+        let instances = GpuBuffer {
+            raw: std::ptr::null_mut(),
+            len: 0,
+            drop_fn: noop_drop,
+        };
+        let texture = Texture {
+            raw: std::ptr::null_mut(),
+            width: 1,
+            height: 1,
+            drop_fn: noop_drop,
+        };
+        assert!(matches!(
+            stub.draw(&mut frame, &pipeline, &vertices, 3),
+            Err(GraphicsError::NoBackend)
+        ));
+        assert!(matches!(
+            stub.draw_textured(&mut frame, &pipeline, &vertices, 3, &texture),
+            Err(GraphicsError::NoBackend)
+        ));
+        assert!(matches!(
+            stub.draw_instanced(&mut frame, &pipeline, &vertices, &instances, 3, 2),
+            Err(GraphicsError::NoBackend)
+        ));
+        assert!(matches!(
+            stub.draw_instanced_textured(
+                &mut frame, &pipeline, &vertices, &instances, 3, 2, &texture
+            ),
+            Err(GraphicsError::NoBackend)
+        ));
     }
 
     #[test]

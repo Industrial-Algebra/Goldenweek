@@ -29,7 +29,7 @@ mod textured {
     use goldenweek::vulkan::{HeadlessSurface, VulkanBackend};
     use goldenweek::{
         CullMode, FilterMode, PipelineConfig, SurfaceHandle, TextureDesc, Topology,
-        VertexAttribute, VertexFormat, VertexLayout,
+        VertexAttribute, VertexBindingLayout, VertexFormat, VertexInputRate,
     };
     use zunesha::InitRequest;
 
@@ -122,8 +122,9 @@ fn fs_main(@location(1) uv: vec2<f32>) -> @location(0) vec4<f32> {
             cull_mode: CullMode::None,
             depth: None,
             blend: None,
-            vertex_layout: VertexLayout {
+            vertex_bindings: vec![VertexBindingLayout {
                 stride: 16,
+                rate: VertexInputRate::Vertex,
                 attributes: vec![
                     VertexAttribute {
                         location: 0,
@@ -136,7 +137,7 @@ fn fs_main(@location(1) uv: vec2<f32>) -> @location(0) vec4<f32> {
                         format: VertexFormat::Float32x2,
                     },
                 ],
-            },
+            }],
         };
         let pipeline = match backend.compile_render_pipeline(
             "vs_main",
