@@ -558,7 +558,17 @@ pub trait GraphicsBackend: Sized {
     /// Cross-family (compute-queue) writes require ownership transfer
     /// — deliberately out of scope (M2 / Zunesha ADR 0005 Phase 2).
     #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
-    fn import_zunesha_buffer(&self, buffer: zunesha::Buffer) -> Result<GpuBuffer>;
+    /// `device` is the shared device the buffer was created on — it must
+    /// be the device this backend borrowed (checked by identity; a
+    /// foreign-device buffer is rejected before any Vulkan command).
+    /// Trust boundary: the caller asserts the buffer↔device pairing; a
+    /// buffer from a third device passed WITH this one is not detectable
+    /// until zunesha exposes buffer ownership (planned `owns_buffer`).
+    fn import_zunesha_buffer(
+        &self,
+        device: &zunesha::vulkan::VulkanDevice,
+        buffer: zunesha::Buffer,
+    ) -> Result<GpuBuffer>;
 
     /// Create an immutable texture and upload `data` (M1).
     ///
@@ -672,7 +682,11 @@ impl GraphicsBackend for NoBackendStub {
         Err(GraphicsError::NoBackend)
     }
     #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
-    fn import_zunesha_buffer(&self, _buffer: zunesha::Buffer) -> Result<GpuBuffer> {
+    fn import_zunesha_buffer(
+        &self,
+        _device: &zunesha::vulkan::VulkanDevice,
+        _buffer: zunesha::Buffer,
+    ) -> Result<GpuBuffer> {
         Err(GraphicsError::NoBackend)
     }
     fn create_texture(

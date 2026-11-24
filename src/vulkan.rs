@@ -98,12 +98,50 @@ fn vertex_stage_input_locations(
             continue;
         }
         for arg in ep.function.arguments.iter() {
-            if let Some(naga::Binding::Location { location, .. }) = &arg.binding {
-                locations.insert(*location);
+            match &arg.binding {
+                // Directly bound argument: `@location(0) p: vec2<f32>`.
+                Some(naga::Binding::Location { location, .. }) => {
+                    locations.insert(*location);
+                }
+                // Struct-input argument (standard WGSL idiom): the
+                // locations live on the struct's members — recursive,
+                // nested structs included (r1 P1-1).
+                None => collect_struct_locations(
+                    &module,
+                    arg.ty,
+                    &mut locations,
+                    &mut std::collections::HashSet::new(),
+                ),
+                // @builtin(...) inputs are not vertex attributes.
+                Some(naga::Binding::BuiltIn(_)) => {}
             }
         }
     }
     Ok(locations)
+}
+
+/// Collects @location bindings from a (possibly nested) struct type's
+/// members. `seen` guards against cyclic type references (naga validates
+/// against these, but reflection stays defensive).
+fn collect_struct_locations(
+    module: &naga::Module,
+    ty: naga::Handle<naga::Type>,
+    out: &mut std::collections::BTreeSet<u32>,
+    seen: &mut std::collections::HashSet<naga::Handle<naga::Type>>,
+) {
+    if !seen.insert(ty) {
+        return;
+    }
+    if let naga::TypeInner::Struct { members, .. } = &module.types[ty].inner {
+        for member in members {
+            match &member.binding {
+                Some(naga::Binding::Location { location, .. }) => {
+                    out.insert(*location);
+                }
+                _ => collect_struct_locations(module, member.ty, out, seen),
+            }
+        }
+    }
 }
 
 fn compile_stage(entry: &str, source: &str, stage: naga::ShaderStage) -> Result<Vec<u32>> {
@@ -2668,7 +2706,27 @@ impl<'a> VulkanBackend<'a> {
     /// `GpuBuffer::len` is recorded as 0: `zunesha::Buffer` exposes no
     /// length accessor, and the import performs no copy that would reveal
     /// one. Draws take explicit counts, so nothing reads it.
-    pub fn import_zunesha_buffer(&self, buffer: zunesha::Buffer) -> Result<GpuBuffer> {
+    pub fn import_zunesha_buffer(
+        &self,
+        device: &zunesha::vulkan::VulkanDevice,
+        buffer: zunesha::Buffer,
+    ) -> Result<GpuBuffer> {
+        // Provenance (r1 P1-2): `zunesha::Buffer` is opaque, so the CALLER
+        // binds it to its creating device at the import call. That device
+        // must be the one this backend borrowed — every foreign-device
+        // instance is rejected here, BEFORE any Vulkan command (a buffer
+        // from another vkDevice bound here is
+        // VUID-vkCmdBindVertexBuffers-commonparent). The residual trust
+        // boundary — a caller passing THIS device with a buffer created
+        // elsewhere — is documented in the trait docs and will close when
+        // zunesha exposes buffer ownership (planned `owns_buffer`).
+        if !std::ptr::eq(self.zunesha_device as *const _, device as *const _) {
+            return Err(GraphicsError::InvalidArgument {
+                message:
+                    "import_zunesha_buffer: the buffer's device is not this backend's shared device"
+                        .into(),
+            });
+        }
         let inner = GpuBufferInner {
             buffer,
             alive: Arc::clone(&self.alive),
@@ -4181,8 +4239,12 @@ impl crate::GraphicsBackend for VulkanBackend<'_> {
         VulkanBackend::create_buffer(self, data)
     }
 
-    fn import_zunesha_buffer(&self, buffer: zunesha::Buffer) -> Result<GpuBuffer> {
-        VulkanBackend::import_zunesha_buffer(self, buffer)
+    fn import_zunesha_buffer(
+        &self,
+        device: &zunesha::vulkan::VulkanDevice,
+        buffer: zunesha::Buffer,
+    ) -> Result<GpuBuffer> {
+        VulkanBackend::import_zunesha_buffer(self, device, buffer)
     }
 
     fn create_texture(
@@ -5908,7 +5970,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
         let foreign = zunesha::Device::create_buffer(&ctx.device, &INSTANCE_OFFSETS)
             .expect("zunesha instance buffer");
         let instances = backend
-            .import_zunesha_buffer(foreign)
+            .import_zunesha_buffer(&ctx.device, foreign)
             .expect("import_zunesha_buffer");
 
         let mut frame = backend.acquire_frame().expect("acquire");
@@ -5943,7 +6005,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
         let foreign = zunesha::Device::create_buffer(&ctx.device, &INSTANCE_OFFSETS)
             .expect("zunesha instance buffer");
         let instances = backend
-            .import_zunesha_buffer(foreign)
+            .import_zunesha_buffer(&ctx.device, foreign)
             .expect("import_zunesha_buffer");
 
         let mut frame = backend.acquire_frame().expect("acquire");
@@ -5992,7 +6054,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
             zunesha::Device::create_buffer(&ctx.device, &[0u32; 4]).expect("zunesha buffer");
         let stub = crate::NoBackendStub;
         assert!(matches!(
-            crate::GraphicsBackend::import_zunesha_buffer(&stub, buffer),
+            crate::GraphicsBackend::import_zunesha_buffer(&stub, &ctx.device, buffer),
             Err(GraphicsError::NoBackend)
         ));
     }
@@ -6062,5 +6124,67 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
             )
             .expect("empty bindings + input-less shader compiles");
         drop(pipeline);
+    }
+
+    /// r1 P1-1 (provenance: fix f43418d): struct-member @location inputs
+    /// must be reflected — standard WGSL idiom.
+    #[test]
+    #[serial]
+    fn struct_input_shader_locations_are_reflected() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        const STRUCT_VERT: &str = r#"
+struct Input {
+    @location(0) position: vec2<f32>,
+    @location(1) offset: vec2<f32>,
+};
+struct VOut { @builtin(position) pos: vec4<f32> };
+@vertex
+fn vs_main(input: Input) -> VOut {
+    return VOut(vec4<f32>(input.position + input.offset, 0.0, 1.0));
+}
+"#;
+        // Matching layout compiles (RED today: reflection returned {}).
+        let ok = backend.compile_render_pipeline(
+            "vs_main",
+            STRUCT_VERT,
+            "fs_main",
+            crate::kernels::FLAT_TRIANGLE_FRAG,
+            &instanced_transform_config(),
+        );
+        assert!(
+            ok.is_ok(),
+            "struct-input shader with matching bindings must compile: {ok:?}"
+        );
+        // Mismatch rejected (empty bindings vs {0,1}).
+        let bad = backend.compile_render_pipeline(
+            "vs_main",
+            STRUCT_VERT,
+            "fs_main",
+            crate::kernels::FLAT_TRIANGLE_FRAG,
+            &PipelineConfig::default(),
+        );
+        assert!(
+            matches!(bad, Err(GraphicsError::InvalidArgument { .. })),
+            "struct-input shader with empty bindings must be rejected (07904)"
+        );
+    }
+
+    /// r1 P1-2 (provenance: d3671f4): importing a buffer created on a
+    /// DIFFERENT zunesha device must be rejected before any Vulkan
+    /// command (VUID-vkCmdBindVertexBuffers-commonparent).
+    #[test]
+    #[serial]
+    fn import_rejects_foreign_device_buffer() {
+        let Some(ctx) = rig() else { return };
+        let Some(ctx2) = rig() else { return };
+        let backend = ctx.backend();
+        let foreign = zunesha::Device::create_buffer(&ctx2.device, &INSTANCE_OFFSETS)
+            .expect("buffer on the second device");
+        let r = backend.import_zunesha_buffer(&ctx2.device, foreign);
+        assert!(
+            matches!(r, Err(GraphicsError::InvalidArgument { .. })),
+            "a buffer from another device must be rejected at import"
+        );
     }
 }
