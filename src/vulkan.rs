@@ -54,7 +54,8 @@ use ash::{Entry, ext, khr, vk};
 use crate::frame::{Frame, FrameInner};
 use crate::{
     CullMode, FilterMode, GpuBuffer, GraphicsError, PipelineConfig, RenderPipeline, Result,
-    SurfaceHandle, Texture, TextureDesc, Topology, VertexFormat,
+    SurfaceHandle, Texture, TextureDesc, Topology, VertexBindingLayout, VertexFormat,
+    VertexInputRate,
 };
 use zunesha::Device;
 
@@ -136,6 +137,78 @@ fn to_vk_format(f: VertexFormat) -> vk::Format {
         VertexFormat::Float32x3 => vk::Format::R32G32B32_SFLOAT,
         VertexFormat::Float32x4 => vk::Format::R32G32B32A32_SFLOAT,
     }
+}
+
+/// Map [`VertexInputRate`] to Vulkan input rates (M3).
+fn to_vk_input_rate(rate: VertexInputRate) -> vk::VertexInputRate {
+    match rate {
+        VertexInputRate::Vertex => vk::VertexInputRate::VERTEX,
+        VertexInputRate::Instance => vk::VertexInputRate::INSTANCE,
+    }
+}
+
+/// Validate a pipeline's vertex-input bindings (M3).
+///
+/// The rules `compile_render_pipeline` enforces BEFORE any GPU work, as
+/// `InvalidArgument`:
+///
+/// - at most ONE `Vertex`-rate and at most ONE `Instance`-rate binding —
+///   the v0.1 draw arity (one vertex stream + one instance stream per
+///   draw); the list TYPE is the future multi-stream surface;
+/// - attribute `location`s unique across the whole list — WGSL input
+///   locations are global, not per binding;
+/// - a binding that declares attributes must declare a non-zero `stride`
+///   (an element layout has no meaning without an element size).
+///
+/// An empty list keeps the historical no-vertex-input meaning (the
+/// stride-0 pipelines from before M3).
+fn validate_vertex_bindings(bindings: &[VertexBindingLayout]) -> Result<()> {
+    let mut vertex_rate = 0usize;
+    let mut instance_rate = 0usize;
+    let mut locations = std::collections::HashSet::new();
+    for (index, binding) in bindings.iter().enumerate() {
+        match binding.rate {
+            VertexInputRate::Vertex => vertex_rate += 1,
+            VertexInputRate::Instance => instance_rate += 1,
+        }
+        if binding.stride == 0 && !binding.attributes.is_empty() {
+            return Err(GraphicsError::InvalidArgument {
+                message: format!(
+                    "vertex binding {index} declares {} attribute(s) but stride 0 — \
+                     a binding with no element size cannot describe an attribute layout",
+                    binding.attributes.len()
+                ),
+            });
+        }
+        for attribute in &binding.attributes {
+            if !locations.insert(attribute.location) {
+                return Err(GraphicsError::InvalidArgument {
+                    message: format!(
+                        "vertex attribute location {} is declared more than once — \
+                         WGSL input locations are global across bindings",
+                        attribute.location
+                    ),
+                });
+            }
+        }
+    }
+    if vertex_rate > 1 {
+        return Err(GraphicsError::InvalidArgument {
+            message: format!(
+                "{vertex_rate} Vertex-rate vertex bindings declared — v0.1 draw arity \
+                 allows at most one (the bindings list is the future multi-stream surface)"
+            ),
+        });
+    }
+    if instance_rate > 1 {
+        return Err(GraphicsError::InvalidArgument {
+            message: format!(
+                "{instance_rate} Instance-rate vertex bindings declared — v0.1 draw arity \
+                 allows at most one instance stream per draw"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Map [`CompareOp`](crate::CompareOp) to Vulkan compare ops.
@@ -405,6 +478,15 @@ pub(crate) struct VulkanPipelineInner {
     vs_module: vk::ShaderModule,
     fs_module: vk::ShaderModule,
     device: ash::Device,
+    /// Vertex-input binding index (list position) of the pipeline's
+    /// Vertex-rate binding, when its config declares one (M3). `None` for
+    /// the pre-M3 no-vertex-input case, where record-time binds default to
+    /// index 0.
+    vertex_binding: Option<u32>,
+    /// Vertex-input binding index of the pipeline's Instance-rate binding.
+    /// `Some` marks an instanced pipeline: the single-stream draw paths
+    /// reject it, and the instanced paths require it (M3 draw arity).
+    instance_binding: Option<u32>,
     /// Retention (round 9, P1): a pipeline bound into a recording whose
     /// completion is unconfirmed must not be destroyed — same discipline
     /// as vertex buffers.
@@ -2296,6 +2378,10 @@ impl<'a> VulkanBackend<'a> {
         fragment_source: &str,
         config: &PipelineConfig,
     ) -> Result<RenderPipeline> {
+        // Binding validation BEFORE anything else (M3): arity, global
+        // location uniqueness, stride sanity — no shader work, no GPU work.
+        validate_vertex_bindings(&config.vertex_bindings)?;
+
         let vs_spv = compile_stage(vertex_entry, vertex_source, naga::ShaderStage::Vertex)?;
         let fs_spv = compile_stage(fragment_entry, fragment_source, naga::ShaderStage::Fragment)?;
 
@@ -2338,31 +2424,42 @@ impl<'a> VulkanBackend<'a> {
                 .name(&fs_name),
         ];
 
-        // Vertex input from the caller's layout (binding 0, interleaved).
-        let binding = vk::VertexInputBindingDescription::default()
-            .binding(0)
-            .stride(config.vertex_layout.stride)
-            .input_rate(vk::VertexInputRate::VERTEX);
-        let attributes: Vec<vk::VertexInputAttributeDescription> = config
-            .vertex_layout
-            .attributes
-            .iter()
-            .map(|a| {
+        // Vertex input from the caller's binding list (M3): binding index =
+        // list position, input rate from the binding, and each attribute
+        // names its OWN binding (no longer hardcoded 0). A zero-stride
+        // binding carries no element layout, so it is not DESCRIBED — that
+        // keeps the pre-M3 "no vertex input" meaning — but its rate still
+        // counts for the draw arity (the config declares the stream).
+        let mut vk_bindings: Vec<vk::VertexInputBindingDescription> = Vec::new();
+        let mut vk_attributes: Vec<vk::VertexInputAttributeDescription> = Vec::new();
+        let mut vertex_binding: Option<u32> = None;
+        let mut instance_binding: Option<u32> = None;
+        for (position, binding) in config.vertex_bindings.iter().enumerate() {
+            let position = position as u32;
+            match binding.rate {
+                VertexInputRate::Vertex => vertex_binding = Some(position),
+                VertexInputRate::Instance => instance_binding = Some(position),
+            }
+            if binding.stride == 0 {
+                continue;
+            }
+            vk_bindings.push(
+                vk::VertexInputBindingDescription::default()
+                    .binding(position)
+                    .stride(binding.stride)
+                    .input_rate(to_vk_input_rate(binding.rate)),
+            );
+            vk_attributes.extend(binding.attributes.iter().map(|a| {
                 vk::VertexInputAttributeDescription::default()
-                    .binding(0)
+                    .binding(position)
                     .location(a.location)
                     .format(to_vk_format(a.format))
                     .offset(a.offset)
-            })
-            .collect();
-        let bindings: Vec<vk::VertexInputBindingDescription> = if config.vertex_layout.stride == 0 {
-            Vec::new()
-        } else {
-            vec![binding]
-        };
+            }));
+        }
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
-            .vertex_binding_descriptions(&bindings)
-            .vertex_attribute_descriptions(&attributes);
+            .vertex_binding_descriptions(&vk_bindings)
+            .vertex_attribute_descriptions(&vk_attributes);
 
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(to_vk_topology(config.topology))
@@ -2458,6 +2555,8 @@ impl<'a> VulkanBackend<'a> {
             vs_module,
             fs_module,
             device: self.device.clone(),
+            vertex_binding,
+            instance_binding,
             retention: Some(Arc::clone(&self.buffer_retention)),
             alive: Some(Arc::clone(&self.alive)),
         });
@@ -2495,6 +2594,39 @@ impl<'a> VulkanBackend<'a> {
         Ok(GpuBuffer {
             raw: Box::into_raw(Box::new(inner)) as *mut c_void,
             len,
+            drop_fn: drop_zunesha_buffer_box,
+        })
+    }
+
+    /// Adopt an externally-created `zunesha::Buffer` as a `GpuBuffer` (M3).
+    ///
+    /// No upload, no copy: the handle wraps the GIVEN buffer (which another
+    /// client of the shared device — Borsalino's dispatch, or zunesha's own
+    /// staging — filled), so a draw reads the same physical buffer. The
+    /// drop protocol is the standard one (`alive`/`retention`, graveyard
+    /// at frame completion), so an imported instance buffer dropped
+    /// mid-recording retires exactly like an uploaded one.
+    ///
+    /// The import does NOT touch the queue — it allocates and copies
+    /// nothing, so no submission (and no `QUEUE_LOCK`) is involved.
+    ///
+    /// v0.1 tier is same-graphics-queue writes only: queue FIFO ordering
+    /// makes them visible to subsequently recorded draws. Cross-family
+    /// (compute-queue) writes require ownership transfer and are out of
+    /// scope (M2 / Zunesha ADR 0005 Phase 2).
+    ///
+    /// `GpuBuffer::len` is recorded as 0: `zunesha::Buffer` exposes no
+    /// length accessor, and the import performs no copy that would reveal
+    /// one. Draws take explicit counts, so nothing reads it.
+    pub fn import_zunesha_buffer(&self, buffer: zunesha::Buffer) -> Result<GpuBuffer> {
+        let inner = GpuBufferInner {
+            buffer,
+            alive: Arc::clone(&self.alive),
+            retention: Arc::clone(&self.buffer_retention),
+        };
+        Ok(GpuBuffer {
+            raw: Box::into_raw(Box::new(inner)) as *mut c_void,
+            len: 0,
             drop_fn: drop_zunesha_buffer_box,
         })
     }
@@ -3164,6 +3296,16 @@ impl<'a> VulkanBackend<'a> {
                 });
             }
         }
+        // Draw arity (M3): a pipeline that consumes per-instance data cannot
+        // be drawn by the single-stream path — the instance stream would be
+        // unbound. Rejected before any registry or queue state changes.
+        if pipeline_inner.instance_binding.is_some() {
+            return Err(GraphicsError::InvalidDraw {
+                message: "pipeline requires instances — it declares an Instance-rate vertex \
+                          binding; use draw_instanced"
+                    .into(),
+            });
+        }
         let zunesha_buffer = &buffer_inner.buffer;
         // Retain: the pending recording references this buffer — a public
         // drop before completion must retire into the graveyard, and a
@@ -3198,13 +3340,140 @@ impl<'a> VulkanBackend<'a> {
                 vk::PipelineBindPoint::GRAPHICS,
                 pipeline_inner.pipeline,
             );
+            // Bind at the pipeline's declared Vertex-rate binding index
+            // (list position); index 0 is the historical single-binding
+            // case and the no-vertex-input default.
             self.device.cmd_bind_vertex_buffers(
                 render.cmd,
-                0,
+                pipeline_inner.vertex_binding.unwrap_or(0),
                 std::slice::from_ref(&vertex_buffer),
                 &[0],
             );
             self.device.cmd_draw(render.cmd, vertex_count, 1, 0, 0);
+        }
+        Ok(())
+    }
+
+    /// Record a non-indexed instanced draw into `frame` (M3).
+    ///
+    /// `vertices` is bound at the pipeline's Vertex-rate binding and
+    /// `instances` at its Instance-rate binding, then
+    /// `vkCmdDraw(vertex_count, instance_count, 0, 0)` is recorded.
+    ///
+    /// Retention (rounds 9–10 apply verbatim): BOTH buffers and the
+    /// pipeline register in the retention registry, and BOTH buffers get
+    /// the `Arc::ptr_eq` owner validation — an instance buffer dropped
+    /// mid-recording retires to the graveyard exactly like a vertex
+    /// buffer. No new queue-op site: this records, it never submits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_instanced(
+        &self,
+        frame: &mut Frame,
+        pipeline: &RenderPipeline,
+        vertices: &GpuBuffer,
+        instances: &GpuBuffer,
+        vertex_count: u32,
+        instance_count: u32,
+    ) -> Result<()> {
+        let Some(frame_index) = frame.peek_index() else {
+            return Err(GraphicsError::InvalidDraw {
+                message: "frame has no acquired image (already presented?)".into(),
+            });
+        };
+        let pipeline_inner =
+            // Safety: `raw` was produced by `Box::into_raw::<VulkanPipelineInner>`
+            // in `compile_render_pipeline` and is still valid.
+            unsafe { &*(pipeline.raw as *const VulkanPipelineInner) };
+        // Safety: `raw` was produced by `Box::into_raw<GpuBufferInner>` in
+        // `create_buffer` / `import_zunesha_buffer` and is still valid.
+        let vertex_inner = unsafe { &*(vertices.raw as *const GpuBufferInner) };
+        let instance_inner = unsafe { &*(instances.raw as *const GpuBufferInner) };
+        // Owner validation (round 10, P1) for BOTH buffers: a destructor
+        // consults the registry baked into its inner (the OWNER's) — a
+        // foreign handle would register here but never be retained for THIS
+        // recording. Rejected, mirroring the single-buffer paths.
+        if !Arc::ptr_eq(&vertex_inner.retention, &self.buffer_retention) {
+            return Err(GraphicsError::InvalidDraw {
+                message: "vertex buffer belongs to a different backend".into(),
+            });
+        }
+        if !Arc::ptr_eq(&instance_inner.retention, &self.buffer_retention) {
+            return Err(GraphicsError::InvalidDraw {
+                message: "instance buffer belongs to a different backend".into(),
+            });
+        }
+        match &pipeline_inner.retention {
+            Some(r) if Arc::ptr_eq(r, &self.buffer_retention) => {}
+            _ => {
+                return Err(GraphicsError::InvalidDraw {
+                    message: "pipeline belongs to a different backend".into(),
+                });
+            }
+        }
+        // Draw arity (M3): an instanced draw needs an Instance-rate binding
+        // to bind `instances` at, and a zero-instance draw records no work
+        // (mirrors the zero-vertex refusal). Both rejected before any
+        // registry or queue state changes.
+        let Some(instance_binding) = pipeline_inner.instance_binding else {
+            return Err(GraphicsError::InvalidDraw {
+                message: "pipeline has no instance binding — draw_instanced requires an \
+                          Instance-rate vertex binding in the pipeline config"
+                    .into(),
+            });
+        };
+        if instance_count == 0 {
+            return Err(GraphicsError::InvalidDraw {
+                message: "instance_count must be non-zero".into(),
+            });
+        }
+        let vertex_buffer = self.zunesha_device.raw_buffer(&vertex_inner.buffer);
+        let instance_buffer = self.zunesha_device.raw_buffer(&instance_inner.buffer);
+        {
+            // Retain: the pending recording references BOTH buffers and the
+            // pipeline — a public drop before completion must retire into
+            // the graveyard, and a poisoned (unconfirmable) frame must LEAK
+            // them (round 9, P1). Lock order: render (held) → retention —
+            // never reversed; the guard is released before the render lock
+            // is taken below.
+            let mut retention = self.buffer_retention.lock().expect("buffer retention lock");
+            retention.bound.insert(vertices.raw as usize);
+            retention.bound.insert(instances.raw as usize);
+            retention.bound_pipelines.insert(pipeline.raw as usize);
+        }
+
+        let render = self.render.lock().expect("render state lock");
+        Self::check_not_broken(&render)?;
+        if !matches!(render.phase, RenderPhase::Open(i) if i == frame_index) {
+            return Err(GraphicsError::InvalidDraw {
+                message: format!(
+                    "frame {frame_index} is not the frame being recorded ({:?})",
+                    render.phase
+                ),
+            });
+        }
+
+        unsafe {
+            self.device.cmd_bind_pipeline(
+                render.cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_inner.pipeline,
+            );
+            if let Some(index) = pipeline_inner.vertex_binding {
+                self.device.cmd_bind_vertex_buffers(
+                    render.cmd,
+                    index,
+                    std::slice::from_ref(&vertex_buffer),
+                    &[0],
+                );
+            }
+            self.device.cmd_bind_vertex_buffers(
+                render.cmd,
+                instance_binding,
+                std::slice::from_ref(&instance_buffer),
+                &[0],
+            );
+            self.device
+                .cmd_draw(render.cmd, vertex_count, instance_count, 0, 0);
         }
         Ok(())
     }
@@ -3250,6 +3519,15 @@ impl<'a> VulkanBackend<'a> {
                     message: "pipeline belongs to a different backend".into(),
                 });
             }
+        }
+        // Draw arity (M3): see `draw` — an instanced pipeline cannot be
+        // drawn by a single-stream path.
+        if pipeline_inner.instance_binding.is_some() {
+            return Err(GraphicsError::InvalidDraw {
+                message: "pipeline requires instances — it declares an Instance-rate vertex \
+                          binding; use draw_instanced_textured"
+                    .into(),
+            });
         }
         let zunesha_buffer = &buffer_inner.buffer;
         // Retain: the pending recording references this buffer — a public
@@ -3320,11 +3598,150 @@ impl<'a> VulkanBackend<'a> {
             );
             self.device.cmd_bind_vertex_buffers(
                 render.cmd,
-                0,
+                pipeline_inner.vertex_binding.unwrap_or(0),
                 std::slice::from_ref(&vertex_buffer),
                 &[0],
             );
             self.device.cmd_draw(render.cmd, vertex_count, 1, 0, 0);
+        }
+        Ok(())
+    }
+
+    /// Record a non-indexed instanced TEXTURED draw into `frame` (M3): the
+    /// M1 texture set (set 0) plus the M3 instance binding. Identical
+    /// guards to [`Self::draw_instanced`], with the texture's owner check
+    /// and bound-registration from [`Self::draw_textured`].
+    ///
+    /// Retention covers all four objects the recording references: BOTH
+    /// buffers, the pipeline, and the texture.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_instanced_textured(
+        &self,
+        frame: &mut Frame,
+        pipeline: &RenderPipeline,
+        vertices: &GpuBuffer,
+        instances: &GpuBuffer,
+        vertex_count: u32,
+        instance_count: u32,
+        texture: &Texture,
+    ) -> Result<()> {
+        let Some(frame_index) = frame.peek_index() else {
+            return Err(GraphicsError::InvalidDraw {
+                message: "frame has no acquired image (already presented?)".into(),
+            });
+        };
+        let pipeline_inner =
+            // Safety: `raw` was produced by `Box::into_raw::<VulkanPipelineInner>`
+            // in `compile_render_pipeline` and is still valid.
+            unsafe { &*(pipeline.raw as *const VulkanPipelineInner) };
+        // Safety: `raw` was produced by `Box::into_raw<GpuBufferInner>` in
+        // `create_buffer` / `import_zunesha_buffer` and is still valid.
+        let vertex_inner = unsafe { &*(vertices.raw as *const GpuBufferInner) };
+        let instance_inner = unsafe { &*(instances.raw as *const GpuBufferInner) };
+        // Owner validation (round 10, P1) for BOTH buffers.
+        if !Arc::ptr_eq(&vertex_inner.retention, &self.buffer_retention) {
+            return Err(GraphicsError::InvalidDraw {
+                message: "vertex buffer belongs to a different backend".into(),
+            });
+        }
+        if !Arc::ptr_eq(&instance_inner.retention, &self.buffer_retention) {
+            return Err(GraphicsError::InvalidDraw {
+                message: "instance buffer belongs to a different backend".into(),
+            });
+        }
+        match &pipeline_inner.retention {
+            Some(r) if Arc::ptr_eq(r, &self.buffer_retention) => {}
+            _ => {
+                return Err(GraphicsError::InvalidDraw {
+                    message: "pipeline belongs to a different backend".into(),
+                });
+            }
+        }
+        // Draw arity (M3): same two rules as `draw_instanced` — an
+        // Instance-rate binding is required, and zero instances record no
+        // work.
+        let Some(instance_binding) = pipeline_inner.instance_binding else {
+            return Err(GraphicsError::InvalidDraw {
+                message: "pipeline has no instance binding — draw_instanced_textured requires \
+                          an Instance-rate vertex binding in the pipeline config"
+                    .into(),
+            });
+        };
+        if instance_count == 0 {
+            return Err(GraphicsError::InvalidDraw {
+                message: "instance_count must be non-zero".into(),
+            });
+        }
+        let vertex_buffer = self.zunesha_device.raw_buffer(&vertex_inner.buffer);
+        let instance_buffer = self.zunesha_device.raw_buffer(&instance_inner.buffer);
+        {
+            // Retain BOTH buffers + the pipeline (round 9, P1) — same
+            // discipline as the other draw paths; guard released before the
+            // render lock is taken.
+            let mut retention = self.buffer_retention.lock().expect("buffer retention lock");
+            retention.bound.insert(vertices.raw as usize);
+            retention.bound.insert(instances.raw as usize);
+            retention.bound_pipelines.insert(pipeline.raw as usize);
+        }
+        // Safety: `raw` was produced by `Box::into_raw::<VulkanTextureInner>`
+        // in `create_texture` and is still valid.
+        let texture_inner = unsafe { &*(texture.raw as *const VulkanTextureInner) };
+        // Foreign textures are rejected (review round 4, P1) — see
+        // `draw_textured`.
+        if !Arc::ptr_eq(&texture_inner.bindings, &self.texture_bindings) {
+            return Err(GraphicsError::InvalidDraw {
+                message: "texture was created by a different backend — \ncross-backend texture use is not supported; create the texture with the backend that draws it".into(),
+            });
+        }
+
+        let render = self.render.lock().expect("render state lock");
+        Self::check_not_broken(&render)?;
+        if !matches!(render.phase, RenderPhase::Open(i) if i == frame_index) {
+            return Err(GraphicsError::InvalidDraw {
+                message: format!(
+                    "frame {frame_index} is not the frame being recorded ({:?})",
+                    render.phase
+                ),
+            });
+        }
+
+        unsafe {
+            // Texture bound into this recording (review round 1, P1).
+            // Lock order: render (held) → bindings — never reversed.
+            self.texture_bindings
+                .lock()
+                .expect("texture bindings lock")
+                .bound
+                .insert(texture.raw as usize);
+            self.device.cmd_bind_pipeline(
+                render.cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_inner.pipeline,
+            );
+            self.device.cmd_bind_descriptor_sets(
+                render.cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_inner.layout,
+                0,
+                std::slice::from_ref(&texture_inner.set),
+                &[],
+            );
+            if let Some(index) = pipeline_inner.vertex_binding {
+                self.device.cmd_bind_vertex_buffers(
+                    render.cmd,
+                    index,
+                    std::slice::from_ref(&vertex_buffer),
+                    &[0],
+                );
+            }
+            self.device.cmd_bind_vertex_buffers(
+                render.cmd,
+                instance_binding,
+                std::slice::from_ref(&instance_buffer),
+                &[0],
+            );
+            self.device
+                .cmd_draw(render.cmd, vertex_count, instance_count, 0, 0);
         }
         Ok(())
     }
@@ -3714,6 +4131,10 @@ impl crate::GraphicsBackend for VulkanBackend<'_> {
         VulkanBackend::create_buffer(self, data)
     }
 
+    fn import_zunesha_buffer(&self, buffer: zunesha::Buffer) -> Result<GpuBuffer> {
+        VulkanBackend::import_zunesha_buffer(self, buffer)
+    }
+
     fn create_texture(
         &self,
         desc: &TextureDesc,
@@ -3732,6 +4153,50 @@ impl crate::GraphicsBackend for VulkanBackend<'_> {
         texture: &Texture,
     ) -> Result<()> {
         VulkanBackend::draw_textured(self, frame, pipeline, vertices, vertex_count, texture)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_instanced(
+        &self,
+        frame: &mut Frame,
+        pipeline: &RenderPipeline,
+        vertices: &GpuBuffer,
+        instances: &GpuBuffer,
+        vertex_count: u32,
+        instance_count: u32,
+    ) -> Result<()> {
+        VulkanBackend::draw_instanced(
+            self,
+            frame,
+            pipeline,
+            vertices,
+            instances,
+            vertex_count,
+            instance_count,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_instanced_textured(
+        &self,
+        frame: &mut Frame,
+        pipeline: &RenderPipeline,
+        vertices: &GpuBuffer,
+        instances: &GpuBuffer,
+        vertex_count: u32,
+        instance_count: u32,
+        texture: &Texture,
+    ) -> Result<()> {
+        VulkanBackend::draw_instanced_textured(
+            self,
+            frame,
+            pipeline,
+            vertices,
+            instances,
+            vertex_count,
+            instance_count,
+            texture,
+        )
     }
 
     fn acquire_frame(&self) -> Result<Frame> {
@@ -3813,14 +4278,15 @@ mod tests {
             cull_mode: CullMode::None,
             depth: None,
             blend: None,
-            vertex_layout: crate::VertexLayout {
+            vertex_bindings: vec![crate::VertexBindingLayout {
                 stride: 8,
+                rate: crate::VertexInputRate::Vertex,
                 attributes: vec![crate::VertexAttribute {
                     location: 0,
                     offset: 0,
                     format: VertexFormat::Float32x2,
                 }],
-            },
+            }],
         }
     }
 
@@ -4192,14 +4658,15 @@ fn fs_main() -> @location(0) vec4<f32> {
         PipelineConfig {
             topology: Topology::TriangleList,
             cull_mode: CullMode::None,
-            vertex_layout: crate::VertexLayout {
+            vertex_bindings: vec![crate::VertexBindingLayout {
                 stride: 12,
+                rate: crate::VertexInputRate::Vertex,
                 attributes: vec![crate::VertexAttribute {
                     location: 0,
                     offset: 0,
                     format: VertexFormat::Float32x3,
                 }],
-            },
+            }],
             depth,
             blend: None,
         }
@@ -4498,8 +4965,9 @@ fn fs_main(@location(1) uv: vec2<f32>) -> @location(0) vec4<f32> {
             cull_mode: CullMode::None,
             depth: None,
             blend: None,
-            vertex_layout: crate::VertexLayout {
+            vertex_bindings: vec![crate::VertexBindingLayout {
                 stride: 16,
+                rate: crate::VertexInputRate::Vertex,
                 attributes: vec![
                     crate::VertexAttribute {
                         location: 0,
@@ -4512,7 +4980,7 @@ fn fs_main(@location(1) uv: vec2<f32>) -> @location(0) vec4<f32> {
                         format: VertexFormat::Float32x2,
                     },
                 ],
-            },
+            }],
         }
     }
 
@@ -4659,6 +5127,805 @@ fn fs_main(@location(1) uv: vec2<f32>) -> @location(0) vec4<f32> {
                 crate::FilterMode::Nearest,
             ),
             Err(GraphicsError::InvalidArgument { .. })
+        ));
+    }
+
+    // ── M3: instanced batches & the zero-copy import seam ────────────
+
+    /// Per-instance transform: `pos` from the Vertex-rate binding, the
+    /// instance offset from the Instance-rate binding.
+    const INSTANCED_VERT: &str = r#"
+struct VOut { @builtin(position) pos: vec4<f32> };
+
+@vertex
+fn vs_main(@location(0) p: vec2<f32>, @location(1) offset: vec2<f32>) -> VOut {
+    return VOut(vec4<f32>(p + offset, 0.0, 1.0));
+}
+"#;
+
+    /// Per-instance transform + per-instance colour, forwarded to the
+    /// fragment stage (instanced geometry, per-instance tint).
+    const INSTANCED_COLOR_VERT: &str = r#"
+struct VOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
+@vertex
+fn vs_main(
+    @location(0) p: vec2<f32>,
+    @location(1) offset: vec2<f32>,
+    @location(2) color: vec4<f32>,
+) -> VOut {
+    return VOut(vec4<f32>(p + offset, 0.0, 1.0), color);
+}
+"#;
+
+    /// Per-instance colour passthrough fragment.
+    const INSTANCED_COLOR_FRAG: &str = r#"
+@fragment
+fn fs_main(@location(0) color: vec4<f32>) -> @location(0) vec4<f32> {
+    return color;
+}
+"#;
+
+    /// Glyph-atlas shape: per-vertex `pos` + `uv`, per-instance `offset` +
+    /// `uv_offset` (four vertex inputs across two bindings).
+    const INSTANCED_TEXTURED_VERT: &str = r#"
+struct VOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(4) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(
+    @location(0) p: vec2<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) offset: vec2<f32>,
+    @location(3) uv_offset: vec2<f32>,
+) -> VOut {
+    return VOut(vec4<f32>(p + offset, 0.0, 1.0), uv + uv_offset);
+}
+"#;
+
+    /// Instanced textured fragment: samples set 0 at the offset UV.
+    const INSTANCED_TEXTURED_FRAG: &str = r#"
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+
+@fragment
+fn fs_main(@location(4) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    return textureSample(tex, samp, uv);
+}
+"#;
+
+    /// A 0.5 × 0.5 quad (triangle strip) with its lower-left corner at the
+    /// NDC origin — the per-instance offset places a copy of it.
+    const UNIT_QUAD: [f32; 8] = [
+        0.0, -0.25, //
+        0.5, -0.25, //
+        0.0, 0.25, //
+        0.5, 0.25, //
+    ];
+
+    /// The same quad carrying UVs that span ONE QUARTER of a 2×2 atlas
+    /// (`[0, 0.5] × [0, 0.5]`): `(x, y, u, v)` per vertex.
+    const UNIT_QUAD_UV: [f32; 16] = [
+        0.0, -0.25, 0.0, 0.0, //
+        0.5, -0.25, 0.5, 0.0, //
+        0.0, 0.25, 0.0, 0.5, //
+        0.5, 0.25, 0.5, 0.5, //
+    ];
+
+    /// Three instance offsets (`[dx, dy]` per instance, 8-byte stride): the
+    /// quads land at x ∈ [-0.9,-0.4], [-0.3,0.2], [0.3,0.8] — distinct, with
+    /// visible gaps between the first/second and second/third.
+    const INSTANCE_OFFSETS: [f32; 6] = [-0.9, 0.0, -0.3, 0.0, 0.3, 0.0];
+
+    /// The same three offsets with a per-instance colour — red, green, blue
+    /// (24-byte stride: `[dx, dy, r, g, b, a]`).
+    const INSTANCE_OFFSETS_COLORS: [f32; 18] = [
+        -0.9, 0.0, 1.0, 0.0, 0.0, 1.0, //
+        -0.3, 0.0, 0.0, 1.0, 0.0, 1.0, //
+        0.3, 0.0, 0.0, 0.0, 1.0, 1.0, //
+    ];
+
+    /// The same three offsets with a per-instance UV offset into the atlas
+    /// (16-byte stride: `[dx, dy, du, dv]`) — top-left, top-right, bottom-left
+    /// quadrant respectively.
+    const INSTANCE_OFFSETS_UV: [f32; 12] = [
+        -0.9, 0.0, 0.0, 0.0, //
+        -0.3, 0.0, 0.5, 0.0, //
+        0.3, 0.0, 0.0, 0.5, //
+    ];
+
+    /// The two-binding transform config: `vec2` position at location 0
+    /// (Vertex-rate, stride 8) + `vec2` instance offset at location 1
+    /// (Instance-rate, stride 8).
+    fn instanced_transform_config() -> PipelineConfig {
+        PipelineConfig {
+            topology: Topology::TriangleStrip,
+            cull_mode: CullMode::None,
+            depth: None,
+            blend: None,
+            vertex_bindings: vec![
+                crate::VertexBindingLayout {
+                    stride: 8,
+                    rate: crate::VertexInputRate::Vertex,
+                    attributes: vec![crate::VertexAttribute {
+                        location: 0,
+                        offset: 0,
+                        format: VertexFormat::Float32x2,
+                    }],
+                },
+                crate::VertexBindingLayout {
+                    stride: 8,
+                    rate: crate::VertexInputRate::Instance,
+                    attributes: vec![crate::VertexAttribute {
+                        location: 1,
+                        offset: 0,
+                        format: VertexFormat::Float32x2,
+                    }],
+                },
+            ],
+        }
+    }
+
+    /// The three-binding colour config: position @0 (Vertex), instance
+    /// offset @1 (Instance, offset 0), instance colour @2 (Instance, offset
+    /// 8) — one Instance-rate binding carrying two attributes.
+    fn instanced_color_config() -> PipelineConfig {
+        PipelineConfig {
+            topology: Topology::TriangleStrip,
+            cull_mode: CullMode::None,
+            depth: None,
+            blend: None,
+            vertex_bindings: vec![
+                crate::VertexBindingLayout {
+                    stride: 8,
+                    rate: crate::VertexInputRate::Vertex,
+                    attributes: vec![crate::VertexAttribute {
+                        location: 0,
+                        offset: 0,
+                        format: VertexFormat::Float32x2,
+                    }],
+                },
+                crate::VertexBindingLayout {
+                    stride: 24,
+                    rate: crate::VertexInputRate::Instance,
+                    attributes: vec![
+                        crate::VertexAttribute {
+                            location: 1,
+                            offset: 0,
+                            format: VertexFormat::Float32x2,
+                        },
+                        crate::VertexAttribute {
+                            location: 2,
+                            offset: 8,
+                            format: VertexFormat::Float32x4,
+                        },
+                    ],
+                },
+            ],
+        }
+    }
+
+    /// The instanced textured config: position @0 + uv @1 (Vertex-rate,
+    /// stride 16), instance offset @2 + uv offset @3 (Instance-rate, stride
+    /// 16).
+    fn instanced_textured_config() -> PipelineConfig {
+        PipelineConfig {
+            topology: Topology::TriangleStrip,
+            cull_mode: CullMode::None,
+            depth: None,
+            blend: None,
+            vertex_bindings: vec![
+                crate::VertexBindingLayout {
+                    stride: 16,
+                    rate: crate::VertexInputRate::Vertex,
+                    attributes: vec![
+                        crate::VertexAttribute {
+                            location: 0,
+                            offset: 0,
+                            format: VertexFormat::Float32x2,
+                        },
+                        crate::VertexAttribute {
+                            location: 1,
+                            offset: 8,
+                            format: VertexFormat::Float32x2,
+                        },
+                    ],
+                },
+                crate::VertexBindingLayout {
+                    stride: 16,
+                    rate: crate::VertexInputRate::Instance,
+                    attributes: vec![
+                        crate::VertexAttribute {
+                            location: 2,
+                            offset: 0,
+                            format: VertexFormat::Float32x2,
+                        },
+                        crate::VertexAttribute {
+                            location: 3,
+                            offset: 8,
+                            format: VertexFormat::Float32x2,
+                        },
+                    ],
+                },
+            ],
+        }
+    }
+
+    /// Framebuffer x for an NDC x (the y samples are all centred).
+    fn ndc_x(ndc: f32, w: usize) -> usize {
+        (((ndc + 1.0) * 0.5) * w as f32) as usize
+    }
+
+    /// The tightly-packed RGBA8 pixel at `(x, y)`.
+    fn pixel_at(pixels: &[u8], w: usize, x: usize, y: usize) -> [u8; 4] {
+        let o = (y * w + x) * 4;
+        [pixels[o], pixels[o + 1], pixels[o + 2], pixels[o + 3]]
+    }
+
+    /// M3 test 2: a pipeline whose shader reads per-instance `@location`
+    /// inputs compiles against a two-binding config — and an empty bindings
+    /// list keeps the pre-M3 no-vertex-input meaning.
+    #[test]
+    #[serial]
+    fn instanced_pipeline_compiles() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let pipeline = backend
+            .compile_render_pipeline(
+                "vs_main",
+                INSTANCED_VERT,
+                "fs_main",
+                crate::kernels::FLAT_TRIANGLE_FRAG,
+                &instanced_transform_config(),
+            )
+            .expect("two-binding instanced pipeline compiles");
+        drop(pipeline);
+
+        // Empty bindings = no vertex input, exactly as before M3.
+        let no_input = backend
+            .compile_render_pipeline(
+                "vs_main",
+                crate::kernels::FLAT_TRIANGLE_VERT,
+                "fs_main",
+                crate::kernels::FLAT_TRIANGLE_FRAG,
+                &PipelineConfig::default(),
+            )
+            .expect("an empty bindings list still compiles (no vertex input)");
+        drop(no_input);
+        println!("instanced + no-input pipelines compiled cleanly");
+    }
+
+    /// M3 validation rule 1: more than one Vertex-rate binding is the v0.1
+    /// draw arity's first refusal.
+    #[test]
+    #[serial]
+    fn bindings_validation_rejects_two_vertex_rate() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let config = PipelineConfig {
+            vertex_bindings: vec![
+                crate::VertexBindingLayout {
+                    stride: 8,
+                    rate: crate::VertexInputRate::Vertex,
+                    attributes: vec![crate::VertexAttribute {
+                        location: 0,
+                        offset: 0,
+                        format: VertexFormat::Float32x2,
+                    }],
+                },
+                crate::VertexBindingLayout {
+                    stride: 8,
+                    rate: crate::VertexInputRate::Vertex,
+                    attributes: vec![crate::VertexAttribute {
+                        location: 1,
+                        offset: 0,
+                        format: VertexFormat::Float32x2,
+                    }],
+                },
+            ],
+            ..flat_config()
+        };
+        let err = backend
+            .compile_render_pipeline(
+                "vs_main",
+                crate::kernels::FLAT_TRIANGLE_VERT,
+                "fs_main",
+                crate::kernels::FLAT_TRIANGLE_FRAG,
+                &config,
+            )
+            .expect_err("two Vertex-rate bindings must be rejected");
+        assert!(
+            matches!(err, GraphicsError::InvalidArgument { .. }),
+            "expected InvalidArgument, got {err:?}"
+        );
+    }
+
+    /// M3 validation rule 2: more than one Instance-rate binding is rejected
+    /// the same way.
+    #[test]
+    #[serial]
+    fn bindings_validation_rejects_two_instance_rate() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let config = PipelineConfig {
+            vertex_bindings: vec![
+                crate::VertexBindingLayout {
+                    stride: 8,
+                    rate: crate::VertexInputRate::Vertex,
+                    attributes: vec![crate::VertexAttribute {
+                        location: 0,
+                        offset: 0,
+                        format: VertexFormat::Float32x2,
+                    }],
+                },
+                crate::VertexBindingLayout {
+                    stride: 8,
+                    rate: crate::VertexInputRate::Instance,
+                    attributes: vec![crate::VertexAttribute {
+                        location: 1,
+                        offset: 0,
+                        format: VertexFormat::Float32x2,
+                    }],
+                },
+                crate::VertexBindingLayout {
+                    stride: 8,
+                    rate: crate::VertexInputRate::Instance,
+                    attributes: vec![crate::VertexAttribute {
+                        location: 2,
+                        offset: 0,
+                        format: VertexFormat::Float32x2,
+                    }],
+                },
+            ],
+            ..flat_config()
+        };
+        let err = backend
+            .compile_render_pipeline(
+                "vs_main",
+                crate::kernels::FLAT_TRIANGLE_VERT,
+                "fs_main",
+                crate::kernels::FLAT_TRIANGLE_FRAG,
+                &config,
+            )
+            .expect_err("two Instance-rate bindings must be rejected");
+        assert!(
+            matches!(err, GraphicsError::InvalidArgument { .. }),
+            "expected InvalidArgument, got {err:?}"
+        );
+    }
+
+    /// M3 validation rule 3: an attribute location repeated ACROSS bindings is
+    /// rejected — WGSL input locations are global.
+    #[test]
+    #[serial]
+    fn bindings_validation_rejects_duplicate_locations_across_bindings() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let config = PipelineConfig {
+            vertex_bindings: vec![
+                crate::VertexBindingLayout {
+                    stride: 8,
+                    rate: crate::VertexInputRate::Vertex,
+                    attributes: vec![crate::VertexAttribute {
+                        location: 0,
+                        offset: 0,
+                        format: VertexFormat::Float32x2,
+                    }],
+                },
+                crate::VertexBindingLayout {
+                    stride: 8,
+                    rate: crate::VertexInputRate::Instance,
+                    attributes: vec![crate::VertexAttribute {
+                        // Same location as binding 0's attribute.
+                        location: 0,
+                        offset: 0,
+                        format: VertexFormat::Float32x2,
+                    }],
+                },
+            ],
+            ..flat_config()
+        };
+        let err = backend
+            .compile_render_pipeline(
+                "vs_main",
+                crate::kernels::FLAT_TRIANGLE_VERT,
+                "fs_main",
+                crate::kernels::FLAT_TRIANGLE_FRAG,
+                &config,
+            )
+            .expect_err("a location repeated across bindings must be rejected");
+        assert!(
+            matches!(err, GraphicsError::InvalidArgument { .. }),
+            "expected InvalidArgument, got {err:?}"
+        );
+    }
+
+    /// M3 validation rule 4: a binding with attributes but stride 0 has no
+    /// element layout to describe — rejected.
+    #[test]
+    #[serial]
+    fn bindings_validation_rejects_nonempty_attributes_with_zero_stride() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let config = PipelineConfig {
+            vertex_bindings: vec![crate::VertexBindingLayout {
+                stride: 0,
+                rate: crate::VertexInputRate::Vertex,
+                attributes: vec![crate::VertexAttribute {
+                    location: 0,
+                    offset: 0,
+                    format: VertexFormat::Float32x2,
+                }],
+            }],
+            ..flat_config()
+        };
+        let err = backend
+            .compile_render_pipeline(
+                "vs_main",
+                crate::kernels::FLAT_TRIANGLE_VERT,
+                "fs_main",
+                crate::kernels::FLAT_TRIANGLE_FRAG,
+                &config,
+            )
+            .expect_err("attributes with stride 0 must be rejected");
+        assert!(
+            matches!(err, GraphicsError::InvalidArgument { .. }),
+            "expected InvalidArgument, got {err:?}"
+        );
+    }
+
+    /// M3 test 6: the draw arity rules, both directions. A pipeline that
+    /// declares an Instance-rate binding cannot be drawn by the single-stream
+    /// path, and `draw_instanced` cannot draw a pipeline that has no instance
+    /// stream.
+    #[test]
+    #[serial]
+    fn draw_arity_mismatches() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let instanced = backend
+            .compile_render_pipeline(
+                "vs_main",
+                INSTANCED_VERT,
+                "fs_main",
+                crate::kernels::FLAT_TRIANGLE_FRAG,
+                &instanced_transform_config(),
+            )
+            .expect("instanced pipeline");
+        let flat = backend
+            .compile_render_pipeline(
+                "vs_main",
+                crate::kernels::FLAT_TRIANGLE_VERT,
+                "fs_main",
+                crate::kernels::FLAT_TRIANGLE_FRAG,
+                &flat_config(),
+            )
+            .expect("flat pipeline");
+        let vb = backend.create_buffer(&UNIT_QUAD).expect("vertex buffer");
+        let instances = backend
+            .create_buffer(&INSTANCE_OFFSETS)
+            .expect("instance buffer");
+
+        let mut frame = backend.acquire_frame().expect("acquire");
+        // Case 1: "pipeline requires instances".
+        let err = backend
+            .draw(&mut frame, &instanced, &vb, 4)
+            .expect_err("draw on an instanced pipeline must be rejected");
+        assert!(
+            matches!(err, GraphicsError::InvalidDraw { .. }),
+            "expected InvalidDraw, got {err:?}"
+        );
+        // Case 2: "pipeline has no instance binding".
+        let err = backend
+            .draw_instanced(&mut frame, &flat, &vb, &instances, 4, 3)
+            .expect_err("draw_instanced on a single-stream pipeline must be rejected");
+        assert!(
+            matches!(err, GraphicsError::InvalidDraw { .. }),
+            "expected InvalidDraw, got {err:?}"
+        );
+        // `frame` is dropped unpresented — safe by design.
+    }
+
+    /// M3 test 9: a zero-instance draw records no work and mirrors the
+    /// zero-vertex refusal.
+    #[test]
+    #[serial]
+    fn draw_instanced_rejects_zero_instances() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let pipeline = backend
+            .compile_render_pipeline(
+                "vs_main",
+                INSTANCED_VERT,
+                "fs_main",
+                crate::kernels::FLAT_TRIANGLE_FRAG,
+                &instanced_transform_config(),
+            )
+            .expect("instanced pipeline");
+        let vb = backend.create_buffer(&UNIT_QUAD).expect("vertex buffer");
+        let instances = backend
+            .create_buffer(&INSTANCE_OFFSETS)
+            .expect("instance buffer");
+        let mut frame = backend.acquire_frame().expect("acquire");
+        let err = backend
+            .draw_instanced(&mut frame, &pipeline, &vb, &instances, 4, 0)
+            .expect_err("instance_count == 0 must be rejected");
+        assert!(
+            matches!(err, GraphicsError::InvalidDraw { .. }),
+            "expected InvalidDraw, got {err:?}"
+        );
+    }
+
+    /// Assert the three instanced quads landed at their per-instance offsets:
+    /// each centre is magenta, and the gaps between the quads are still the
+    /// clear colour (an ignored instance stream would leave all three quads
+    /// stacked at x ∈ [0, 0.5], failing both halves).
+    fn assert_three_offset_quads(backend: &VulkanBackend<'_>, pixels: &[u8]) {
+        let w = backend.extent().width as usize;
+        let h = backend.extent().height as usize;
+        let magenta = readback_texel(backend, [255, 0, 255, 255]);
+        for ndc in [-0.65f32, -0.05, 0.55] {
+            let p = pixel_at(pixels, w, ndc_x(ndc, w), h / 2);
+            assert_eq!(
+                p, magenta,
+                "the quad offset to NDC x={ndc} must be magenta, got {p:?}"
+            );
+        }
+        for ndc in [-0.35f32, 0.25] {
+            let p = pixel_at(pixels, w, ndc_x(ndc, w), h / 2);
+            assert!(
+                p[0] == p[1] && p[1] == p[2] && (24..=28).contains(&p[0]),
+                "the gap at NDC x={ndc} must still be the 0.1 gray clear, got {p:?}"
+            );
+        }
+    }
+
+    /// M3 test 3: three instances, per-instance x offset — the readback shows
+    /// three distinct quads at the offsets.
+    #[test]
+    #[serial]
+    fn draw_instanced_renders_per_instance_transforms() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let pipeline = backend
+            .compile_render_pipeline(
+                "vs_main",
+                INSTANCED_VERT,
+                "fs_main",
+                crate::kernels::FLAT_TRIANGLE_FRAG,
+                &instanced_transform_config(),
+            )
+            .expect("instanced pipeline");
+        let vb = backend.create_buffer(&UNIT_QUAD).expect("vertex buffer");
+        let instances = backend
+            .create_buffer(&INSTANCE_OFFSETS)
+            .expect("instance buffer");
+
+        let mut frame = backend.acquire_frame().expect("acquire");
+        backend
+            .draw_instanced(&mut frame, &pipeline, &vb, &instances, 4, 3)
+            .expect("draw_instanced");
+        let pixels = backend.read_pixels(&frame).expect("read_pixels");
+        backend.present(frame).expect("present");
+        assert_three_offset_quads(&backend, &pixels);
+        println!("three instanced quads verified at their offsets");
+    }
+
+    /// M3 test 4: per-instance colour — the readback shows three distinct
+    /// colours, one per instance.
+    #[test]
+    #[serial]
+    fn draw_instanced_renders_per_instance_colors() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let pipeline = backend
+            .compile_render_pipeline(
+                "vs_main",
+                INSTANCED_COLOR_VERT,
+                "fs_main",
+                INSTANCED_COLOR_FRAG,
+                &instanced_color_config(),
+            )
+            .expect("instanced colour pipeline");
+        let vb = backend.create_buffer(&UNIT_QUAD).expect("vertex buffer");
+        let instances = backend
+            .create_buffer(&INSTANCE_OFFSETS_COLORS)
+            .expect("instance buffer");
+
+        let mut frame = backend.acquire_frame().expect("acquire");
+        backend
+            .draw_instanced(&mut frame, &pipeline, &vb, &instances, 4, 3)
+            .expect("draw_instanced");
+        let pixels = backend.read_pixels(&frame).expect("read_pixels");
+        backend.present(frame).expect("present");
+
+        let w = backend.extent().width as usize;
+        let h = backend.extent().height as usize;
+        let expected = [
+            (-0.65f32, [255u8, 0, 0, 255]),
+            (-0.05, [0, 255, 0, 255]),
+            (0.55, [0, 0, 255, 255]),
+        ];
+        for (ndc, texel) in expected {
+            let p = pixel_at(&pixels, w, ndc_x(ndc, w), h / 2);
+            let want = readback_texel(&backend, texel);
+            assert_eq!(
+                p, want,
+                "instance at NDC x={ndc} must carry its own colour ({texel:?}), got {p:?}"
+            );
+        }
+    }
+
+    /// M3 test 5: a glyph-atlas batch — two instances sample DIFFERENT texel
+    /// quadrants of a 2×2 atlas because of their per-instance UV offset.
+    #[test]
+    #[serial]
+    fn draw_instanced_textured_samples_per_instance_uv() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let pipeline = backend
+            .compile_render_pipeline(
+                "vs_main",
+                INSTANCED_TEXTURED_VERT,
+                "fs_main",
+                INSTANCED_TEXTURED_FRAG,
+                &instanced_textured_config(),
+            )
+            .expect("instanced textured pipeline");
+        let texture = backend
+            .create_texture(
+                &crate::TextureDesc {
+                    width: 2,
+                    height: 2,
+                },
+                &QUAD_TEXELS,
+                crate::FilterMode::Nearest,
+            )
+            .expect("create_texture");
+        let vb = backend.create_buffer(&UNIT_QUAD_UV).expect("vertex buffer");
+        let instances = backend
+            .create_buffer(&INSTANCE_OFFSETS_UV)
+            .expect("instance buffer");
+
+        let mut frame = backend.acquire_frame().expect("acquire");
+        backend
+            .draw_instanced_textured(&mut frame, &pipeline, &vb, &instances, 4, 3, &texture)
+            .expect("draw_instanced_textured");
+        let pixels = backend.read_pixels(&frame).expect("read_pixels");
+        backend.present(frame).expect("present");
+
+        let w = backend.extent().width as usize;
+        let h = backend.extent().height as usize;
+        // Quadrant centres: each instance samples its own atlas quadrant.
+        let expected = [
+            (-0.65f32, [255u8, 0, 0, 255]), // top-left texel: red
+            (-0.05, [0, 255, 0, 255]),      // top-right texel: green
+            (0.55, [0, 0, 255, 255]),       // bottom-left texel: blue
+        ];
+        for (ndc, texel) in expected {
+            let p = pixel_at(&pixels, w, ndc_x(ndc, w), h / 2);
+            let want = readback_texel(&backend, texel);
+            assert_eq!(
+                p, want,
+                "the instance at NDC x={ndc} must sample its own atlas quadrant ({texel:?}), got {p:?}"
+            );
+        }
+    }
+
+    /// M3 test 7: the seam proof — the instance buffer is created by the
+    /// shared ZUNESHA device directly (never through Goldenweek's upload),
+    /// imported, drawn, and verified by readback. Goldenweek performs no copy.
+    #[test]
+    #[serial]
+    fn import_zunesha_buffer_draws_zero_copy() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let pipeline = backend
+            .compile_render_pipeline(
+                "vs_main",
+                INSTANCED_VERT,
+                "fs_main",
+                crate::kernels::FLAT_TRIANGLE_FRAG,
+                &instanced_transform_config(),
+            )
+            .expect("instanced pipeline");
+        let vb = backend.create_buffer(&UNIT_QUAD).expect("vertex buffer");
+        // Created on the SHARED device by zunesha itself — the bytes never
+        // pass through Goldenweek.
+        let foreign = zunesha::Device::create_buffer(&ctx.device, &INSTANCE_OFFSETS)
+            .expect("zunesha instance buffer");
+        let instances = backend
+            .import_zunesha_buffer(foreign)
+            .expect("import_zunesha_buffer");
+
+        let mut frame = backend.acquire_frame().expect("acquire");
+        backend
+            .draw_instanced(&mut frame, &pipeline, &vb, &instances, 4, 3)
+            .expect("draw_instanced from an imported buffer");
+        let pixels = backend.read_pixels(&frame).expect("read_pixels");
+        backend.present(frame).expect("present");
+        assert_three_offset_quads(&backend, &pixels);
+        println!("imported zunesha buffer drew its per-instance offsets with no copy");
+    }
+
+    /// M3 test 8: an IMPORTED instance buffer dropped between
+    /// `draw_instanced` and `present` retires into the graveyard (the r9
+    /// regression shape) instead of being destroyed under the pending
+    /// recording — no destroy-while-in-use.
+    #[test]
+    #[serial]
+    fn imported_buffer_drop_mid_recording_retires() {
+        let Some(ctx) = rig() else { return };
+        let backend = ctx.backend();
+        let pipeline = backend
+            .compile_render_pipeline(
+                "vs_main",
+                INSTANCED_VERT,
+                "fs_main",
+                crate::kernels::FLAT_TRIANGLE_FRAG,
+                &instanced_transform_config(),
+            )
+            .expect("instanced pipeline");
+        let vb = backend.create_buffer(&UNIT_QUAD).expect("vertex buffer");
+        let foreign = zunesha::Device::create_buffer(&ctx.device, &INSTANCE_OFFSETS)
+            .expect("zunesha instance buffer");
+        let instances = backend
+            .import_zunesha_buffer(foreign)
+            .expect("import_zunesha_buffer");
+
+        let mut frame = backend.acquire_frame().expect("acquire");
+        backend
+            .draw_instanced(&mut frame, &pipeline, &vb, &instances, 4, 3)
+            .expect("draw_instanced");
+        // Drop the imported handle while the recording is still pending.
+        drop(instances);
+        assert_eq!(
+            backend
+                .buffer_retention
+                .lock()
+                .expect("buffer retention lock")
+                .graveyard
+                .len(),
+            1,
+            "an imported instance buffer dropped mid-recording must retire into \
+             the graveyard, not destroy under the pending recording"
+        );
+
+        let pixels = backend.read_pixels(&frame).expect("readback after drop");
+        backend
+            .present(frame)
+            .expect("present drains the graveyard");
+        assert!(
+            backend
+                .buffer_retention
+                .lock()
+                .expect("buffer retention lock")
+                .graveyard
+                .is_empty(),
+            "the graveyard drains at frame completion"
+        );
+        // The frame rendered from the buffer that was dropped mid-recording.
+        assert_three_offset_quads(&backend, &pixels);
+    }
+
+    /// M3 test 10 (import half): the stub's import seam is total too. The
+    /// draw-family half lives in `lib.rs` — the opaque handles can be
+    /// fabricated without a device there, but a `zunesha::Buffer` cannot.
+    #[test]
+    #[serial]
+    fn stub_import_returns_no_backend() {
+        let Some(ctx) = rig() else { return };
+        let buffer =
+            zunesha::Device::create_buffer(&ctx.device, &[0u32; 4]).expect("zunesha buffer");
+        let stub = crate::NoBackendStub;
+        assert!(matches!(
+            crate::GraphicsBackend::import_zunesha_buffer(&stub, buffer),
+            Err(GraphicsError::NoBackend)
         ));
     }
 }

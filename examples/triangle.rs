@@ -26,7 +26,8 @@ use ash::vk::Handle;
 use goldenweek::kernels::{FLAT_TRIANGLE_FRAG, FLAT_TRIANGLE_VERT};
 use goldenweek::vulkan::{HeadlessSurface, VulkanBackend};
 use goldenweek::{
-    CullMode, PipelineConfig, SurfaceHandle, Topology, VertexAttribute, VertexFormat, VertexLayout,
+    CullMode, PipelineConfig, SurfaceHandle, Topology, VertexAttribute, VertexBindingLayout,
+    VertexFormat, VertexInputRate,
 };
 use zunesha::InitRequest;
 
@@ -74,14 +75,15 @@ fn main() -> ExitCode {
         cull_mode: CullMode::None,
         depth: None,
         blend: None,
-        vertex_layout: VertexLayout {
+        vertex_bindings: vec![VertexBindingLayout {
             stride: 8,
+            rate: VertexInputRate::Vertex,
             attributes: vec![VertexAttribute {
                 location: 0,
                 offset: 0,
                 format: VertexFormat::Float32x2,
             }],
-        },
+        }],
     };
     let pipeline = match backend.compile_render_pipeline(
         "vs_main",
