@@ -564,6 +564,10 @@ pub trait GraphicsBackend: Sized {
     /// `owns_buffer`, since zunesha 0.3) — a foreign-device buffer is
     /// rejected before any Vulkan command. The import's provenance is
     /// validated by the substrate, not by caller assertion.
+    ///
+    /// Rejection is NON-CONSUMING: every `Err` carries the buffer back
+    /// ([`GraphicsError::ImportRejected`]) — no adoption happened and
+    /// the caller retains it for their own disposition.
     fn import_zunesha_buffer(
         &self,
         device: &zunesha::vulkan::VulkanDevice,
@@ -685,9 +689,12 @@ impl GraphicsBackend for NoBackendStub {
     fn import_zunesha_buffer(
         &self,
         _device: &zunesha::vulkan::VulkanDevice,
-        _buffer: zunesha::Buffer,
+        buffer: zunesha::Buffer,
     ) -> Result<GpuBuffer> {
-        Err(GraphicsError::NoBackend)
+        Err(GraphicsError::ImportRejected {
+            message: "no graphics backend available for current platform".into(),
+            buffer,
+        })
     }
     fn create_texture(
         &self,

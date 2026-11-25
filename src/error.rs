@@ -43,6 +43,20 @@ pub enum GraphicsError {
         /// What went wrong with the surface.
         message: String,
     },
+    /// A zunesha buffer import was rejected (wrong device, or no
+    /// backend). The buffer is returned UNCONSUMED — no adoption
+    /// happened and the caller retains it for their own disposition.
+    /// (Variant exists only under the `vulkan` feature, matching the
+    /// import API it serves.)
+    #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+    #[error("import_zunesha_buffer rejected: {message}")]
+    ImportRejected {
+        /// Why the import was rejected.
+        message: String,
+        /// The caller's buffer, returned unconsumed.
+        buffer: zunesha::Buffer,
+    },
+
     #[error("swapchain recreation refused: {message}")]
     /// A swapchain recreation was refused: the surface format changed (the
     /// render pass and every compiled pipeline are bound to the old format —
