@@ -2711,20 +2711,29 @@ impl<'a> VulkanBackend<'a> {
         device: &zunesha::vulkan::VulkanDevice,
         buffer: zunesha::Buffer,
     ) -> Result<GpuBuffer> {
-        // Provenance (r1 P1-2): `zunesha::Buffer` is opaque, so the CALLER
-        // binds it to its creating device at the import call. That device
-        // must be the one this backend borrowed — every foreign-device
-        // instance is rejected here, BEFORE any Vulkan command (a buffer
-        // from another vkDevice bound here is
-        // VUID-vkCmdBindVertexBuffers-commonparent). The residual trust
-        // boundary — a caller passing THIS device with a buffer created
-        // elsewhere — is documented in the trait docs and will close when
-        // zunesha exposes buffer ownership (planned `owns_buffer`).
+        // Provenance (r1 P1-2 + zunesha 0.3 hardening): two checks, both
+        // BEFORE any Vulkan command (a buffer from another vkDevice bound
+        // here is VUID-vkCmdBindVertexBuffers-commonparent):
+        // 1. the passed device must be the one this backend borrowed
+        //    (foreign device instance);
+        // 2. the buffer must answer to that device — the substrate's
+        //    `owns_buffer` closes the residual lying-caller case the
+        //    r1 fix documented (a third-party buffer passed WITH this
+        //    backend's device).
         if !std::ptr::eq(self.zunesha_device as *const _, device as *const _) {
-            return Err(GraphicsError::InvalidArgument {
+            return Err(GraphicsError::ImportRejected {
                 message:
                     "import_zunesha_buffer: the buffer's device is not this backend's shared device"
                         .into(),
+                buffer,
+            });
+        }
+        if !self.zunesha_device.owns_buffer(&buffer) {
+            return Err(GraphicsError::ImportRejected {
+                message:
+                    "import_zunesha_buffer: buffer was not created by this backend's shared device"
+                        .into(),
+                buffer,
             });
         }
         let inner = GpuBufferInner {
@@ -6053,10 +6062,14 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
         let buffer =
             zunesha::Device::create_buffer(&ctx.device, &[0u32; 4]).expect("zunesha buffer");
         let stub = crate::NoBackendStub;
-        assert!(matches!(
-            crate::GraphicsBackend::import_zunesha_buffer(&stub, &ctx.device, buffer),
-            Err(GraphicsError::NoBackend)
-        ));
+        let r = crate::GraphicsBackend::import_zunesha_buffer(&stub, &ctx.device, buffer);
+        match r {
+            // Uniform contract: even the stub returns the buffer.
+            Err(GraphicsError::ImportRejected { buffer, .. }) => {
+                let _recovered: zunesha::Buffer = buffer;
+            }
+            other => panic!("stub import must reject with ImportRejected, got {other:?}"),
+        }
     }
 
     /// M3 VERIFY (07904): the pipeline must reject a shader/bindings
@@ -6181,10 +6194,38 @@ fn vs_main(input: Input) -> VOut {
         let backend = ctx.backend();
         let foreign = zunesha::Device::create_buffer(&ctx2.device, &INSTANCE_OFFSETS)
             .expect("buffer on the second device");
-        let r = backend.import_zunesha_buffer(&ctx2.device, foreign);
-        assert!(
-            matches!(r, Err(GraphicsError::InvalidArgument { .. })),
-            "a buffer from another device must be rejected at import"
-        );
+        match backend.import_zunesha_buffer(&ctx2.device, foreign) {
+            Err(GraphicsError::ImportRejected { buffer, .. }) => {
+                // r1 P2: rejection is non-consuming — the caller's buffer
+                // survives, still usable on the device that owns it.
+                ctx2.backend()
+                    .import_zunesha_buffer(&ctx2.device, buffer)
+                    .expect("recovered buffer imports on its own device");
+            }
+            other => panic!("expected ImportRejected, got {other:?}"),
+        }
+    }
+
+    /// zunesha 0.3 `owns_buffer` hardening: the LYING-caller case —
+    /// THIS backend's device passed WITH a foreign buffer — is now
+    /// rejected by the substrate check (was the documented residual).
+    #[test]
+    #[serial]
+    fn import_rejects_foreign_buffer_with_our_device() {
+        let Some(ctx) = rig() else { return };
+        let Some(ctx2) = rig() else { return };
+        let backend = ctx.backend();
+        let foreign = zunesha::Device::create_buffer(&ctx2.device, &INSTANCE_OFFSETS)
+            .expect("buffer on the second device");
+        // Lie: pass OUR device with the foreign buffer. The identity
+        // check passes; `owns_buffer` must catch it.
+        match backend.import_zunesha_buffer(&ctx.device, foreign) {
+            Err(GraphicsError::ImportRejected { buffer, .. }) => {
+                ctx2.backend()
+                    .import_zunesha_buffer(&ctx2.device, buffer)
+                    .expect("recovered buffer imports on its own device");
+            }
+            other => panic!("expected ImportRejected, got {other:?}"),
+        }
     }
 }

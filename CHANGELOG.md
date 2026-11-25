@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0] — Unreleased
 
+### Changed — import provenance hardened (zunesha 0.3)
+
+- **`import_zunesha_buffer` validates buffer ownership at the substrate**
+  — zunesha 0.3.0's `VulkanDevice::owns_buffer` closes the residual
+  documented in the M3 review: a foreign buffer passed WITH this
+  backend's device is now rejected before any Vulkan command. Registry
+  dependency window: `zunesha = "0.3"` (0.1 could not see 0.2+).
+- **Import rejection is now non-consuming** — `GraphicsError::ImportRejected`
+  carries the caller's buffer back unconsumed (no adoption happened);
+  previously every rejection arm silently destroyed it. Uniform across
+  the vulkan backend and the stub.
+
 ### Added — Instanced Batches & the Zero-Copy Import Seam (M3)
 - **Generalized vertex bindings (breaking, pre-0.1.0):** `VertexLayout` is
   removed; `PipelineConfig::vertex_bindings: Vec<VertexBindingLayout>` where

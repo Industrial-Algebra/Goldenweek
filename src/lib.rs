@@ -559,11 +559,15 @@ pub trait GraphicsBackend: Sized {
     /// — deliberately out of scope (M2 / Zunesha ADR 0005 Phase 2).
     #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
     /// `device` is the shared device the buffer was created on — it must
-    /// be the device this backend borrowed (checked by identity; a
-    /// foreign-device buffer is rejected before any Vulkan command).
-    /// Trust boundary: the caller asserts the buffer↔device pairing; a
-    /// buffer from a third device passed WITH this one is not detectable
-    /// until zunesha exposes buffer ownership (planned `owns_buffer`).
+    /// be the device this backend borrowed (checked by identity), and the
+    /// buffer itself must answer to that device (zunesha
+    /// `owns_buffer`, since zunesha 0.3) — a foreign-device buffer is
+    /// rejected before any Vulkan command. The import's provenance is
+    /// validated by the substrate, not by caller assertion.
+    ///
+    /// Rejection is NON-CONSUMING: every `Err` carries the buffer back
+    /// ([`GraphicsError::ImportRejected`]) — no adoption happened and
+    /// the caller retains it for their own disposition.
     fn import_zunesha_buffer(
         &self,
         device: &zunesha::vulkan::VulkanDevice,
@@ -685,9 +689,12 @@ impl GraphicsBackend for NoBackendStub {
     fn import_zunesha_buffer(
         &self,
         _device: &zunesha::vulkan::VulkanDevice,
-        _buffer: zunesha::Buffer,
+        buffer: zunesha::Buffer,
     ) -> Result<GpuBuffer> {
-        Err(GraphicsError::NoBackend)
+        Err(GraphicsError::ImportRejected {
+            message: "no graphics backend available for current platform".into(),
+            buffer,
+        })
     }
     fn create_texture(
         &self,
