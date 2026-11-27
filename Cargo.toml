@@ -43,3 +43,9 @@ serial_test = "3"
 [[example]]
 name = "triangle"
 required-features = ["vulkan"]
+
+# M3 flagship: one draw_instanced call, per-instance offset + color,
+# verified by readback (docs/plans/2026-11-24-m3-instanced-batches.md).
+[[example]]
+name = "instanced"
+required-features = ["vulkan"]

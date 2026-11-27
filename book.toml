@@ -1,0 +1,15 @@
+[book]
+title = "Goldenweek"
+description = "Thin GPU graphics abstraction for the Industrial Algebra ecosystem — render pipelines, frames, and presentation over Metal and Vulkan."
+authors = ["Industrial Algebra"]
+language = "en"
+src = "book/src"
+
+[build]
+build-dir = "book/book"
+
+[output.html]
+additional-css = ["book/theme/custom.css"]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/Industrial-Algebra/Goldenweek"
