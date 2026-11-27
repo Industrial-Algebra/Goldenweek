@@ -13,6 +13,36 @@ Thin GPU **graphics** abstraction for the Industrial Algebra ecosystem.
 - **[docs/architecture.md](docs/architecture.md)** — purpose, the graphics surface, and relationship to Zunesha.
 - **[docs/adr/0001 — Graphics surface and scope](docs/adr/0001-graphics-surface-and-scope.md)** — the v0.1 refusal list and rationale.
 
+## Documentation
+
+- **[Book](book/src/SUMMARY.md)** (deployed at release) — concepts, guide, API map, design, examples.
+- **[docs/architecture.md](docs/architecture.md)** — purpose, the graphics surface, and relationship to Zunesha.
+- **[ADR 0001 — Graphics surface and scope](docs/adr/0001-graphics-surface-and-scope.md)** — the v0.1 refusal list and rationale.
+- **[ADR 0002 — Headless verification and device pinning](docs/adr/0002-headless-verification-and-device-pinning.md)** — how the examples verify themselves.
+- **[Roadmap](docs/ROADMAP.md)** and **[Critique](book/src/design/critique.md)** — what v0.1.0 delivers and what is honestly weak.
+
+## Examples
+
+```bash
+cargo run --features vulkan --example triangle   # magenta triangle, verified by readback
+cargo run --features vulkan --example textured   # textured quad, 4 distinct quadrant texels
+cargo run --features vulkan --example instanced  # one draw call, 4 per-instance quads
+```
+
+Every example *verifies itself* by pixel readback (ADR 0002) — no
+"it probably rendered" exits.
+
+## Feature flags
+
+| Feature | Effect | Platform |
+|---|---|---|
+| *(default: none)* | trait + opaque handles + `NoBackendStub` — every operation returns `NoBackend` | all |
+| `vulkan` | the complete Vulkan backend (via `ash` FFI over the shared Zunesha device) | Linux, Windows |
+| `metal` | *(reserved)* — lands post-v0.1, substrate-first | macOS |
+
+The zero-copy import seam requires **zunesha ≥ 0.3** (substrate-side
+`owns_buffer` provenance check).
+
 Goldenweek is the graphics sibling of
 [Borsalino](https://github.com/Industrial-Algebra/Borsalino). Where Borsalino
 is a minimal, synchronous **compute** abstraction over Metal and Vulkan,
@@ -103,6 +133,13 @@ collapses complexity and is reversible only via a documented ADR:
 | 4 | **No async-by-default.** Synchronous `acquire → draw → present`. | Matches Borsalino's dispatch model and the WASM-host story in Baedeker. |
 | 5 | **No stencil or multisample at v0.1** — depth testing and color blending ship via `PipelineConfig::depth` / `PipelineConfig::blend` (increment 6). | Depth + blending landed with hardware-verified tests; stencil/MSAA remain for later increments. |
 | 6 | **No textures at v0.1.** | Grow by proven need. |
+
+> **v0.1.0 status update:** refusals 5 and 6 have since been reversed by
+> proven need through the ADR process — textures and sampled images (M1)
+> and depth/blending shipped; instanced draws and the zero-copy import
+> seam (M3) landed with the same discipline. The refusal *table* stays:
+> each reversal is a recorded decision, not a scope drift. Stencil/MSAA
+> and windowing remain refused.
 
 ## Architecture
 
